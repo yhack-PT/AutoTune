@@ -38,20 +38,19 @@ function getDummyResponse(): string {
 
 const SUGGESTIONS = [
   {
-    label: "Brainstorm names",
-    prompt: "Help me brainstorm creative names for a new product",
+    label: "Foreign Law Expert",
+    prompt:
+      "I want to fine-tune a model to be an expert in Nepali and South Asian law. It should accurately interpret and explain Nepalese statutes, constitutional provisions, case law, and legal procedures — helping users navigate legal queries while always noting when professional legal counsel is required.",
   },
   {
-    label: "Explain a concept",
-    prompt: "Explain quantum computing in simple terms",
+    label: "AIME Tutor",
+    prompt:
+      "I want to fine-tune a model to tutor students preparing for AMC and AIME competitions. It should guide students through challenging problems step by step, building deep intuition in number theory, combinatorics, geometry, and algebra rather than just providing answers.",
   },
   {
-    label: "Write an email",
-    prompt: "Draft a professional email declining a meeting",
-  },
-  {
-    label: "Debug code",
-    prompt: "Help me debug this Python function that's returning None",
+    label: "Clinical Document Processor",
+    prompt:
+      "I want to fine-tune a model to process and summarize clinical healthcare documents. It should extract key information from physician notes, discharge summaries, lab reports, and EHRs — identifying diagnoses, medications, procedures, and follow-up actions while handling sensitive data responsibly.",
   },
 ];
 
