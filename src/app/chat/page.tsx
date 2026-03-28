@@ -178,11 +178,7 @@ export default function ChatPage() {
             ChatGPT
           </span>
         </div>
-        <div className="flex items-center gap-2">
-          <span className="text-xs text-muted-foreground px-2 py-1 rounded-full bg-muted">
-            Demo Mode
-          </span>
-        </div>
+        <div className="flex items-center gap-2" />
       </header>
 
       {/* Messages area */}
