@@ -100,7 +100,7 @@ export function ModelConfiguration() {
                   onClick={() => setReasoningLevel(level.value)}
                   className={`relative z-10 flex-1 rounded-md px-3 py-2.5 text-center transition-colors duration-200 ${reasoningLevel === level.value
                       ? "text-neutral-900"
-                      : "text-neutral-500 hover:text-neutral-700"
+                      : "text-neutral-500"
                     }`}
                   aria-label={`Select ${level.label}`}
                 >
