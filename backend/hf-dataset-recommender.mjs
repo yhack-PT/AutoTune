@@ -2,6 +2,18 @@ import process from "node:process";
 import { readFile, writeFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 
+import {
+  extractRowsFromPreview,
+  inferCompatibleMethodsFromNormalization,
+  inferDeterministicNormalization,
+  normalizeOptionalString,
+  selectPreferredEvalSplit,
+  selectPreferredTrainSplit,
+  summarizeRow,
+  uniqueStrings,
+  validateNormalizationProposal,
+} from "./posttraining-normalization.mjs";
+
 const HUB_API_URL = "https://huggingface.co/api/datasets";
 const DATASET_VIEWER_URL = "https://datasets-server.huggingface.co";
 const OPENAI_RESPONSES_API_URL = "https://api.openai.com/v1/responses";
@@ -89,6 +101,14 @@ async function withLoggerContext(logger, callback) {
   }
 }
 
+export class RecommendationFailure extends Error {
+  constructor(message, recommendation) {
+    super(message);
+    this.name = "RecommendationFailure";
+    this.recommendation = recommendation;
+  }
+}
+
 export async function recommendDatasets(input, options = {}) {
   return withLoggerContext(options.logger, async () => {
     logInfo(
@@ -105,14 +125,48 @@ export async function recommendDatasets(input, options = {}) {
     logInfo(
       `running ${context.search_queries.length} HF searches with min row floor ${context.min_rows_floor || 0}`,
     );
-    const discoveredCandidates = await discoverCandidates(context);
+    const discoveredCandidates = await (
+      typeof options.discoverCandidates === "function"
+        ? options.discoverCandidates(context)
+        : discoverCandidates(context)
+    );
     logInfo(`discovered ${discoveredCandidates.length} candidate datasets before enrichment`);
-    const enrichedCandidates = await enrichCandidates(discoveredCandidates, context);
+    const enrichedCandidates = await (
+      typeof options.enrichCandidates === "function"
+        ? options.enrichCandidates(discoveredCandidates, context, options)
+        : enrichCandidates(discoveredCandidates, context, options)
+    );
     logInfo(`enriched ${enrichedCandidates.length} candidate datasets`);
+    const publicCandidates = enrichedCandidates.filter((candidate) => !candidate.private && !candidate.gated);
+    const rankedDatasets = sortCandidatesForDiagnostics(publicCandidates);
+    const compatibleCandidates = publicCandidates.filter((candidate) => candidate.compatibility_status === "compatible");
+
+    if (compatibleCandidates.length === 0) {
+      const recommendation = {
+        analysis: normalizedPlan.analysis,
+        search_queries: normalizedPlan.search_queries,
+        ranking_criteria: normalizedPlan.ranking_criteria,
+        recommendation_guidance: buildRecommendationGuidance([], normalizedPlan),
+        compatibility_summary: buildCompatibilitySummary(publicCandidates),
+        ranked_datasets: rankedDatasets,
+        recommended_datasets: [],
+        fatal_error: {
+          code: "no_compatible_candidates",
+          message:
+            "No ranked dataset candidates could be normalized into a backend-supported training shape during recommendation.",
+        },
+      };
+      if (!options.skipDebugWrite) {
+        await writeRankedDatasetsDebugFile(recommendation, options.debugOutputPath);
+      }
+      throw new RecommendationFailure(recommendation.fatal_error.message, recommendation);
+    }
+
     const recommendedDatasets = dedupeRankedDatasets(
-      await rankCandidatesWithOpenAI(
-        enrichedCandidates.filter((candidate) => !candidate.private && !candidate.gated),
-        context,
+      await (
+        typeof options.rankCandidates === "function"
+          ? options.rankCandidates(compatibleCandidates, context)
+          : rankCandidatesWithOpenAI(compatibleCandidates, context)
       ),
     );
     logInfo(`returning ${recommendedDatasets.length} recommended datasets`);
@@ -122,16 +176,42 @@ export async function recommendDatasets(input, options = {}) {
       search_queries: normalizedPlan.search_queries,
       ranking_criteria: normalizedPlan.ranking_criteria,
       recommendation_guidance: buildRecommendationGuidance(recommendedDatasets, normalizedPlan),
+      compatibility_summary: buildCompatibilitySummary(publicCandidates),
+      ranked_datasets: rankedDatasets,
       recommended_datasets: recommendedDatasets,
     };
     if (!options.skipDebugWrite) {
-      await writeRankedDatasetsDebugFile(recommendedDatasets, options.debugOutputPath);
+      await writeRankedDatasetsDebugFile(result, options.debugOutputPath);
     }
     return result;
   });
 }
 
 export default recommendDatasets;
+
+function sortCandidatesForDiagnostics(candidates) {
+  return [...candidates].sort((left, right) => {
+    const leftCompatibility = left.compatibility_status === "compatible" ? 0 : 1;
+    const rightCompatibility = right.compatibility_status === "compatible" ? 0 : 1;
+    if (leftCompatibility !== rightCompatibility) {
+      return leftCompatibility - rightCompatibility;
+    }
+    const leftSource = left.normalization_source === "deterministic" ? 0 : 1;
+    const rightSource = right.normalization_source === "deterministic" ? 0 : 1;
+    if (leftSource !== rightSource) {
+      return leftSource - rightSource;
+    }
+    return Number(right.score ?? 0) - Number(left.score ?? 0);
+  });
+}
+
+function buildCompatibilitySummary(candidates) {
+  return {
+    total_candidates: candidates.length,
+    compatible_candidates: candidates.filter((candidate) => candidate.compatibility_status === "compatible").length,
+    incompatible_candidates: candidates.filter((candidate) => candidate.compatibility_status !== "compatible").length,
+  };
+}
 
 function isSearchPlanInput(input) {
   return Boolean(input && typeof input === "object" && Array.isArray(input.search_queries));
@@ -618,7 +698,7 @@ function buildSearchVariants(searchText) {
   return uniqueStrings([query.search, normalized, compact, broad, withTask].filter(Boolean));
 }
 
-async function enrichCandidates(candidates, context) {
+async function enrichCandidates(candidates, context, options = {}) {
   logInfo(`starting enrichment for ${candidates.length} candidates`);
   return mapWithConcurrency(candidates, ENRICHMENT_CONCURRENCY, async (candidate) => {
     logInfo(`enriching dataset ${candidate.id}`);
@@ -648,6 +728,8 @@ async function enrichCandidates(candidates, context) {
     const splitsPayload = await fetchViewerEndpoint("/splits", { dataset: candidate.id }).catch(() => null);
     const splitsInfo = parseSplitsInfo(splitsPayload);
     const previewTarget = choosePreviewTarget(splitsInfo.rawSplits);
+    const preferredTrainSplit = selectPreferredTrainSplit(splitsInfo.rawSplits);
+    const preferredEvalSplit = selectPreferredEvalSplit(splitsInfo.rawSplits);
 
     let schemaPreview = null;
     if (viewerAccessible && previewTarget) {
@@ -659,6 +741,53 @@ async function enrichCandidates(candidates, context) {
     }
 
     const schemaSignals = parseSchemaSignals(schemaPreview, candidate.tags);
+    const featureNames = Array.isArray(schemaPreview?.features)
+      ? schemaPreview.features.map((feature) => String(feature?.name ?? "")).filter(Boolean)
+      : [];
+    const sampleRows = extractRowsFromPreview(schemaPreview).slice(0, 3);
+    const rowKeys = uniqueStrings(sampleRows.flatMap((row) => Object.keys(row ?? {})));
+    const availableColumns = uniqueStrings([...featureNames, ...rowKeys]);
+    const sourceSchema = {
+      available_columns: availableColumns,
+      sample_rows: sampleRows.map((row) => summarizeRow(row)),
+    };
+    const directCompatibility = inferDeterministicNormalization(availableColumns, sampleRows);
+
+    let compatibilityStatus = directCompatibility.compatibility_status;
+    let compatibilityReason = directCompatibility.compatibility_reason;
+    let normalizationProposal = directCompatibility.normalization_proposal;
+    let normalizationSource = normalizationProposal ? "deterministic" : null;
+
+    if (!normalizationProposal && viewerAccessible && availableColumns.length > 0) {
+      const gptNormalization = await inferNormalizationProposal(candidate, context, {
+        ...options,
+        sourceSchema,
+      }).catch((error) => {
+        warnings.push(
+          `Normalization inference failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        return null;
+      });
+
+      const proposalErrors = validateNormalizationProposal(
+        gptNormalization?.normalization_proposal,
+        availableColumns,
+      );
+      if (gptNormalization?.normalization_proposal && proposalErrors.length === 0) {
+        normalizationProposal = gptNormalization.normalization_proposal;
+        compatibilityStatus = "compatible";
+        compatibilityReason = gptNormalization.compatibility_reason;
+        normalizationSource = "openai";
+      } else if (gptNormalization?.normalization_proposal) {
+        warnings.push(
+          `Discarded invalid normalization proposal: ${proposalErrors.join(" ")}`,
+        );
+      } else if (gptNormalization?.compatibility_reason) {
+        compatibilityReason = gptNormalization.compatibility_reason;
+      }
+    }
+
+    const compatibleMethods = inferCompatibleMethodsFromNormalization(normalizationProposal);
     const license = extractLicense(candidate);
 
     if (!license) {
@@ -675,11 +804,31 @@ async function enrichCandidates(candidates, context) {
       size_partial: sizeInfo.partial,
       splits: splitsInfo.names,
       schema_signals: schemaSignals.signals,
-      schema_details: schemaSignals.details,
+      schema_details: { feature_names: availableColumns },
+      source_schema: sourceSchema,
+      preferred_dataset_config: normalizeOptionalString(preferredTrainSplit?.config) ?? null,
+      preferred_train_split: normalizeOptionalString(preferredTrainSplit?.split) ?? "train",
+      preferred_eval_split: normalizeOptionalString(preferredEvalSplit?.split),
+      compatibility_status: compatibleMethods.length > 0 ? "compatible" : compatibilityStatus,
+      compatibility_reason:
+        compatibleMethods.length > 0
+          ? compatibilityReason
+          : compatibilityReason ||
+            "No supported normalization proposal could be inferred for this dataset.",
+      normalization_source: normalizationSource,
+      normalization_proposal: normalizationProposal,
+      compatible_methods: compatibleMethods,
       license,
       warnings,
     };
   });
+}
+
+async function inferNormalizationProposal(candidate, context, options = {}) {
+  if (typeof options.normalizationPlanner === "function") {
+    return options.normalizationPlanner(candidate, context, options.sourceSchema);
+  }
+  return callOpenAINormalizationPlanner(candidate, context, options.sourceSchema);
 }
 
 async function fetchViewerEndpoint(path, params) {
@@ -769,6 +918,153 @@ function extractLicense(candidate) {
     normalizeOptionalString(tagLicense) ??
     null
   );
+}
+
+function getNormalizationFieldSchema() {
+  return {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      source_column: { type: ["string", "null"] },
+      template: { type: ["string", "null"] },
+      value_mapping: {
+        type: ["object", "null"],
+        additionalProperties: { type: "string" },
+      },
+    },
+    required: ["source_column", "template", "value_mapping"],
+  };
+}
+
+function getNormalizationProposalSchema() {
+  return {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      usable: { type: "boolean" },
+      compatibility_reason: { type: "string" },
+      normalization_proposal: {
+        anyOf: [
+          { type: "null" },
+          {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              version: { type: "integer", enum: [1] },
+              shape: { type: "string", enum: ["text", "prompt_completion"] },
+              strategy: {
+                type: "string",
+                enum: [
+                  "copy_column",
+                  "copy_columns",
+                  "qa_template",
+                  "classification_template",
+                  "template_synthesis",
+                ],
+              },
+              source_columns: {
+                type: "array",
+                minItems: 1,
+                items: { type: "string" },
+              },
+              fields: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  text: { anyOf: [{ type: "null" }, getNormalizationFieldSchema()] },
+                  prompt: { anyOf: [{ type: "null" }, getNormalizationFieldSchema()] },
+                  completion: { anyOf: [{ type: "null" }, getNormalizationFieldSchema()] },
+                },
+                required: ["text", "prompt", "completion"],
+              },
+            },
+            required: ["version", "shape", "strategy", "source_columns", "fields"],
+          },
+        ],
+      },
+    },
+    required: ["usable", "compatibility_reason", "normalization_proposal"],
+  };
+}
+
+function buildOpenAINormalizationPrompt(candidate, context, sourceSchema) {
+  return [
+    "Infer a deterministic normalization recipe for a single Hugging Face dataset so a text-only SFT backend can train on it.",
+    "Do not invent columns.",
+    "Use the native dataset field names exactly as provided.",
+    "Return usable=false when the schema cannot support a meaningful deterministic text or prompt/completion normalization.",
+    "Use template_synthesis only when direct column mapping is impossible.",
+    "Avoid likely identifier columns such as ticket ids, customer ids, phone numbers, and other obvious PII unless they are essential.",
+    `Objective: ${context.analysis?.domain_summary || ""}`,
+    `Mapped task types: ${JSON.stringify(context.analysis?.mapped_task_types ?? [])}`,
+    `Dataset id: ${candidate.id}`,
+    `Description: ${candidate.description ?? ""}`,
+    `Warnings: ${JSON.stringify(candidate.warnings ?? [])}`,
+    `Schema signals: ${JSON.stringify(candidate.schema_signals ?? [])}`,
+    `Available columns: ${JSON.stringify(sourceSchema?.available_columns ?? [])}`,
+    `Sample rows: ${JSON.stringify(sourceSchema?.sample_rows ?? [])}`,
+  ].join("\n");
+}
+
+async function callOpenAINormalizationPlanner(candidate, context, sourceSchema) {
+  await ensureDotEnvLoaded();
+  const apiKey = normalizeOptionalString(process.env.OPENAI_API_KEY);
+  if (!apiKey) {
+    throw new Error("OPENAI_API_KEY is required to infer dataset normalization proposals.");
+  }
+
+  const model = normalizeOptionalString(process.env.OPENAI_MODEL) ?? DEFAULT_OPENAI_MODEL;
+  const prompt = buildOpenAINormalizationPrompt(candidate, context, sourceSchema);
+  logMultiline(`openai normalization prompt for ${candidate.id}`, prompt);
+
+  const response = await fetchJson(OPENAI_RESPONSES_API_URL, {
+    method: "POST",
+    timeoutMs: 60_000,
+    maxRetries: 3,
+    requestLabel: `OpenAI normalization request for ${candidate.id}`,
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model,
+      store: false,
+      input: [
+        {
+          role: "system",
+          content:
+            "You infer deterministic dataset normalization recipes for text-only SFT training. Return only the requested JSON and never invent schema fields.",
+        },
+        {
+          role: "user",
+          content: prompt,
+        },
+      ],
+      text: {
+        format: {
+          type: "json_schema",
+          name: "hf_dataset_normalization",
+          schema: getNormalizationProposalSchema(),
+          strict: true,
+        },
+      },
+    }),
+  });
+
+  const outputText = extractOpenAIOutputText(response);
+  if (!outputText) {
+    throw new Error("OpenAI returned an empty normalization response.");
+  }
+
+  try {
+    return JSON.parse(outputText);
+  } catch (error) {
+    throw new Error(
+      `OpenAI returned invalid JSON for dataset normalization: ${
+        error instanceof Error ? error.message : "unknown parse error"
+      }`,
+    );
+  }
 }
 
 async function rankCandidatesWithOpenAI(candidates, context) {
@@ -877,9 +1173,17 @@ function buildOpenAIRankingInput(candidates, context) {
     schema_signals: candidate.schema_signals,
     viewer_accessible: candidate.viewer_accessible,
     size_partial: candidate.size_partial,
+    compatibility_status: candidate.compatibility_status,
+    compatibility_reason: candidate.compatibility_reason,
+    normalization_source: candidate.normalization_source,
+    compatible_methods: candidate.compatible_methods,
+    normalization_shape: candidate.normalization_proposal?.shape ?? null,
+    normalization_strategy: candidate.normalization_proposal?.strategy ?? null,
+    source_columns: candidate.normalization_proposal?.source_columns ?? [],
     warnings: candidate.warnings ?? [],
     tags: (candidate.tags ?? []).slice(0, 12),
-    feature_names: candidate.schema_details?.feature_names?.slice(0, 12) ?? [],
+    feature_names: candidate.source_schema?.available_columns?.slice(0, 20) ?? [],
+    sample_rows: candidate.source_schema?.sample_rows ?? [],
   }));
 }
 
@@ -891,6 +1195,8 @@ function buildOpenAIRankingPrompt(context, rankingInput) {
     "Return 2-3 datasets only when combining them would materially improve coverage, robustness, or task fit.",
     "Do not return more than 3 datasets.",
     "Prefer domain relevance, task/schema fit, target row-band fit, public usability, license clarity, and overall data usefulness.",
+    "Only choose candidates whose compatibility_status is compatible.",
+    "Prefer deterministic direct normalization over template_synthesis when task fit is otherwise similar.",
     "The candidates have already been fetched from Hugging Face; you are only choosing the recommended set.",
     `Analysis: ${JSON.stringify(context.analysis)}`,
     `Search queries: ${JSON.stringify(context.search_queries)}`,
@@ -955,6 +1261,15 @@ function mergeOpenAIRanking(candidates, ranking, context) {
       license: candidate.license,
       splits: candidate.splits,
       schema_signals: candidate.schema_signals,
+      compatibility_status: candidate.compatibility_status,
+      compatibility_reason: candidate.compatibility_reason,
+      normalization_source: candidate.normalization_source,
+      normalization_proposal: candidate.normalization_proposal,
+      compatible_methods: candidate.compatible_methods,
+      source_schema: candidate.source_schema,
+      preferred_dataset_config: candidate.preferred_dataset_config ?? null,
+      preferred_train_split: candidate.preferred_train_split ?? "train",
+      preferred_eval_split: candidate.preferred_eval_split ?? null,
       warnings: uniqueStrings([...(candidate.warnings ?? []), ...(rankedCandidate.warnings ?? [])]),
     });
     seen.add(rankedCandidate.dataset);
@@ -1280,17 +1595,6 @@ function overlapScore(tokens, haystack) {
   }
 
   return matched / tokens.length;
-}
-
-function uniqueStrings(values) {
-  return [...new Set(values.filter(Boolean))];
-}
-
-function normalizeOptionalString(value) {
-  if (typeof value === "string" && value.trim()) {
-    return value.trim();
-  }
-  return null;
 }
 
 function normalizePositiveInt(value) {

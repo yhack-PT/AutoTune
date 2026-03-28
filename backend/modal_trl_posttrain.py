@@ -37,6 +37,7 @@ Notes:
 
 import json
 import os
+import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -375,16 +376,20 @@ def _resolve_label_mapping_value(
     raw_label: Any,
     label_mapping: dict[str, Any] | None,
     field_name: str,
+    dataset_id: str | None = None,
 ) -> str:
     if label_mapping:
         for candidate in _label_mapping_candidates(raw_label):
             if candidate in label_mapping:
                 return str(label_mapping[candidate])
-        raise ValueError(
-            f"Could not map `{field_name}` value `{raw_label}` through label_mapping. "
-            "Ensure label_mapping contains string keys for the raw dataset labels."
+        dataset_prefix = (
+            f"Prepared dataset `{dataset_id}` " if isinstance(dataset_id, str) and dataset_id.strip() else ""
         )
-    return _normalize_text_value(raw_label, field_name)
+        raise ValueError(
+            f"{dataset_prefix}could not map `{field_name}` value `{raw_label}` through explicit value_mapping. "
+            "Add a string key for this raw label or remove value_mapping for passthrough labels."
+        )
+    return _stringify_manifest_value(raw_label, field_name)
 
 
 def _render_prompt_template(template: str, values: dict[str, Any]) -> str:
@@ -392,6 +397,22 @@ def _render_prompt_template(template: str, values: dict[str, Any]) -> str:
     for key, value in values.items():
         rendered = rendered.replace("{" + key + "}", "" if value is None else str(value))
     return rendered
+
+
+def _extract_template_variables(template: str) -> list[str]:
+    return list(dict.fromkeys(match.group(1).strip() for match in re.finditer(r"{([^{}]+)}", template) if match.group(1).strip()))
+
+
+def _stringify_manifest_value(value: Any, field_name: str) -> str:
+    if value is None:
+        raise ValueError(f"Expected `{field_name}` to be populated.")
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    if isinstance(value, (list, dict)):
+        return json.dumps(value, ensure_ascii=True)
+    return str(value)
 
 
 def _build_label_space_text(label_mapping: dict[str, Any] | None) -> str:
@@ -436,172 +457,131 @@ def _assert_columns_exist(dataset: Any, columns: list[str], dataset_id: str) -> 
         )
 
 
-def _transform_prepared_dataset_entry(config: TrainConfig, dataset: Any, entry: dict[str, Any]) -> Any:
-    preset = _require_manifest_string(entry, "transform_preset", entry.get("dataset", "dataset"))
-    dataset_id = _require_manifest_string(entry, "dataset", entry.get("dataset", "dataset"))
-    field_mapping = _require_manifest_mapping(entry, "field_mapping")
-    label_mapping = _require_manifest_mapping(entry, "label_mapping")
-    prompt_template = entry.get("prompt_template")
-    if prompt_template is not None and not isinstance(prompt_template, str):
-        raise ValueError(f"Prepared dataset `{dataset_id}` prompt_template must be a string when provided.")
+def _require_normalization_field(fields: dict[str, Any], key: str, dataset_id: str) -> dict[str, Any]:
+    value = fields.get(key)
+    if not isinstance(value, dict):
+        raise ValueError(f"Prepared dataset `{dataset_id}` normalization.fields.{key} must be an object.")
+    return value
 
-    remove_columns = list(dataset.column_names)
 
-    if preset == "sft_text":
-        text_column = _require_source_column(field_mapping, "text", dataset_id)
-        _assert_columns_exist(dataset, [text_column], dataset_id)
-        return dataset.map(
-            lambda example: {"text": example[text_column]},
-            remove_columns=remove_columns,
-            desc=f"Preparing {dataset_id} with sft_text",
+def _normalization_field_columns(field_spec: dict[str, Any]) -> list[str]:
+    columns: list[str] = []
+    source_column = field_spec.get("source_column")
+    if isinstance(source_column, str) and source_column.strip():
+        columns.append(source_column.strip())
+
+    template = field_spec.get("template")
+    if isinstance(template, str) and template.strip():
+        columns.extend(_extract_template_variables(template))
+
+    return list(dict.fromkeys(column for column in columns if column))
+
+
+def _render_normalization_field(
+    example: dict[str, Any],
+    field_spec: dict[str, Any],
+    field_name: str,
+    dataset_id: str,
+) -> str:
+    source_column = field_spec.get("source_column")
+    template = field_spec.get("template")
+    value_mapping = field_spec.get("value_mapping")
+
+    if value_mapping is not None and not isinstance(value_mapping, dict):
+        raise ValueError(f"normalization.fields.{field_name}.value_mapping must be an object when provided.")
+
+    has_source = isinstance(source_column, str) and source_column.strip()
+    has_template = isinstance(template, str) and template.strip()
+    if has_source == has_template:
+        raise ValueError(
+            f"normalization.fields.{field_name} must define exactly one of source_column or template."
         )
 
-    if preset == "sft_messages":
-        messages_column = _require_source_column(field_mapping, "messages", dataset_id)
-        _assert_columns_exist(dataset, [messages_column], dataset_id)
-        return dataset.map(
-            lambda example: {"messages": example[messages_column]},
-            remove_columns=remove_columns,
-            desc=f"Preparing {dataset_id} with sft_messages",
+    if has_source:
+        raw_value = example[source_column.strip()]
+    else:
+        template_vars = _extract_template_variables(template)
+        raw_value = _render_prompt_template(
+            template,
+            {variable: example.get(variable) for variable in template_vars},
         )
 
-    if preset == "prompt_completion_passthrough":
-        prompt_column = _require_source_column(field_mapping, "prompt", dataset_id)
-        completion_column = _require_source_column(field_mapping, "completion", dataset_id)
-        _assert_columns_exist(dataset, [prompt_column, completion_column], dataset_id)
-        return dataset.map(
-            lambda example: {
-                "prompt": example[prompt_column],
-                "completion": example[completion_column],
-            },
-            remove_columns=remove_columns,
-            desc=f"Preparing {dataset_id} with prompt_completion_passthrough",
+    if isinstance(value_mapping, dict):
+        return _resolve_label_mapping_value(
+            raw_value,
+            value_mapping,
+            f"normalization.fields.{field_name}",
+            dataset_id,
         )
+    return _stringify_manifest_value(raw_value, field_name)
 
-    if preset == "qa_to_prompt_completion":
-        question_column = _require_source_column(field_mapping, "question", dataset_id)
-        answer_column = _require_source_column(field_mapping, "answer", dataset_id)
-        context_column = field_mapping.get("context")
-        columns = [question_column, answer_column]
-        if isinstance(context_column, str) and context_column.strip():
-            columns.append(context_column.strip())
-        _assert_columns_exist(dataset, columns, dataset_id)
-        template = prompt_template or "Question:\n{question}\n\nAnswer:"
-        if isinstance(context_column, str) and context_column.strip():
-            template = prompt_template or "Context:\n{context}\n\nQuestion:\n{question}\n\nAnswer:"
-            context_column = context_column.strip()
 
-        def qa_to_prompt_completion(example: dict[str, Any]) -> dict[str, str]:
-            values = {
-                "question": example[question_column],
-                "answer": example[answer_column],
-                "context": example[context_column] if isinstance(context_column, str) else None,
-            }
-            return {
-                "prompt": _render_prompt_template(template, values),
-                "completion": example[answer_column],
-            }
+def _transform_dataset_with_normalization(dataset_id: str, dataset: Any, entry: dict[str, Any]) -> Any:
+    normalization = entry.get("normalization")
+    if not isinstance(normalization, dict):
+        raise ValueError(f"Prepared dataset `{dataset_id}` normalization must be an object.")
 
-        return dataset.map(
-            qa_to_prompt_completion,
-            remove_columns=remove_columns,
-            desc=f"Preparing {dataset_id} with qa_to_prompt_completion",
-        )
+    shape = _require_manifest_string(normalization, "shape", dataset_id)
+    fields = _require_manifest_mapping(normalization, "fields")
+    source_columns = normalization.get("source_columns")
+    if not isinstance(source_columns, list) or not source_columns:
+        raise ValueError(f"Prepared dataset `{dataset_id}` normalization.source_columns must be a non-empty array.")
 
-    if preset == "classification_to_prompt_completion":
-        input_column = _require_source_column(field_mapping, "input", dataset_id)
-        label_column = _require_source_column(field_mapping, "label", dataset_id)
-        _assert_columns_exist(dataset, [input_column, label_column], dataset_id)
-        label_space = _build_label_space_text(label_mapping)
-        template = (
-            prompt_template
-            or "Classify the following example. Return only the label.\n\n"
-            "Available labels: {label_space}\n\nInput:\n{input}\n\nLabel:"
-        )
-
-        def classification_to_prompt_completion(example: dict[str, Any]) -> dict[str, str]:
-            values = {
-                "input": example[input_column],
-                "label": example[label_column],
-                "label_space": label_space,
-            }
-            return {
-                "prompt": _render_prompt_template(template, values),
-                "completion": _resolve_label_mapping_value(example[label_column], label_mapping, label_column),
-            }
-
-        return dataset.map(
-            classification_to_prompt_completion,
-            remove_columns=remove_columns,
-            desc=f"Preparing {dataset_id} with classification_to_prompt_completion",
-        )
-
-    if preset in {"paired_preference_passthrough", "paired_preference_chat"}:
-        prompt_column = _require_source_column(field_mapping, "prompt", dataset_id)
-        chosen_column = _require_source_column(field_mapping, "chosen", dataset_id)
-        rejected_column = _require_source_column(field_mapping, "rejected", dataset_id)
-        _assert_columns_exist(dataset, [prompt_column, chosen_column, rejected_column], dataset_id)
-
-        if config.trainer_type in {"kto", "bco"}:
-            def paired_to_unpaired(batch: dict[str, list[Any]]) -> dict[str, list[Any]]:
-                prompts: list[Any] = []
-                completions: list[Any] = []
-                labels: list[bool] = []
-                for prompt, chosen, rejected in zip(
-                    batch[prompt_column],
-                    batch[chosen_column],
-                    batch[rejected_column],
-                    strict=True,
-                ):
-                    prompts.extend([prompt, prompt])
-                    completions.extend([chosen, rejected])
-                    labels.extend([True, False])
-                return {"prompt": prompts, "completion": completions, "label": labels}
-
-            return dataset.map(
-                paired_to_unpaired,
-                batched=True,
-                remove_columns=remove_columns,
-                desc=f"Preparing {dataset_id} paired preference data for {config.trainer_type.upper()}",
+    normalized_source_columns: list[str] = []
+    for column in source_columns:
+        if not isinstance(column, str) or not column.strip():
+            raise ValueError(
+                f"Prepared dataset `{dataset_id}` normalization.source_columns must contain only non-empty strings."
             )
+        normalized_source_columns.append(column.strip())
 
+    required_columns = set(normalized_source_columns)
+
+    if shape == "text":
+        text_field = _require_normalization_field(fields, "text", dataset_id)
+        required_columns.update(_normalization_field_columns(text_field))
+        _assert_columns_exist(dataset, sorted(required_columns), dataset_id)
         return dataset.map(
-            lambda example: {
-                "prompt": example[prompt_column],
-                "chosen": example[chosen_column],
-                "rejected": example[rejected_column],
-            },
-            remove_columns=remove_columns,
-            desc=f"Preparing {dataset_id} with {preset}",
+            lambda example: {"text": _render_normalization_field(example, text_field, "text", dataset_id)},
+            remove_columns=list(dataset.column_names),
+            desc=f"Preparing {dataset_id} with normalization.text",
         )
 
-    if preset == "unpaired_preference_passthrough":
-        prompt_column = _require_source_column(field_mapping, "prompt", dataset_id)
-        completion_column = _require_source_column(field_mapping, "completion", dataset_id)
-        label_column = _require_source_column(field_mapping, "label", dataset_id)
-        _assert_columns_exist(dataset, [prompt_column, completion_column, label_column], dataset_id)
-
-        def unpaired_preference(example: dict[str, Any]) -> dict[str, Any]:
-            raw_label = example[label_column]
-            if label_mapping:
-                mapped_label = _resolve_label_mapping_value(raw_label, label_mapping, label_column)
-            else:
-                mapped_label = raw_label
-            return {
-                "prompt": example[prompt_column],
-                "completion": example[completion_column],
-                "label": _normalize_label_value(mapped_label),
-            }
-
+    if shape == "prompt_completion":
+        prompt_field = _require_normalization_field(fields, "prompt", dataset_id)
+        completion_field = _require_normalization_field(fields, "completion", dataset_id)
+        required_columns.update(_normalization_field_columns(prompt_field))
+        required_columns.update(_normalization_field_columns(completion_field))
+        _assert_columns_exist(dataset, sorted(required_columns), dataset_id)
         return dataset.map(
-            unpaired_preference,
-            remove_columns=remove_columns,
-            desc=f"Preparing {dataset_id} with unpaired_preference_passthrough",
+            lambda example: {
+                "prompt": _render_normalization_field(example, prompt_field, "prompt", dataset_id),
+                "completion": _render_normalization_field(
+                    example,
+                    completion_field,
+                    "completion",
+                    dataset_id,
+                ),
+            },
+            remove_columns=list(dataset.column_names),
+            desc=f"Preparing {dataset_id} with normalization.prompt_completion",
         )
 
     raise ValueError(
-        f"Unsupported transform_preset `{preset}` for prepared dataset `{dataset_id}`."
+        f"Prepared dataset `{dataset_id}` normalization.shape `{shape}` is not supported."
     )
+
+
+def _transform_prepared_dataset_entry(config: TrainConfig, dataset: Any, entry: dict[str, Any]) -> Any:
+    dataset_id = _require_manifest_string(entry, "dataset", entry.get("dataset", "dataset"))
+    normalization = entry.get("normalization")
+    if normalization is None:
+        raise ValueError(
+            f"Prepared dataset `{dataset_id}` must define `normalization`. "
+            "Legacy transform_preset manifests are no longer supported."
+        )
+
+    return _transform_dataset_with_normalization(dataset_id, dataset, entry)
 
 
 def _dataset_column_signature(dataset: Any) -> tuple[str, ...]:

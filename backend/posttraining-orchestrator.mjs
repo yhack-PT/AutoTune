@@ -319,17 +319,53 @@ function buildServeAppName(jobId) {
   return `vllm-lora-${normalized}`.slice(0, 60);
 }
 
-function extractModalRunUrl(text) {
-  const matches = [...String(text).matchAll(/https:\/\/[^\s"'<>]+modal\.run[^\s"'<>]*/g)]
+function collectModalRunUrls(text) {
+  return [...String(text).matchAll(/https:\/\/[^\s"'<>]+modal\.run[^\s"'<>]*/g)]
     .map((match) => match[0].replace(/[),.;]+$/, ""))
     .filter((url) => !url.includes("/docs"));
+}
 
-  if (!matches.length) {
+export function extractModalRunUrl(text) {
+  const rawText = String(text ?? "");
+  const directMatches = collectModalRunUrls(rawText);
+  if (directMatches.length > 0) {
+    directMatches.sort((left, right) => left.length - right.length);
+    return directMatches[0];
+  }
+
+  const lines = rawText
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const reconstructedMatches = [];
+
+  for (let index = 0; index < lines.length; index += 1) {
+    if (!lines[index].includes("https://")) {
+      continue;
+    }
+
+    let candidate = lines[index];
+    for (let continuationIndex = index + 1; continuationIndex < Math.min(lines.length, index + 4); continuationIndex += 1) {
+      const continuationToken = lines[continuationIndex].split(/\s+/)[0];
+      if (!continuationToken || continuationToken.startsWith("https://")) {
+        break;
+      }
+
+      candidate += continuationToken;
+      const candidateMatches = collectModalRunUrls(candidate);
+      if (candidateMatches.length > 0) {
+        reconstructedMatches.push(...candidateMatches);
+        break;
+      }
+    }
+  }
+
+  if (!reconstructedMatches.length) {
     return null;
   }
 
-  matches.sort((left, right) => left.length - right.length);
-  return matches[0];
+  reconstructedMatches.sort((left, right) => left.length - right.length);
+  return reconstructedMatches[0];
 }
 
 async function fetchJson(url, options = {}) {
@@ -442,31 +478,46 @@ async function runSmokeTest({ jobId, deploymentUrl, model, logger }) {
 
 async function runRecommendationStage(jobId, job) {
   const logger = createStageLogger(jobId, "recommending");
-  const recommendation = await recommendDatasets(
-    {
-      domain: job.input.domain,
-      qualityTier: job.input.qualityTier,
-      useCase: job.input.task,
-    },
-    {
-      logger,
-      skipDebugWrite: true,
-    },
-  );
-  await writeJsonFile(getJobPaths(jobId).recommendationPath, recommendation);
-  await completeStage(jobId, "recommending", "Recommendation completed.", (draft) => {
-    draft.artifacts.recommendationPath = getJobPaths(jobId).recommendationPath;
-    return draft;
-  });
-  await logger.emit({
-    source: "orchestrator",
-    level: "info",
-    message: "Saved recommendation output.",
-    data: {
-      path: getJobPaths(jobId).recommendationPath,
-      recommendedDatasets: recommendation.recommended_datasets?.map((item) => item.dataset) ?? [],
-    },
-  });
+  try {
+    const recommendation = await recommendDatasets(
+      {
+        domain: job.input.domain,
+        qualityTier: job.input.qualityTier,
+        useCase: job.input.task,
+      },
+      {
+        logger,
+        skipDebugWrite: true,
+      },
+    );
+    await writeJsonFile(getJobPaths(jobId).recommendationPath, recommendation);
+    await completeStage(jobId, "recommending", "Recommendation completed.", (draft) => {
+      draft.artifacts.recommendationPath = getJobPaths(jobId).recommendationPath;
+      return draft;
+    });
+    await logger.emit({
+      source: "orchestrator",
+      level: "info",
+      message: "Saved recommendation output.",
+      data: {
+        path: getJobPaths(jobId).recommendationPath,
+        recommendedDatasets: recommendation.recommended_datasets?.map((item) => item.dataset) ?? [],
+      },
+    });
+  } catch (error) {
+    if (error && typeof error === "object" && "recommendation" in error && error.recommendation) {
+      await writeJsonFile(getJobPaths(jobId).recommendationPath, error.recommendation);
+      await logger.emit({
+        source: "orchestrator",
+        level: "info",
+        message: "Saved recommendation diagnostics.",
+        data: {
+          path: getJobPaths(jobId).recommendationPath,
+        },
+      });
+    }
+    throw error;
+  }
 }
 
 async function runCompilerStage(jobId, job) {

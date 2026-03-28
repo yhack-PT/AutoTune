@@ -1,0 +1,9 @@
+{
+  "deployedAt": "2026-03-28T22:24:22.540Z",
+  "appName": "vllm-lora-customer-support-classify-support-ticket-2d9572fc",
+  "url": "https://andrew-qian64--vllm-lora-customer-support-classify-suppo-40e271.modal.run",
+  "adapterName": "customer-support-classify-support-ticket-2d9572fc",
+  "adapterPath": "experiments/customer-support-classify-support-ticket-2d9572fc/final_adapter",
+  "baseModel": "Qwen/Qwen3-8B-Base",
+  "gpuType": "L40S"
+}

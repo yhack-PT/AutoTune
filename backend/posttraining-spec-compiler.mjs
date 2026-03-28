@@ -3,13 +3,16 @@ import path from "node:path";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 
-const DATASET_VIEWER_URL = "https://datasets-server.huggingface.co";
+import {
+  inferOutputKindFromNormalization as inferOutputKindFromNormalizationShared,
+  validateNormalizationProposal as validateNormalizationProposalShared,
+} from "./posttraining-normalization.mjs";
+
 const OPENAI_RESPONSES_API_URL = "https://api.openai.com/v1/responses";
 const DEFAULT_OPENAI_MODEL = "gpt-5-mini";
 const DEFAULT_INPUT_PATH = "backend/datasets.json";
 const DEFAULT_OUTPUT_ROOT = "backend/generated-posttraining-jobs";
 const REQUEST_TIMEOUT_MS = 10_000;
-const ENRICHMENT_CONCURRENCY = 4;
 const MAX_REPAIR_ATTEMPTS = 3;
 const LOG_PREFIX = "[posttraining-spec-compiler]";
 const TRANSIENT_STATUS_CODES = new Set([408, 409, 429, 500, 502, 503, 504]);
@@ -38,30 +41,7 @@ const DEFAULT_TRAINING_PARAMS = {
   eval_steps: 200,
 };
 
-const ALLOWED_METHODS = ["sft", "dpo", "kto", "orpo", "cpo", "bco"];
 const ALLOWED_GPUS = ["A10", "L40S", "H100"];
-const ALLOWED_TRANSFORM_PRESETS = [
-  "sft_text",
-  "sft_messages",
-  "prompt_completion_passthrough",
-  "qa_to_prompt_completion",
-  "classification_to_prompt_completion",
-  "paired_preference_passthrough",
-  "paired_preference_chat",
-  "unpaired_preference_passthrough",
-];
-const SFT_PRESETS = new Set([
-  "sft_text",
-  "sft_messages",
-  "prompt_completion_passthrough",
-  "qa_to_prompt_completion",
-  "classification_to_prompt_completion",
-]);
-const PAIRED_PREFERENCE_PRESETS = new Set([
-  "paired_preference_passthrough",
-  "paired_preference_chat",
-]);
-const UNPAIRED_PREFERENCE_PRESETS = new Set(["unpaired_preference_passthrough"]);
 
 let dotEnvLoaded = false;
 let activeLogger = null;
@@ -93,6 +73,60 @@ function normalizeOptionalString(value) {
 
 function uniqueStrings(values) {
   return [...new Set(values.filter(Boolean))];
+}
+
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isNoOpValueMapping(valueMapping) {
+  if (!isPlainObject(valueMapping)) {
+    return false;
+  }
+
+  const entries = Object.entries(valueMapping);
+  return (
+    entries.length === 0 ||
+    entries.every(([rawValue, mappedValue]) => String(rawValue) === String(mappedValue))
+  );
+}
+
+function canonicalizeNormalizationField(fieldSpec) {
+  if (!isPlainObject(fieldSpec)) {
+    return fieldSpec;
+  }
+
+  const sourceColumn = normalizeOptionalString(fieldSpec.source_column);
+  const template = normalizeOptionalString(fieldSpec.template);
+  const shouldStripValueMapping = sourceColumn && !template && isNoOpValueMapping(fieldSpec.value_mapping);
+
+  return {
+    ...fieldSpec,
+    value_mapping: shouldStripValueMapping ? null : fieldSpec.value_mapping ?? null,
+  };
+}
+
+function canonicalizeNormalizationProposal(normalizationProposal) {
+  if (!isPlainObject(normalizationProposal)) {
+    return null;
+  }
+
+  const fields = isPlainObject(normalizationProposal.fields)
+    ? { ...normalizationProposal.fields }
+    : normalizationProposal.fields;
+
+  if (isPlainObject(fields)) {
+    for (const fieldName of ["text", "prompt", "completion"]) {
+      if (isPlainObject(fields[fieldName])) {
+        fields[fieldName] = canonicalizeNormalizationField(fields[fieldName]);
+      }
+    }
+  }
+
+  return {
+    ...normalizationProposal,
+    fields,
+  };
 }
 
 function slugify(value) {
@@ -305,20 +339,6 @@ function extractOpenAIOutputText(response) {
   return "";
 }
 
-async function fetchViewerEndpoint(endpointPath, params) {
-  const url = new URL(endpointPath, DATASET_VIEWER_URL);
-  for (const [key, value] of Object.entries(params ?? {})) {
-    if (value !== null && value !== undefined && value !== "") {
-      url.searchParams.set(key, String(value));
-    }
-  }
-  return fetchJson(url.toString(), {
-    timeoutMs: 15_000,
-    maxRetries: 2,
-    requestLabel: `HF dataset viewer ${endpointPath}`,
-  });
-}
-
 function parseCliArgs(argv) {
   const parsed = {
     inputPath: DEFAULT_INPUT_PATH,
@@ -391,6 +411,30 @@ function normalizeCandidate(candidate) {
     schema_signals: Array.isArray(candidate.schema_signals)
       ? uniqueStrings(candidate.schema_signals.map((value) => String(value).trim()))
       : [],
+    compatibility_status: normalizeOptionalString(candidate.compatibility_status) ?? "unknown",
+    compatibility_reason: normalizeOptionalString(candidate.compatibility_reason) ?? "",
+    source_schema:
+      candidate.source_schema && typeof candidate.source_schema === "object"
+        ? {
+            available_columns: Array.isArray(candidate.source_schema.available_columns)
+              ? uniqueStrings(candidate.source_schema.available_columns.map((value) => String(value).trim()))
+              : [],
+            sample_rows: Array.isArray(candidate.source_schema.sample_rows)
+              ? candidate.source_schema.sample_rows
+              : [],
+          }
+        : { available_columns: [], sample_rows: [] },
+    preferred_dataset_config: normalizeOptionalString(candidate.preferred_dataset_config),
+    preferred_train_split: normalizeOptionalString(candidate.preferred_train_split) ?? "train",
+    preferred_eval_split: normalizeOptionalString(candidate.preferred_eval_split),
+    normalization_source: normalizeOptionalString(candidate.normalization_source),
+    normalization_proposal:
+      candidate.normalization_proposal && typeof candidate.normalization_proposal === "object"
+        ? canonicalizeNormalizationProposal(candidate.normalization_proposal)
+        : null,
+    compatible_methods: Array.isArray(candidate.compatible_methods)
+      ? uniqueStrings(candidate.compatible_methods.map((value) => String(value).trim()))
+      : [],
     warnings: Array.isArray(candidate.warnings)
       ? uniqueStrings(candidate.warnings.map((value) => String(value).trim()))
       : [],
@@ -447,311 +491,6 @@ function normalizeCompilerInput(rawInput, contextOverride = null) {
   };
 }
 
-function normalizeKey(value) {
-  return String(value ?? "")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "_")
-    .replace(/^_+|_+$/g, "");
-}
-
-function firstMatchingColumn(columnMap, candidates) {
-  for (const candidate of candidates) {
-    const normalized = normalizeKey(candidate);
-    if (columnMap.has(normalized)) {
-      return columnMap.get(normalized);
-    }
-  }
-  return null;
-}
-
-function extractRowsFromPreview(previewPayload) {
-  if (!Array.isArray(previewPayload?.rows)) {
-    return [];
-  }
-  return previewPayload.rows
-    .map((rowEntry) => (rowEntry?.row && typeof rowEntry.row === "object" ? rowEntry.row : null))
-    .filter(Boolean);
-}
-
-function looksLikeMessages(value) {
-  return (
-    Array.isArray(value) &&
-    value.length > 0 &&
-    value.every((item) => item && typeof item === "object" && "role" in item)
-  );
-}
-
-function getSampleValue(rows, columnName) {
-  for (const row of rows) {
-    if (row && Object.prototype.hasOwnProperty.call(row, columnName)) {
-      return row[columnName];
-    }
-  }
-  return null;
-}
-
-function buildLabelMappingHint(rows, labelColumn) {
-  const values = uniqueStrings(
-    rows
-      .map((row) => row?.[labelColumn])
-      .filter((value) => value !== null && value !== undefined)
-      .map((value) => String(value)),
-  ).slice(0, 12);
-
-  if (!values.length) {
-    return null;
-  }
-
-  return Object.fromEntries(values.map((value) => [value, value]));
-}
-
-function pushTransformOption(options, preset, fieldMappingHint, extra = {}) {
-  options.push({
-    transform_preset: preset,
-    field_mapping_hint: fieldMappingHint,
-    output_kind: extra.output_kind ?? "unknown",
-    label_mapping_hint: extra.label_mapping_hint ?? null,
-    prompt_template_hint: extra.prompt_template_hint ?? null,
-    method_support: extra.method_support ?? [],
-  });
-}
-
-function inferTransformOptions(featureNames, sampleRows) {
-  const options = [];
-  const columnMap = new Map(featureNames.map((name) => [normalizeKey(name), name]));
-
-  const messagesColumn = firstMatchingColumn(columnMap, [
-    "messages",
-    "conversation",
-    "conversations",
-    "dialog",
-    "dialogue",
-    "chat",
-  ]);
-  if (messagesColumn && looksLikeMessages(getSampleValue(sampleRows, messagesColumn))) {
-    pushTransformOption(options, "sft_messages", { messages: messagesColumn }, {
-      output_kind: "text",
-      method_support: ["sft"],
-    });
-  }
-
-  const promptColumn = firstMatchingColumn(columnMap, ["prompt", "instruction", "input"]);
-  const completionColumn = firstMatchingColumn(columnMap, ["completion", "response", "output"]);
-  if (promptColumn && completionColumn) {
-    pushTransformOption(
-      options,
-      "prompt_completion_passthrough",
-      { prompt: promptColumn, completion: completionColumn },
-      {
-        output_kind: "prompt_completion",
-        method_support: ["sft"],
-      },
-    );
-  }
-
-  const questionColumn = firstMatchingColumn(columnMap, ["question", "query"]);
-  const answerColumn = firstMatchingColumn(columnMap, ["answer", "answers", "response"]);
-  const contextColumn = firstMatchingColumn(columnMap, ["context", "passage", "document"]);
-  if (questionColumn && answerColumn) {
-    pushTransformOption(
-      options,
-      "qa_to_prompt_completion",
-      {
-        question: questionColumn,
-        answer: answerColumn,
-        ...(contextColumn ? { context: contextColumn } : {}),
-      },
-      {
-        output_kind: "prompt_completion",
-        method_support: ["sft"],
-        prompt_template_hint: contextColumn
-          ? "Context:\n{context}\n\nQuestion:\n{question}\n\nAnswer:"
-          : "Question:\n{question}\n\nAnswer:",
-      },
-    );
-  }
-
-  const inputColumn = firstMatchingColumn(columnMap, [
-    "text",
-    "content",
-    "body",
-    "ticket",
-    "input",
-    "utterance",
-  ]);
-  const labelColumn = firstMatchingColumn(columnMap, [
-    "label",
-    "labels",
-    "category",
-    "class",
-    "intent",
-    "topic",
-  ]);
-  if (inputColumn && labelColumn) {
-    pushTransformOption(
-      options,
-      "classification_to_prompt_completion",
-      { input: inputColumn, label: labelColumn },
-      {
-        output_kind: "prompt_completion",
-        method_support: ["sft"],
-        label_mapping_hint: buildLabelMappingHint(sampleRows, labelColumn),
-        prompt_template_hint:
-          "Classify the following example. Return only the label.\n\nAvailable labels: {label_space}\n\nInput:\n{input}\n\nLabel:",
-      },
-    );
-  }
-
-  if (inputColumn) {
-    pushTransformOption(options, "sft_text", { text: inputColumn }, {
-      output_kind: "text",
-      method_support: ["sft"],
-    });
-  }
-
-  const chosenColumn = firstMatchingColumn(columnMap, ["chosen", "preferred", "accept"]);
-  const rejectedColumn = firstMatchingColumn(columnMap, ["rejected", "dispreferred", "reject"]);
-  if (promptColumn && chosenColumn && rejectedColumn) {
-    const sampleChosen = getSampleValue(sampleRows, chosenColumn);
-    const sampleRejected = getSampleValue(sampleRows, rejectedColumn);
-    const pairedPreset =
-      looksLikeMessages(sampleChosen) || looksLikeMessages(sampleRejected)
-        ? "paired_preference_chat"
-        : "paired_preference_passthrough";
-    pushTransformOption(
-      options,
-      pairedPreset,
-      { prompt: promptColumn, chosen: chosenColumn, rejected: rejectedColumn },
-      {
-        output_kind: "paired_preference",
-        method_support: ["dpo", "orpo", "cpo", "kto", "bco"],
-      },
-    );
-  }
-
-  const preferenceCompletionColumn =
-    completionColumn ?? firstMatchingColumn(columnMap, ["answer", "response", "output"]);
-  if (promptColumn && preferenceCompletionColumn && labelColumn) {
-    pushTransformOption(
-      options,
-      "unpaired_preference_passthrough",
-      {
-        prompt: promptColumn,
-        completion: preferenceCompletionColumn,
-        label: labelColumn,
-      },
-      {
-        output_kind: "unpaired_preference",
-        method_support: ["kto", "bco"],
-        label_mapping_hint: buildLabelMappingHint(sampleRows, labelColumn),
-      },
-    );
-  }
-
-  return options.filter(
-    (option, index, collection) =>
-      collection.findIndex((candidate) => candidate.transform_preset === option.transform_preset) === index,
-  );
-}
-
-function inferSupportedMethods(transformOptions) {
-  return uniqueStrings(transformOptions.flatMap((option) => option.method_support));
-}
-
-function inferOutputKind(method, preset) {
-  if (method === "sft") {
-    if (preset === "sft_text") {
-      return "sft_text";
-    }
-    if (preset === "sft_messages") {
-      return "sft_messages";
-    }
-    return "prompt_completion";
-  }
-  if (method === "kto" || method === "bco") {
-    return "unpaired_preference";
-  }
-  return "paired_preference";
-}
-
-function selectPreferredTrainSplit(splits) {
-  const preferredOrder = ["train", "training", "default"];
-  for (const preferred of preferredOrder) {
-    const match = splits.find((split) => normalizeOptionalString(split.split)?.toLowerCase() === preferred);
-    if (match) {
-      return match;
-    }
-  }
-  return splits[0] ?? null;
-}
-
-function selectPreferredEvalSplit(splits) {
-  const preferredOrder = ["validation", "dev", "test", "eval"];
-  for (const preferred of preferredOrder) {
-    const match = splits.find((split) => normalizeOptionalString(split.split)?.toLowerCase() === preferred);
-    if (match) {
-      return match;
-    }
-  }
-  return null;
-}
-
-function summarizeRow(row) {
-  const summarized = {};
-  for (const [key, value] of Object.entries(row ?? {})) {
-    if (looksLikeMessages(value)) {
-      summarized[key] = value.slice(0, 2).map((message) => ({
-        role: message.role,
-        content: truncateText(message.content, 120),
-      }));
-    } else if (Array.isArray(value)) {
-      summarized[key] = value.slice(0, 4).map((item) =>
-        typeof item === "string" ? truncateText(item, 120) : item,
-      );
-    } else if (value && typeof value === "object") {
-      summarized[key] = truncateText(JSON.stringify(value), 160);
-    } else {
-      summarized[key] = truncateText(value, 160);
-    }
-  }
-  return summarized;
-}
-
-async function enrichCandidate(candidate) {
-  const splitsPayload = await fetchViewerEndpoint("/splits", { dataset: candidate.dataset }).catch(() => null);
-  const splitEntries = Array.isArray(splitsPayload?.splits) ? splitsPayload.splits : [];
-  const preferredTrainSplit = selectPreferredTrainSplit(splitEntries);
-  const preferredEvalSplit = selectPreferredEvalSplit(splitEntries);
-
-  let previewPayload = null;
-  if (preferredTrainSplit?.split) {
-    previewPayload = await fetchViewerEndpoint("/first-rows", {
-      dataset: candidate.dataset,
-      config: preferredTrainSplit.config ?? null,
-      split: preferredTrainSplit.split,
-    }).catch(() => null);
-  }
-
-  const featureNames = Array.isArray(previewPayload?.features)
-    ? previewPayload.features.map((feature) => String(feature?.name ?? "")).filter(Boolean)
-    : [];
-  const sampleRows = extractRowsFromPreview(previewPayload).slice(0, 3);
-  const rowKeys = uniqueStrings(sampleRows.flatMap((row) => Object.keys(row ?? {})));
-  const availableColumns = uniqueStrings([...featureNames, ...rowKeys]);
-  const transformOptions = inferTransformOptions(availableColumns, sampleRows);
-
-  return {
-    ...candidate,
-    preferred_dataset_config: normalizeOptionalString(preferredTrainSplit?.config) ?? null,
-    preferred_train_split: normalizeOptionalString(preferredTrainSplit?.split) ?? "train",
-    preferred_eval_split: normalizeOptionalString(preferredEvalSplit?.split),
-    feature_names: availableColumns,
-    sample_rows: sampleRows.map((row) => summarizeRow(row)),
-    transform_options: transformOptions,
-    supported_methods: inferSupportedMethods(transformOptions),
-  };
-}
-
 function buildObjectiveSummary(context, args, candidates) {
   const explicit = normalizeOptionalString(args.objectiveSummary);
   if (explicit) {
@@ -781,18 +520,17 @@ function buildObjectiveSummary(context, args, candidates) {
 function buildPlatformConstraints(seedArtifact) {
   return {
     text_only: true,
-    supported_methods: ALLOWED_METHODS,
+    supported_methods: ["sft"],
     default_adaptation_strategy: "lora",
     default_artifact_strategy: "adapter",
-    allowed_transform_presets: ALLOWED_TRANSFORM_PRESETS,
+    allowed_normalization_shapes: ["text", "prompt_completion"],
     allowed_compute_gpus: ALLOWED_GPUS,
     allowed_base_models: [DEFAULT_BASE_MODEL],
     seed_artifact_available: Boolean(normalizeOptionalString(seedArtifact)),
     seed_artifact: normalizeOptionalString(seedArtifact),
     trainer_notes: [
-      "SFT mixes must normalize to a single final shape: either all text-style or all prompt-completion-style.",
-      "DPO, ORPO, and CPO require paired preference data.",
-      "KTO and BCO require unpaired preference data, but paired preference datasets may be converted to unpaired.",
+      "This normalization redesign currently supports SFT only.",
+      "All selected datasets must normalize to the same final SFT shape: either text or prompt-completion.",
       "LoRA is the default adaptation strategy and should usually remain unchanged.",
     ],
   };
@@ -813,10 +551,12 @@ function buildCandidatePromptPayload(candidateProfiles) {
     preferred_dataset_config: candidate.preferred_dataset_config,
     preferred_train_split: candidate.preferred_train_split,
     preferred_eval_split: candidate.preferred_eval_split,
-    feature_names: candidate.feature_names,
-    sample_rows: candidate.sample_rows,
-    transform_options: candidate.transform_options,
-    supported_methods: candidate.supported_methods,
+    source_schema: candidate.source_schema,
+    normalization_proposal: candidate.normalization_proposal,
+    compatibility_status: candidate.compatibility_status,
+    compatibility_reason: candidate.compatibility_reason,
+    normalization_source: candidate.normalization_source,
+    compatible_methods: candidate.compatible_methods,
   }));
 }
 
@@ -832,13 +572,13 @@ function buildSpecPrompt({
   const lines = [
     "Produce a compact PostTrainingJobSpec for text-only LLM post-training.",
     "You must select the training method and the dataset mix.",
-    "Use only the provided dataset candidates. Do not invent dataset ids, columns, or transforms.",
-    "Method and LoRA are different axes: the method is sft/dpo/kto/orpo/cpo/bco, while LoRA is the default adaptation strategy.",
+    "Use only the provided dataset candidates. Do not invent dataset ids, columns, or normalization recipes.",
+    "Each candidate already includes a canonical normalization proposal and its compatible methods.",
+    "Method and LoRA are different axes: the method is the trainer choice, while LoRA is the default adaptation strategy.",
     "Choose 1-3 datasets only when mixing materially improves coverage or robustness.",
     "All selected datasets must be executable by the current trainer backend.",
-    "For SFT mixes, do not mix text-style outputs with prompt-completion-style outputs in the same job.",
-    "For non-SFT methods, choose them only when the selected datasets truly support that preference format.",
-    "If no seed artifact is available, choose SFT.",
+    "Do not mix text-style outputs with prompt-completion-style outputs in the same job.",
+    "The current normalization redesign supports SFT-compatible datasets only.",
     `Job id: ${jobId}`,
     `Objective summary: ${objectiveSummary}`,
     `Recommender analysis: ${JSON.stringify(context.analysis ?? {})}`,
@@ -859,13 +599,13 @@ function buildSpecPrompt({
   return lines.join("\n");
 }
 
-function getSpecSchema() {
+function getSpecSchema(supportedMethods = ["sft"]) {
   return {
     type: "object",
     additionalProperties: false,
     properties: {
       objective_summary: { type: "string" },
-      method: { type: "string", enum: ALLOWED_METHODS },
+      method: { type: "string", enum: supportedMethods },
       adaptation_strategy: { type: "string", enum: ["lora"] },
       artifact_strategy: { type: "string", enum: ["adapter", "merged"] },
       base_model: {
@@ -890,16 +630,6 @@ function getSpecSchema() {
             train_split: { type: "string" },
             eval_split: { type: ["string", "null"] },
             weight: { type: "number", exclusiveMinimum: 0 },
-            transform_preset: { type: "string", enum: ALLOWED_TRANSFORM_PRESETS },
-            field_mapping: {
-              type: "object",
-              additionalProperties: { type: "string" },
-            },
-            label_mapping: {
-              type: ["object", "null"],
-              additionalProperties: { type: "string" },
-            },
-            prompt_template: { type: ["string", "null"] },
             warnings: {
               type: "array",
               items: { type: "string" },
@@ -912,10 +642,6 @@ function getSpecSchema() {
             "train_split",
             "eval_split",
             "weight",
-            "transform_preset",
-            "field_mapping",
-            "label_mapping",
-            "prompt_template",
             "warnings",
             "include_reason",
           ],
@@ -994,7 +720,7 @@ function getSpecSchema() {
   };
 }
 
-async function callOpenAISpecPlanner(prompt) {
+async function callOpenAISpecPlanner(prompt, specSchema) {
   await ensureDotEnvLoaded();
 
   const apiKey = normalizeOptionalString(process.env.OPENAI_API_KEY);
@@ -1021,7 +747,7 @@ async function callOpenAISpecPlanner(prompt) {
         {
           role: "system",
           content:
-            "You plan post-training jobs for a text-only TRL + Modal backend. Return only the requested JSON structure and use only the provided datasets and transforms.",
+            "You plan post-training jobs for a text-only TRL + Modal backend. Return only the requested JSON structure and use only the provided datasets and normalization proposals.",
         },
         {
           role: "user",
@@ -1032,7 +758,7 @@ async function callOpenAISpecPlanner(prompt) {
         format: {
           type: "json_schema",
           name: "post_training_job_spec",
-          schema: getSpecSchema(),
+          schema: specSchema,
           strict: true,
         },
       },
@@ -1059,58 +785,6 @@ async function callOpenAISpecPlanner(prompt) {
   }
 }
 
-function validateFieldMapping(fieldMapping, validColumns, datasetId, requiredKeys) {
-  if (!fieldMapping || typeof fieldMapping !== "object" || Array.isArray(fieldMapping)) {
-    return [`${datasetId}: field_mapping must be an object.`];
-  }
-
-  const errors = [];
-  for (const key of requiredKeys) {
-    const value = fieldMapping[key];
-    if (typeof value !== "string" || !value.trim()) {
-      errors.push(`${datasetId}: field_mapping.${key} must be a non-empty string.`);
-    } else if (!validColumns.has(value)) {
-      errors.push(`${datasetId}: field_mapping.${key} references unknown column '${value}'.`);
-    }
-  }
-  return errors;
-}
-
-function requiredFieldKeysForPreset(preset) {
-  switch (preset) {
-    case "sft_text":
-      return ["text"];
-    case "sft_messages":
-      return ["messages"];
-    case "prompt_completion_passthrough":
-      return ["prompt", "completion"];
-    case "qa_to_prompt_completion":
-      return ["question", "answer"];
-    case "classification_to_prompt_completion":
-      return ["input", "label"];
-    case "paired_preference_passthrough":
-    case "paired_preference_chat":
-      return ["prompt", "chosen", "rejected"];
-    case "unpaired_preference_passthrough":
-      return ["prompt", "completion", "label"];
-    default:
-      return [];
-  }
-}
-
-function validateMethodForPreset(method, preset) {
-  if (method === "sft") {
-    return SFT_PRESETS.has(preset);
-  }
-  if (method === "dpo" || method === "orpo" || method === "cpo") {
-    return PAIRED_PREFERENCE_PRESETS.has(preset);
-  }
-  if (method === "kto" || method === "bco") {
-    return PAIRED_PREFERENCE_PRESETS.has(preset) || UNPAIRED_PREFERENCE_PRESETS.has(preset);
-  }
-  return false;
-}
-
 function normalizeWeights(selectedDatasets) {
   const total = selectedDatasets.reduce((sum, dataset) => sum + Number(dataset.weight ?? 0), 0);
   if (!Number.isFinite(total) || total <= 0) {
@@ -1134,8 +808,8 @@ function validateAndFinalizeSpec(rawSpec, candidateProfiles, platformConstraints
     seed_artifact: normalizeOptionalString(rawSpec?.seed_artifact) ?? normalizeOptionalString(seedArtifact),
   };
 
-  if (!ALLOWED_METHODS.includes(spec.method)) {
-    errors.push(`method must be one of ${ALLOWED_METHODS.join(", ")}.`);
+  if (!platformConstraints.supported_methods.includes(spec.method)) {
+    errors.push(`method must be one of ${platformConstraints.supported_methods.join(", ")}.`);
   }
   if (spec.adaptation_strategy !== "lora") {
     errors.push("adaptation_strategy must be 'lora' for the current backend.");
@@ -1219,39 +893,21 @@ function validateAndFinalizeSpec(rawSpec, candidateProfiles, platformConstraints
       continue;
     }
 
-    const transformPreset = normalizeOptionalString(selectedDataset.transform_preset);
-    if (!transformPreset || !ALLOWED_TRANSFORM_PRESETS.includes(transformPreset)) {
-      errors.push(`${datasetId}: transform_preset must be one of ${ALLOWED_TRANSFORM_PRESETS.join(", ")}.`);
+    if (!candidate.normalization_proposal) {
+      errors.push(`${datasetId}: candidate is missing a normalization proposal.`);
       continue;
     }
 
-    const supportedPresetNames = new Set(candidate.transform_options.map((option) => option.transform_preset));
-    if (!supportedPresetNames.has(transformPreset)) {
-      errors.push(
-        `${datasetId}: transform_preset '${transformPreset}' is not supported by the enriched schema for that dataset.`,
-      );
-    }
-
-    if (!validateMethodForPreset(spec.method, transformPreset)) {
-      errors.push(`${datasetId}: transform_preset '${transformPreset}' is incompatible with method '${spec.method}'.`);
-    }
-
-    const validColumns = new Set(candidate.feature_names);
-    errors.push(
-      ...validateFieldMapping(
-        selectedDataset.field_mapping,
-        validColumns,
-        datasetId,
-        requiredFieldKeysForPreset(transformPreset),
-      ),
+    const normalizationErrors = validateNormalizationProposalShared(
+      candidate.normalization_proposal,
+      candidate.source_schema?.available_columns ?? [],
     );
+    if (normalizationErrors.length > 0) {
+      errors.push(...normalizationErrors.map((error) => `${datasetId}: ${error}`));
+    }
 
-    if (
-      selectedDataset.label_mapping !== null &&
-      selectedDataset.label_mapping !== undefined &&
-      (typeof selectedDataset.label_mapping !== "object" || Array.isArray(selectedDataset.label_mapping))
-    ) {
-      errors.push(`${datasetId}: label_mapping must be either null or an object.`);
+    if (!candidate.compatible_methods.includes(spec.method)) {
+      errors.push(`${datasetId}: normalization proposal is incompatible with method '${spec.method}'.`);
     }
 
     const rawWeight = Number(selectedDataset.weight);
@@ -1259,7 +915,10 @@ function validateAndFinalizeSpec(rawSpec, candidateProfiles, platformConstraints
       errors.push(`${datasetId}: weight must be a positive number.`);
     }
 
-    const outputKind = inferOutputKind(spec.method, transformPreset);
+    const outputKind = inferOutputKindFromNormalizationShared(spec.method, candidate.normalization_proposal);
+    if (outputKind === "unsupported") {
+      errors.push(`${datasetId}: normalization proposal does not support method '${spec.method}'.`);
+    }
     outputKinds.add(outputKind);
 
     selectedDatasets.push({
@@ -1270,10 +929,9 @@ function validateAndFinalizeSpec(rawSpec, candidateProfiles, platformConstraints
       eval_split:
         normalizeOptionalString(selectedDataset.eval_split) ?? candidate.preferred_eval_split ?? null,
       weight: rawWeight,
-      transform_preset: transformPreset,
-      field_mapping: selectedDataset.field_mapping ?? {},
-      label_mapping: selectedDataset.label_mapping ?? null,
-      prompt_template: normalizeOptionalString(selectedDataset.prompt_template),
+      source_schema: candidate.source_schema,
+      normalization: candidate.normalization_proposal,
+      compatible_methods: candidate.compatible_methods,
       warnings: uniqueStrings([
         ...(candidate.warnings ?? []),
         ...(Array.isArray(selectedDataset.warnings) ? selectedDataset.warnings.map((value) => String(value)) : []),
@@ -1288,10 +946,6 @@ function validateAndFinalizeSpec(rawSpec, candidateProfiles, platformConstraints
         [...outputKinds],
       )}.`,
     );
-  }
-
-  if (spec.method !== "sft" && !spec.seed_artifact) {
-    errors.push("seed_artifact is required for dpo, kto, orpo, cpo, and bco runs.");
   }
 
   if (errors.length > 0) {
@@ -1350,10 +1004,9 @@ function buildPreparedDatasetManifest(spec) {
       train_split: dataset.train_split,
       eval_split: dataset.eval_split,
       weight: dataset.weight,
-      transform_preset: dataset.transform_preset,
-      field_mapping: dataset.field_mapping,
-      label_mapping: dataset.label_mapping,
-      prompt_template: dataset.prompt_template,
+      source_schema: dataset.source_schema,
+      normalization: dataset.normalization,
+      compatible_methods: dataset.compatible_methods,
       warnings: dataset.warnings,
       include_reason: dataset.include_reason,
     })),
@@ -1487,9 +1140,8 @@ function buildDefaultTrainingParams(method) {
 }
 
 function buildFallbackSpec(objectiveSummary, jobId, candidateProfiles, seedArtifact) {
-  const firstCandidate = candidateProfiles[0];
-  const transform = firstCandidate.transform_options.find((option) => SFT_PRESETS.has(option.transform_preset));
-  if (!firstCandidate || !transform) {
+  const firstCandidate = candidateProfiles.find((candidate) => candidate.compatible_methods.includes("sft"));
+  if (!firstCandidate || !firstCandidate.normalization_proposal) {
     throw new Error("Unable to build even a fallback SFT spec because no compatible SFT dataset candidate was found.");
   }
 
@@ -1507,10 +1159,9 @@ function buildFallbackSpec(objectiveSummary, jobId, candidateProfiles, seedArtif
         train_split: firstCandidate.preferred_train_split,
         eval_split: firstCandidate.preferred_eval_split,
         weight: 1,
-        transform_preset: transform.transform_preset,
-        field_mapping: transform.field_mapping_hint,
-        label_mapping: transform.label_mapping_hint,
-        prompt_template: transform.prompt_template_hint,
+        source_schema: firstCandidate.source_schema,
+        normalization: firstCandidate.normalization_proposal,
+        compatible_methods: firstCandidate.compatible_methods,
         warnings: firstCandidate.warnings,
         include_reason: firstCandidate.why || "Fallback compatible dataset selection.",
       },
@@ -1537,10 +1188,12 @@ async function generateValidatedSpec({
   platformConstraints,
   seedArtifact,
   jobId,
+  specPlanner,
 }) {
   const attempts = [];
   let previousSpec = null;
   let validationErrors = [];
+  const specSchema = getSpecSchema(platformConstraints.supported_methods);
 
   for (let attempt = 1; attempt <= MAX_REPAIR_ATTEMPTS; attempt += 1) {
     const prompt = buildSpecPrompt({
@@ -1553,7 +1206,11 @@ async function generateValidatedSpec({
       validationErrors,
     });
 
-    const openAIResult = await callOpenAISpecPlanner(prompt);
+    const openAIResult = await (
+      typeof specPlanner === "function"
+        ? specPlanner({ prompt, specSchema, attempt, previousSpec, validationErrors })
+        : callOpenAISpecPlanner(prompt, specSchema)
+    );
     const validation = validateAndFinalizeSpec(
       openAIResult.parsed,
       candidateProfiles,
@@ -1645,26 +1302,43 @@ export async function runCompiler(args, options = {}) {
     const contextOverride = args.contextPath ? await loadJsonFile(args.contextPath) : null;
     const normalizedInput = normalizeCompilerInput(rawInput, contextOverride);
     const sortedCandidates = [...normalizedInput.candidates].sort((left, right) => right.score - left.score);
-    const candidatesToEnrich = sortedCandidates.slice(0, 8);
+    const candidateProfiles = sortedCandidates.slice(0, 8);
 
-    logInfo(`enriching ${candidatesToEnrich.length} ranked dataset candidates`);
-    const candidateProfiles = await mapWithConcurrency(
-      candidatesToEnrich,
-      ENRICHMENT_CONCURRENCY,
-      enrichCandidate,
-    );
-
-    const usableCandidates = candidateProfiles.filter((candidate) => candidate.transform_options.length > 0);
+    logInfo(`loaded ${candidateProfiles.length} ranked dataset candidates from recommendation output`);
+    const candidateDiagnostics = candidateProfiles.map((candidate) => {
+      const validationErrors = candidate.normalization_proposal
+        ? validateNormalizationProposalShared(
+            candidate.normalization_proposal,
+            candidate.source_schema?.available_columns ?? [],
+          )
+        : ["candidate is missing a normalization proposal."];
+      return {
+        candidate,
+        validationErrors,
+      };
+    });
+    const usableCandidates = candidateDiagnostics
+      .filter(
+        ({ candidate, validationErrors }) =>
+          validationErrors.length === 0 && candidate.compatible_methods.includes("sft"),
+      )
+      .map(({ candidate }) => candidate);
     if (!usableCandidates.length) {
+      const diagnosticMessage = candidateDiagnostics
+        .map(({ candidate, validationErrors }) =>
+          `${candidate.dataset}: ${validationErrors.join(" ") || "not compatible with sft."}`,
+        )
+        .join(" ; ");
       throw new Error(
-        "None of the enriched dataset candidates exposed a supported transform preset for the current backend.",
+        `None of the recommended dataset candidates exposed a valid normalization proposal for the current backend. ${diagnosticMessage}`,
       );
     }
 
     const objectiveSummary = buildObjectiveSummary(normalizedInput.context, args, usableCandidates);
     const timestamp = new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14);
-    const generatedJobId = normalizeOptionalString(args.jobId)
-      ? slugify(args.jobId)
+    const explicitJobId = normalizeOptionalString(args.jobId)?.replace(/[\\/]+/g, "-");
+    const generatedJobId = explicitJobId
+      ? explicitJobId
       : `${slugify(objectiveSummary || usableCandidates[0].dataset || "job")}-${timestamp}`;
     const platformConstraints = buildPlatformConstraints(args.seedArtifact);
 
@@ -1675,6 +1349,7 @@ export async function runCompiler(args, options = {}) {
       platformConstraints,
       seedArtifact: args.seedArtifact,
       jobId: generatedJobId,
+      specPlanner: options.specPlanner,
     });
 
     const preparedDatasetManifest = buildPreparedDatasetManifest(spec);
@@ -1688,8 +1363,12 @@ export async function runCompiler(args, options = {}) {
       context_path: args.contextPath ? path.resolve(args.contextPath) : null,
       usable_candidates: usableCandidates.map((candidate) => ({
         dataset: candidate.dataset,
-        supported_methods: candidate.supported_methods,
-        transform_options: candidate.transform_options,
+        compatibility_status: candidate.compatibility_status,
+        compatibility_reason: candidate.compatibility_reason,
+        normalization_source: candidate.normalization_source,
+        compatible_methods: candidate.compatible_methods,
+        normalization_proposal: candidate.normalization_proposal,
+        source_schema: candidate.source_schema,
         preferred_dataset_config: candidate.preferred_dataset_config,
         preferred_train_split: candidate.preferred_train_split,
         preferred_eval_split: candidate.preferred_eval_split,
@@ -1721,7 +1400,7 @@ export async function runCompiler(args, options = {}) {
       selected_datasets: spec.selected_datasets.map((dataset) => ({
         dataset: dataset.dataset,
         weight: dataset.weight,
-        transform_preset: dataset.transform_preset,
+        normalization_shape: dataset.normalization?.shape ?? null,
       })),
       compiled_config_path: path.join(outputDir, "compiled_train_config.yaml"),
       spec_path: path.join(outputDir, "post_training_job_spec.yaml"),

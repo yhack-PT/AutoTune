@@ -1,0 +1,68 @@
+{
+  "jobId": "customer-support-classify-support-ticket-dc6d7998",
+  "status": "failed",
+  "currentStage": "failed",
+  "createdAt": "2026-03-28T22:12:40.499Z",
+  "updatedAt": "2026-03-28T22:16:34.464Z",
+  "input": {
+    "domain": "customer support",
+    "task": "Classify support tickets by issue type and urgency.",
+    "qualityTier": 3,
+    "seedArtifact": null
+  },
+  "method": "sft",
+  "selectedDatasets": [
+    "Tobi-Bueck/customer-support-tickets"
+  ],
+  "errorSummary": "Could not determine the deployed modal.run URL from Modal deploy output.",
+  "artifacts": {
+    "jobDir": "/home/andrew/code/PT/backend/generated-posttraining-jobs/customer-support-classify-support-ticket-dc6d7998",
+    "recommendationPath": "/home/andrew/code/PT/backend/generated-posttraining-jobs/customer-support-classify-support-ticket-dc6d7998/recommendation.json",
+    "specPath": "/home/andrew/code/PT/backend/generated-posttraining-jobs/customer-support-classify-support-ticket-dc6d7998/post_training_job_spec.yaml",
+    "compiledConfigPath": "/home/andrew/code/PT/backend/generated-posttraining-jobs/customer-support-classify-support-ticket-dc6d7998/compiled_train_config.yaml",
+    "manifestPath": "/home/andrew/code/PT/backend/generated-posttraining-jobs/customer-support-classify-support-ticket-dc6d7998/prepared_dataset_manifest.json",
+    "compilerTracePath": "/home/andrew/code/PT/backend/generated-posttraining-jobs/customer-support-classify-support-ticket-dc6d7998/compiler_trace.json",
+    "trainingResultPath": "/home/andrew/code/PT/backend/generated-posttraining-jobs/customer-support-classify-support-ticket-dc6d7998/training_result.json",
+    "deploymentPath": "/home/andrew/code/PT/backend/generated-posttraining-jobs/customer-support-classify-support-ticket-dc6d7998/deployment.json",
+    "smokeTestPath": "/home/andrew/code/PT/backend/generated-posttraining-jobs/customer-support-classify-support-ticket-dc6d7998/smoke_test.json"
+  },
+  "deployment": null,
+  "smokeTest": null,
+  "stageHistory": [
+    {
+      "stage": "queued",
+      "status": "completed",
+      "startedAt": "2026-03-28T22:12:40.499Z",
+      "completedAt": "2026-03-28T22:12:40.499Z",
+      "errorSummary": null
+    },
+    {
+      "stage": "recommending",
+      "status": "completed",
+      "startedAt": "2026-03-28T22:12:40.596Z",
+      "completedAt": "2026-03-28T22:14:51.841Z",
+      "errorSummary": null
+    },
+    {
+      "stage": "compiling",
+      "status": "completed",
+      "startedAt": "2026-03-28T22:14:51.846Z",
+      "completedAt": "2026-03-28T22:15:26.143Z",
+      "errorSummary": null
+    },
+    {
+      "stage": "training",
+      "status": "completed",
+      "startedAt": "2026-03-28T22:15:26.146Z",
+      "completedAt": "2026-03-28T22:16:30.282Z",
+      "errorSummary": null
+    },
+    {
+      "stage": "deploying",
+      "status": "failed",
+      "startedAt": "2026-03-28T22:16:30.286Z",
+      "completedAt": "2026-03-28T22:16:34.464Z",
+      "errorSummary": "Could not determine the deployed modal.run URL from Modal deploy output."
+    }
+  ]
+}

@@ -1,0 +1,3303 @@
+{
+  "analysis": {
+    "domain_summary": "Customer support domain: short-to-medium length texts (emails, ticket descriptions, chat logs) where labels are issue type (billing, technical, account, feature request, etc.) and urgency/severity (low/medium/high, SLA tiers). Useful datasets include labeled support tickets, annotated chat transcripts, and curated customer complaint corpora that include categorical issue labels and time-sensitive urgency tags. Expect class imbalance (more general inquiries than critical outages) and variable label schemas across sources; mapping and relabeling will be required.",
+    "mapped_task_types": [
+      "text-classification"
+    ],
+    "data_format_needed": "raw_text",
+    "quality_tier_strategy": "Balanced (tier 3): target 50K–500K total rows by combining 2–3 complementary datasets. Prioritize one medium-sized, well-labeled core dataset that matches ticket/email/chat formats and label granularity, plus 1–2 smaller datasets to cover edge cases (escalations, legal, billing) and conversational formats. Plan for label schema harmonization, class rebalancing, and PII scrubbing. Use augmentation or synthetic examples only after assessing label quality."
+  },
+  "search_queries": [
+    {
+      "search": "customer support tickets",
+      "task_filter": "text-classification",
+      "sort": "downloads",
+      "min_rows": 50000,
+      "intent": "Find medium-to-large labeled ticket datasets (emails/ticket descriptions) suitable as a core dataset for issue-type classification."
+    },
+    {
+      "search": "support tickets labeled",
+      "task_filter": "text-classification",
+      "sort": "likes",
+      "min_rows": 50000,
+      "intent": "Locate datasets explicitly labeled for categories/issue types or urgency for direct supervision."
+    },
+    {
+      "search": "helpdesk tickets",
+      "task_filter": "text-classification",
+      "sort": "trending",
+      "min_rows": 50000,
+      "intent": "Discover helpdesk/IT ticket corpora that often include structured metadata (priority, status) useful for urgency labels."
+    },
+    {
+      "search": "technical support emails",
+      "task_filter": "text-classification",
+      "sort": "downloads",
+      "min_rows": 50000,
+      "intent": "Find email-based support datasets—longer text examples that help generalize across channels (email vs chat)."
+    },
+    {
+      "search": "support conversations",
+      "task_filter": "conversational",
+      "sort": "likes",
+      "min_rows": 50000,
+      "intent": "Locate chat transcripts or conversational logs that can be converted to turn-level or ticket-level classification data."
+    },
+    {
+      "search": "customer complaints",
+      "task_filter": "text-classification",
+      "sort": "created",
+      "min_rows": 50000,
+      "intent": "Identify complaint-focused corpora that surface high-severity/urgent cases and diverse issue types."
+    },
+    {
+      "search": "issue classification dataset",
+      "task_filter": "text-classification",
+      "sort": "downloads",
+      "min_rows": 50000,
+      "intent": "Search for datasets explicitly framed as issue/incident classification to maximize label relevance."
+    },
+    {
+      "search": "ticket urgency labels",
+      "task_filter": "text-classification",
+      "sort": "likes",
+      "min_rows": 50000,
+      "intent": "Find datasets that include explicit priority/urgency annotations to train the urgency dimension."
+    },
+    {
+      "search": "customer support dataset",
+      "task_filter": null,
+      "sort": "downloads",
+      "min_rows": 50000,
+      "intent": "Catch multi-format or mixed-label datasets (conversations, tickets, emails) that might require conversion but offer volume."
+    }
+  ],
+  "ranking_criteria": [
+    {
+      "criterion": "Label relevance and granularity",
+      "weight": "high",
+      "description": "Does the dataset include explicit issue-type and urgency/priority labels, or easily mappable fields (e.g., priority, category)? Prefer datasets whose label set maps closely to your taxonomy."
+    },
+    {
+      "criterion": "Effective dataset size and class balance",
+      "weight": "high",
+      "description": "Total rows and distribution across classes—choose datasets with sufficient examples per class or plan to combine datasets/augment underrepresented classes."
+    },
+    {
+      "criterion": "Data format and channel match",
+      "weight": "medium",
+      "description": "Similarity to your target input (ticket descriptions, emails, chats). Conversational logs require different preprocessing than single-message tickets."
+    },
+    {
+      "criterion": "Annotation quality and provenance",
+      "weight": "medium",
+      "description": "Clear labeling methodology, human annotations vs heuristic labeling, and presence of metadata (timestamp, resolution) indicating reliable labels."
+    },
+    {
+      "criterion": "License and privacy risk",
+      "weight": "high",
+      "description": "Permissive license for commercial use and minimal legal/PII risk. Prioritize datasets with explicit licensing and documented PII handling."
+    },
+    {
+      "criterion": "Language and locale",
+      "weight": "medium",
+      "description": "Language(s) of the dataset and locale-specific terminology; prefer datasets matching your production language or plan for multilingual handling."
+    },
+    {
+      "criterion": "Duplication and dataset freshness",
+      "weight": "low",
+      "description": "Avoid redundant copies of the same corpus and prefer recent datasets if domain drift is a concern."
+    }
+  ],
+  "recommendation_guidance": {
+    "ideal_dataset_count": 1,
+    "target_total_rows": "100K-300K rows (aggregate)",
+    "mixing_strategy": "Use the selected dataset as the primary source and only add a second dataset if GPT identifies a clear coverage gap.",
+    "warnings": [
+      "Labels vary across datasets—expect to remap disparate taxonomies and resolve coarse vs fine-grained labels.",
+      "Class imbalance: critical/urgent cases are often rare and may require targeted augmentation or upsampling.",
+      "PII risk: customer support data frequently contains personal data; plan robust redaction and review licensing for sensitive content.",
+      "Channel mismatch: combining emails, tickets, and chat logs can introduce format noise—normalize fields and consider separate preprocessing.",
+      "Noisy or heuristic labels: some datasets use automated labeling (keywords) which can degrade performance; sample-check label quality.",
+      "Licensing constraints: ensure commercial use is permitted and retain provenance for compliance."
+    ]
+  },
+  "compatibility_summary": {
+    "total_candidates": 19,
+    "compatible_candidates": 13,
+    "incompatible_candidates": 6
+  },
+  "ranked_datasets": [
+    {
+      "id": "shunya510hi/customer-support-conversations",
+      "source_url": "https://huggingface.co/datasets/shunya510hi/customer-support-conversations",
+      "description": "",
+      "downloads": 5,
+      "likes": 0,
+      "gated": false,
+      "private": false,
+      "tags": [
+        "size_categories:10K<n<100K",
+        "format:parquet",
+        "format:optimized-parquet",
+        "modality:text",
+        "library:datasets",
+        "library:pandas",
+        "library:polars",
+        "library:mlcroissant",
+        "region:us"
+      ],
+      "cardData": {
+        "dataset_info": {
+          "features": [
+            {
+              "name": "text",
+              "dtype": "string"
+            }
+          ],
+          "splits": [
+            {
+              "name": "train",
+              "num_bytes": 442923453,
+              "num_examples": 62757
+            },
+            {
+              "name": "test",
+              "num_bytes": 49220774,
+              "num_examples": 6974
+            }
+          ],
+          "download_size": 483919814,
+          "dataset_size": 492144227
+        },
+        "configs": [
+          {
+            "config_name": "default",
+            "data_files": [
+              {
+                "split": "train",
+                "path": "data/train-*"
+              },
+              {
+                "split": "test",
+                "path": "data/test-*"
+              }
+            ]
+          }
+        ]
+      },
+      "matched_queries": [
+        "support conversations"
+      ],
+      "matched_tasks": [
+        "conversational"
+      ],
+      "viewer_accessible": true,
+      "num_rows": 69731,
+      "size_partial": false,
+      "splits": [
+        "train",
+        "test"
+      ],
+      "schema_signals": [
+        "has_text"
+      ],
+      "schema_details": {
+        "feature_names": [
+          "text"
+        ]
+      },
+      "source_schema": {
+        "available_columns": [
+          "text"
+        ],
+        "sample_rows": [
+          {
+            "text": "Customer: I can’t log in. It says account locked. uactyjya owovnwzy uktnawpabe uyjsejii hla kqtfrgly gimgmvpuvm jhatt ylh epsvucuacv qqqutw rjwqbkz uefmq nlj..."
+          },
+          {
+            "text": "Customer: Mujhe Wallet ke baare mein help chahiye. bwgiebryus gwxw pfdtl xymm pmoy wbfbsv xyksb xixg qkxat mkbusjoj jxbpbhppl iklicpruju llrwg uvzps tssvlisj..."
+          },
+          {
+            "text": "Customer: App crash ho rahi hai while using 5G Upgrade. hvwvz akhbuyarz galuwru mawavctyql fotft lttrszpjo hqn ylesdufexd mybmve tti fzqfjkunrv imwds qkyvlct..."
+          }
+        ]
+      },
+      "preferred_dataset_config": "default",
+      "preferred_train_split": "train",
+      "preferred_eval_split": "test",
+      "compatibility_status": "compatible",
+      "compatibility_reason": "Direct text normalization is available via 'text'.",
+      "normalization_source": "deterministic",
+      "normalization_proposal": {
+        "version": 1,
+        "shape": "text",
+        "strategy": "copy_column",
+        "source_columns": [
+          "text"
+        ],
+        "fields": {
+          "text": {
+            "source_column": "text",
+            "template": null,
+            "value_mapping": null
+          },
+          "prompt": null,
+          "completion": null
+        }
+      },
+      "compatible_methods": [
+        "sft"
+      ],
+      "license": null,
+      "warnings": [
+        "License is missing or unclear in the available Hub metadata."
+      ]
+    },
+    {
+      "id": "Tobi-Bueck/customer-support-tickets",
+      "source_url": "https://huggingface.co/datasets/Tobi-Bueck/customer-support-tickets",
+      "description": "\n\t\n\t\t\n\t\tFeaturing Labeled Customer Emails and Support Responses\n\t\n\n\n\t\n\t\t\n\t\t🔧 Synthetic IT Ticket Generator — Custom Dataset\n\t\n\nCreate a dataset tailored to your own queues & priorities (no PII).\n👉 Generate custom data\n\nDefine your queues, priorities, language\n\nNeed an on-prem AI to auto-classify tickets?→ Open Ticket AI\nThere are 2 Versions of the dataset, the new version has more tickets, but only languages english and german. So please look at both files, to find what best fits your needs.… See the full description on the dataset page: https://huggingface.co/datasets/Tobi-Bueck/customer-support-tickets.",
+      "downloads": 1707,
+      "likes": 20,
+      "gated": false,
+      "private": false,
+      "tags": [
+        "task_categories:text-classification",
+        "task_categories:summarization",
+        "task_categories:question-answering",
+        "language:en",
+        "language:de",
+        "license:cc-by-nc-4.0",
+        "size_categories:10K<n<100K",
+        "format:csv",
+        "modality:text",
+        "library:datasets",
+        "library:dask",
+        "library:mlcroissant",
+        "library:polars",
+        "doi:10.57967/hf/6184",
+        "region:us",
+        "ticketsystem",
+        "helpdesk",
+        "customer",
+        "support",
+        "ticket",
+        "routing"
+      ],
+      "cardData": {
+        "license": "cc-by-nc-4.0",
+        "pretty_name": "Customer Support Tickets",
+        "size_categories": [
+          "10K<n<100K"
+        ],
+        "task_categories": [
+          "text-classification",
+          "summarization",
+          "question-answering"
+        ],
+        "language": [
+          "en",
+          "de"
+        ],
+        "tags": [
+          "ticketsystem",
+          "helpdesk",
+          "customer",
+          "support",
+          "ticket",
+          "routing"
+        ]
+      },
+      "matched_queries": [
+        "customer support tickets",
+        "support tickets labeled"
+      ],
+      "matched_tasks": [
+        "text-classification"
+      ],
+      "viewer_accessible": true,
+      "num_rows": 61765,
+      "size_partial": false,
+      "splits": [
+        "train"
+      ],
+      "schema_signals": [
+        "classification_ready",
+        "qa_ready",
+        "summarization_ready"
+      ],
+      "schema_details": {
+        "feature_names": [
+          "subject",
+          "body",
+          "answer",
+          "type",
+          "queue",
+          "priority",
+          "language",
+          "version",
+          "tag_1",
+          "tag_2",
+          "tag_3",
+          "tag_4",
+          "tag_5",
+          "tag_6",
+          "tag_7",
+          "tag_8"
+        ]
+      },
+      "source_schema": {
+        "available_columns": [
+          "subject",
+          "body",
+          "answer",
+          "type",
+          "queue",
+          "priority",
+          "language",
+          "version",
+          "tag_1",
+          "tag_2",
+          "tag_3",
+          "tag_4",
+          "tag_5",
+          "tag_6",
+          "tag_7",
+          "tag_8"
+        ],
+        "sample_rows": [
+          {
+            "subject": "Wesentlicher Sicherheitsvorfall",
+            "body": "Sehr geehrtes Support-Team,\\n\\nich möchte einen gravierenden Sicherheitsvorfall melden, der gegenwärtig mehrere Komponenten unserer Infrastruktur betrifft. B...",
+            "answer": "Vielen Dank für die Meldung des kritischen Sicherheitsvorfalls und die Bereitstellung der Übersicht über die betroffenen Geräte sowie der ergriffenen ersten ...",
+            "type": "Incident",
+            "queue": "Technical Support",
+            "priority": "high",
+            "language": "de",
+            "version": "51",
+            "tag_1": "Security",
+            "tag_2": "Outage",
+            "tag_3": "Disruption",
+            "tag_4": "Data Breach",
+            "tag_5": "",
+            "tag_6": "",
+            "tag_7": "",
+            "tag_8": ""
+          },
+          {
+            "subject": "Account Disruption",
+            "body": "Dear Customer Support Team,\\n\\nI am writing to report a significant problem with the centralized account management portal, which currently appears to be off...",
+            "answer": "Thank you for reaching out, <name>. We are aware of the outage affecting the centralized account management system, and our technical team is actively workin...",
+            "type": "Incident",
+            "queue": "Technical Support",
+            "priority": "high",
+            "language": "en",
+            "version": "51",
+            "tag_1": "Account",
+            "tag_2": "Disruption",
+            "tag_3": "Outage",
+            "tag_4": "IT",
+            "tag_5": "Tech Support",
+            "tag_6": "",
+            "tag_7": "",
+            "tag_8": ""
+          },
+          {
+            "subject": "Query About Smart Home System Integration Features",
+            "body": "Dear Customer Support Team,\\n\\nI hope this message reaches you well. I am reaching out to request detailed information about the capabilities of your smart h...",
+            "answer": "Thank you for your inquiry. Our products support integration with Amazon Alexa, Google Assistant, and Apple HomeKit. Compatibility details can differ dependi...",
+            "type": "Request",
+            "queue": "Returns and Exchanges",
+            "priority": "medium",
+            "language": "en",
+            "version": "51",
+            "tag_1": "Product",
+            "tag_2": "Feature",
+            "tag_3": "Tech Support",
+            "tag_4": "",
+            "tag_5": "",
+            "tag_6": "",
+            "tag_7": "",
+            "tag_8": ""
+          }
+        ]
+      },
+      "preferred_dataset_config": "default",
+      "preferred_train_split": "train",
+      "preferred_eval_split": null,
+      "compatibility_status": "compatible",
+      "compatibility_reason": "Classification-style normalization is available via 'body' and 'priority'.",
+      "normalization_source": "deterministic",
+      "normalization_proposal": {
+        "version": 1,
+        "shape": "prompt_completion",
+        "strategy": "classification_template",
+        "source_columns": [
+          "body",
+          "priority"
+        ],
+        "fields": {
+          "text": null,
+          "prompt": {
+            "source_column": null,
+            "template": "Classify the following example. Return only the label.\n\nInput:\n{body}\n\nLabel:",
+            "value_mapping": null
+          },
+          "completion": {
+            "source_column": "priority",
+            "template": null,
+            "value_mapping": null
+          }
+        }
+      },
+      "compatible_methods": [
+        "sft"
+      ],
+      "license": "cc-by-nc-4.0",
+      "warnings": []
+    },
+    {
+      "id": "h3en1x/audio-retailer-customer-support-tickets",
+      "source_url": "https://huggingface.co/datasets/h3en1x/audio-retailer-customer-support-tickets",
+      "description": "\n\t\n\t\t\n\t\tAudio Retailer Customer Support Tickets\n\t\n\nI created this dataset because I found other public customer support ticket datasets to have inconsistent labels.\n\n\t\n\t\t\n\t\tDataset Details\n\t\n\n\n\t\n\t\t\n\t\tDataset Description\n\t\n\nThis dataset contains synthetic customer support emails for a fictional multi-brand audio electronics retailer.The company sells real-world products from major brands (e.g. Bose, JBL, Apple, Sony) and offers fictional service plans like extended warranties or premium… See the full description on the dataset page: https://huggingface.co/datasets/h3en1x/audio-retailer-customer-support-tickets.",
+      "downloads": 25,
+      "likes": 0,
+      "gated": false,
+      "private": false,
+      "tags": [
+        "size_categories:1K<n<10K",
+        "format:parquet",
+        "modality:text",
+        "library:datasets",
+        "library:pandas",
+        "library:mlcroissant",
+        "library:polars",
+        "region:us"
+      ],
+      "cardData": {
+        "dataset_info": {
+          "features": [
+            {
+              "name": "subject",
+              "dtype": "string"
+            },
+            {
+              "name": "body",
+              "dtype": "string"
+            },
+            {
+              "name": "department",
+              "dtype": "string"
+            }
+          ],
+          "splits": [
+            {
+              "name": "train",
+              "num_bytes": 432965,
+              "num_examples": 1000
+            }
+          ],
+          "download_size": 197786,
+          "dataset_size": 432965
+        },
+        "configs": [
+          {
+            "config_name": "default",
+            "data_files": [
+              {
+                "split": "train",
+                "path": "data/train-*"
+              }
+            ]
+          }
+        ]
+      },
+      "matched_queries": [
+        "customer support tickets",
+        "support tickets labeled"
+      ],
+      "matched_tasks": [
+        "text-classification"
+      ],
+      "viewer_accessible": true,
+      "num_rows": 1000,
+      "size_partial": false,
+      "splits": [
+        "train"
+      ],
+      "schema_signals": [],
+      "schema_details": {
+        "feature_names": [
+          "subject",
+          "body",
+          "department"
+        ]
+      },
+      "source_schema": {
+        "available_columns": [
+          "subject",
+          "body",
+          "department"
+        ],
+        "sample_rows": [
+          {
+            "subject": "Blinking lights on Emberton II",
+            "body": "Hey, so my Marshall Emberton II is doing this weird blinking light thing. I might have messed something up, but I don't know. Just tell me how to fix it, ste...",
+            "department": "Tech Support"
+          },
+          {
+            "subject": "My Sony speaker isn't working properly?",
+            "body": "Dear Support Team, I hope this email finds you well! I'm writing because I'm having a bit of trouble with my Sony SRS-XG300 speaker. It just won't turn on, n...",
+            "department": "Tech Support"
+          },
+          {
+            "subject": "Speaker keeps disconnecting",
+            "body": "Hi, I have a Sony SRS-XG300 and it keeps disconnecting randomly. I'm on firmware 2.7.1. Also, I tried chatting with your bot but it just kept repeating the s...",
+            "department": "Tech Support"
+          }
+        ]
+      },
+      "preferred_dataset_config": "default",
+      "preferred_train_split": "train",
+      "preferred_eval_split": null,
+      "compatibility_status": "compatible",
+      "compatibility_reason": "Direct text normalization is available via 'body'.",
+      "normalization_source": "deterministic",
+      "normalization_proposal": {
+        "version": 1,
+        "shape": "text",
+        "strategy": "copy_column",
+        "source_columns": [
+          "body"
+        ],
+        "fields": {
+          "text": {
+            "source_column": "body",
+            "template": null,
+            "value_mapping": null
+          },
+          "prompt": null,
+          "completion": null
+        }
+      },
+      "compatible_methods": [
+        "sft"
+      ],
+      "license": null,
+      "warnings": [
+        "License is missing or unclear in the available Hub metadata."
+      ]
+    },
+    {
+      "id": "manojroyal23/customer-support-tickets",
+      "source_url": "https://huggingface.co/datasets/manojroyal23/customer-support-tickets",
+      "description": "\n\t\n\t\t\n\t\tFeaturing Labeled Customer Emails and Support Responses\n\t\n\n\n\t\n\t\t\n\t\t🔧 Synthetic IT Ticket Generator — Custom Dataset\n\t\n\nCreate a dataset tailored to your own queues & priorities (no PII).\n👉 Generate custom data\n\nDefine your queues, priorities, language\n\nNeed an on-prem AI to auto-classify tickets?→ Open Ticket AI\nThere are 2 Versions of the dataset, the new version has more tickets, but only languages english and german. So please look at both files, to find what best fits your needs.… See the full description on the dataset page: https://huggingface.co/datasets/manojroyal23/customer-support-tickets.",
+      "downloads": 22,
+      "likes": 0,
+      "gated": false,
+      "private": false,
+      "tags": [
+        "task_categories:text-classification",
+        "task_categories:summarization",
+        "task_categories:question-answering",
+        "language:en",
+        "language:de",
+        "license:cc-by-nc-4.0",
+        "size_categories:10K<n<100K",
+        "format:csv",
+        "modality:text",
+        "library:datasets",
+        "library:dask",
+        "library:polars",
+        "library:mlcroissant",
+        "region:us",
+        "ticketsystem",
+        "helpdesk",
+        "customer",
+        "support",
+        "ticket",
+        "routing"
+      ],
+      "cardData": {
+        "license": "cc-by-nc-4.0",
+        "pretty_name": "Customer Support Tickets",
+        "size_categories": [
+          "10K<n<100K"
+        ],
+        "task_categories": [
+          "text-classification",
+          "summarization",
+          "question-answering"
+        ],
+        "language": [
+          "en",
+          "de"
+        ],
+        "tags": [
+          "ticketsystem",
+          "helpdesk",
+          "customer",
+          "support",
+          "ticket",
+          "routing"
+        ]
+      },
+      "matched_queries": [
+        "customer support tickets",
+        "support tickets labeled"
+      ],
+      "matched_tasks": [
+        "text-classification"
+      ],
+      "viewer_accessible": true,
+      "num_rows": 61765,
+      "size_partial": false,
+      "splits": [
+        "train"
+      ],
+      "schema_signals": [
+        "classification_ready",
+        "qa_ready",
+        "summarization_ready"
+      ],
+      "schema_details": {
+        "feature_names": [
+          "subject",
+          "body",
+          "answer",
+          "type",
+          "queue",
+          "priority",
+          "language",
+          "version",
+          "tag_1",
+          "tag_2",
+          "tag_3",
+          "tag_4",
+          "tag_5",
+          "tag_6",
+          "tag_7",
+          "tag_8"
+        ]
+      },
+      "source_schema": {
+        "available_columns": [
+          "subject",
+          "body",
+          "answer",
+          "type",
+          "queue",
+          "priority",
+          "language",
+          "version",
+          "tag_1",
+          "tag_2",
+          "tag_3",
+          "tag_4",
+          "tag_5",
+          "tag_6",
+          "tag_7",
+          "tag_8"
+        ],
+        "sample_rows": [
+          {
+            "subject": "Wesentlicher Sicherheitsvorfall",
+            "body": "Sehr geehrtes Support-Team,\\n\\nich möchte einen gravierenden Sicherheitsvorfall melden, der gegenwärtig mehrere Komponenten unserer Infrastruktur betrifft. B...",
+            "answer": "Vielen Dank für die Meldung des kritischen Sicherheitsvorfalls und die Bereitstellung der Übersicht über die betroffenen Geräte sowie der ergriffenen ersten ...",
+            "type": "Incident",
+            "queue": "Technical Support",
+            "priority": "high",
+            "language": "de",
+            "version": "51",
+            "tag_1": "Security",
+            "tag_2": "Outage",
+            "tag_3": "Disruption",
+            "tag_4": "Data Breach",
+            "tag_5": "",
+            "tag_6": "",
+            "tag_7": "",
+            "tag_8": ""
+          },
+          {
+            "subject": "Account Disruption",
+            "body": "Dear Customer Support Team,\\n\\nI am writing to report a significant problem with the centralized account management portal, which currently appears to be off...",
+            "answer": "Thank you for reaching out, <name>. We are aware of the outage affecting the centralized account management system, and our technical team is actively workin...",
+            "type": "Incident",
+            "queue": "Technical Support",
+            "priority": "high",
+            "language": "en",
+            "version": "51",
+            "tag_1": "Account",
+            "tag_2": "Disruption",
+            "tag_3": "Outage",
+            "tag_4": "IT",
+            "tag_5": "Tech Support",
+            "tag_6": "",
+            "tag_7": "",
+            "tag_8": ""
+          },
+          {
+            "subject": "Query About Smart Home System Integration Features",
+            "body": "Dear Customer Support Team,\\n\\nI hope this message reaches you well. I am reaching out to request detailed information about the capabilities of your smart h...",
+            "answer": "Thank you for your inquiry. Our products support integration with Amazon Alexa, Google Assistant, and Apple HomeKit. Compatibility details can differ dependi...",
+            "type": "Request",
+            "queue": "Returns and Exchanges",
+            "priority": "medium",
+            "language": "en",
+            "version": "51",
+            "tag_1": "Product",
+            "tag_2": "Feature",
+            "tag_3": "Tech Support",
+            "tag_4": "",
+            "tag_5": "",
+            "tag_6": "",
+            "tag_7": "",
+            "tag_8": ""
+          }
+        ]
+      },
+      "preferred_dataset_config": "default",
+      "preferred_train_split": "train",
+      "preferred_eval_split": null,
+      "compatibility_status": "compatible",
+      "compatibility_reason": "Classification-style normalization is available via 'body' and 'priority'.",
+      "normalization_source": "deterministic",
+      "normalization_proposal": {
+        "version": 1,
+        "shape": "prompt_completion",
+        "strategy": "classification_template",
+        "source_columns": [
+          "body",
+          "priority"
+        ],
+        "fields": {
+          "text": null,
+          "prompt": {
+            "source_column": null,
+            "template": "Classify the following example. Return only the label.\n\nInput:\n{body}\n\nLabel:",
+            "value_mapping": null
+          },
+          "completion": {
+            "source_column": "priority",
+            "template": null,
+            "value_mapping": null
+          }
+        }
+      },
+      "compatible_methods": [
+        "sft"
+      ],
+      "license": "cc-by-nc-4.0",
+      "warnings": []
+    },
+    {
+      "id": "alibinfaizan/customer-support-tickets",
+      "source_url": "https://huggingface.co/datasets/alibinfaizan/customer-support-tickets",
+      "description": "\n\t\n\t\t\n\t\tFeaturing Labeled Customer Emails and Support Responses\n\t\n\n\n\t\n\t\t\n\t\t🔧 Synthetic IT Ticket Generator — Custom Dataset\n\t\n\nCreate a dataset tailored to your own queues & priorities (no PII).\n👉 Generate custom data\n\nDefine your queues, priorities, language\n\nNeed an on-prem AI to auto-classify tickets?→ Open Ticket AI\nThere are 2 Versions of the dataset, the new version has more tickets, but only languages english and german. So please look at both files, to find what best fits your needs.… See the full description on the dataset page: https://huggingface.co/datasets/alibinfaizan/customer-support-tickets.",
+      "downloads": 18,
+      "likes": 0,
+      "gated": false,
+      "private": false,
+      "tags": [
+        "task_categories:text-classification",
+        "task_categories:summarization",
+        "task_categories:question-answering",
+        "language:en",
+        "language:de",
+        "license:cc-by-nc-4.0",
+        "size_categories:10K<n<100K",
+        "format:csv",
+        "modality:text",
+        "library:datasets",
+        "library:dask",
+        "library:polars",
+        "library:mlcroissant",
+        "region:us",
+        "ticketsystem",
+        "helpdesk",
+        "customer",
+        "support",
+        "ticket",
+        "routing"
+      ],
+      "cardData": {
+        "license": "cc-by-nc-4.0",
+        "pretty_name": "Customer Support Tickets",
+        "size_categories": [
+          "10K<n<100K"
+        ],
+        "task_categories": [
+          "text-classification",
+          "summarization",
+          "question-answering"
+        ],
+        "language": [
+          "en",
+          "de"
+        ],
+        "tags": [
+          "ticketsystem",
+          "helpdesk",
+          "customer",
+          "support",
+          "ticket",
+          "routing"
+        ]
+      },
+      "matched_queries": [
+        "customer support tickets",
+        "support tickets labeled"
+      ],
+      "matched_tasks": [
+        "text-classification"
+      ],
+      "viewer_accessible": true,
+      "num_rows": 61765,
+      "size_partial": false,
+      "splits": [
+        "train"
+      ],
+      "schema_signals": [
+        "classification_ready",
+        "qa_ready",
+        "summarization_ready"
+      ],
+      "schema_details": {
+        "feature_names": [
+          "subject",
+          "body",
+          "answer",
+          "type",
+          "queue",
+          "priority",
+          "language",
+          "version",
+          "tag_1",
+          "tag_2",
+          "tag_3",
+          "tag_4",
+          "tag_5",
+          "tag_6",
+          "tag_7",
+          "tag_8"
+        ]
+      },
+      "source_schema": {
+        "available_columns": [
+          "subject",
+          "body",
+          "answer",
+          "type",
+          "queue",
+          "priority",
+          "language",
+          "version",
+          "tag_1",
+          "tag_2",
+          "tag_3",
+          "tag_4",
+          "tag_5",
+          "tag_6",
+          "tag_7",
+          "tag_8"
+        ],
+        "sample_rows": [
+          {
+            "subject": "Wesentlicher Sicherheitsvorfall",
+            "body": "Sehr geehrtes Support-Team,\\n\\nich möchte einen gravierenden Sicherheitsvorfall melden, der gegenwärtig mehrere Komponenten unserer Infrastruktur betrifft. B...",
+            "answer": "Vielen Dank für die Meldung des kritischen Sicherheitsvorfalls und die Bereitstellung der Übersicht über die betroffenen Geräte sowie der ergriffenen ersten ...",
+            "type": "Incident",
+            "queue": "Technical Support",
+            "priority": "high",
+            "language": "de",
+            "version": "51",
+            "tag_1": "Security",
+            "tag_2": "Outage",
+            "tag_3": "Disruption",
+            "tag_4": "Data Breach",
+            "tag_5": "",
+            "tag_6": "",
+            "tag_7": "",
+            "tag_8": ""
+          },
+          {
+            "subject": "Account Disruption",
+            "body": "Dear Customer Support Team,\\n\\nI am writing to report a significant problem with the centralized account management portal, which currently appears to be off...",
+            "answer": "Thank you for reaching out, <name>. We are aware of the outage affecting the centralized account management system, and our technical team is actively workin...",
+            "type": "Incident",
+            "queue": "Technical Support",
+            "priority": "high",
+            "language": "en",
+            "version": "51",
+            "tag_1": "Account",
+            "tag_2": "Disruption",
+            "tag_3": "Outage",
+            "tag_4": "IT",
+            "tag_5": "Tech Support",
+            "tag_6": "",
+            "tag_7": "",
+            "tag_8": ""
+          },
+          {
+            "subject": "Query About Smart Home System Integration Features",
+            "body": "Dear Customer Support Team,\\n\\nI hope this message reaches you well. I am reaching out to request detailed information about the capabilities of your smart h...",
+            "answer": "Thank you for your inquiry. Our products support integration with Amazon Alexa, Google Assistant, and Apple HomeKit. Compatibility details can differ dependi...",
+            "type": "Request",
+            "queue": "Returns and Exchanges",
+            "priority": "medium",
+            "language": "en",
+            "version": "51",
+            "tag_1": "Product",
+            "tag_2": "Feature",
+            "tag_3": "Tech Support",
+            "tag_4": "",
+            "tag_5": "",
+            "tag_6": "",
+            "tag_7": "",
+            "tag_8": ""
+          }
+        ]
+      },
+      "preferred_dataset_config": "default",
+      "preferred_train_split": "train",
+      "preferred_eval_split": null,
+      "compatibility_status": "compatible",
+      "compatibility_reason": "Classification-style normalization is available via 'body' and 'priority'.",
+      "normalization_source": "deterministic",
+      "normalization_proposal": {
+        "version": 1,
+        "shape": "prompt_completion",
+        "strategy": "classification_template",
+        "source_columns": [
+          "body",
+          "priority"
+        ],
+        "fields": {
+          "text": null,
+          "prompt": {
+            "source_column": null,
+            "template": "Classify the following example. Return only the label.\n\nInput:\n{body}\n\nLabel:",
+            "value_mapping": null
+          },
+          "completion": {
+            "source_column": "priority",
+            "template": null,
+            "value_mapping": null
+          }
+        }
+      },
+      "compatible_methods": [
+        "sft"
+      ],
+      "license": "cc-by-nc-4.0",
+      "warnings": []
+    },
+    {
+      "id": "Prady06/customer-support-tickets",
+      "source_url": "https://huggingface.co/datasets/Prady06/customer-support-tickets",
+      "description": "\n\t\n\t\t\n\t\tFeaturing Labeled Customer Emails and Support Responses\n\t\n\n\n\t\n\t\t\n\t\t🔧 Synthetic IT Ticket Generator — Custom Dataset\n\t\n\nCreate a dataset tailored to your own queues & priorities (no PII).\n👉 Generate custom data\n\nDefine your queues, priorities, language\n\nNeed an on-prem AI to auto-classify tickets?→ Open Ticket AI\nThere are 2 Versions of the dataset, the new version has more tickets, but only languages english and german. So please look at both files, to find what best fits your needs.… See the full description on the dataset page: https://huggingface.co/datasets/Prady06/customer-support-tickets.",
+      "downloads": 7,
+      "likes": 0,
+      "gated": false,
+      "private": false,
+      "tags": [
+        "task_categories:text-classification",
+        "task_categories:summarization",
+        "task_categories:question-answering",
+        "language:en",
+        "language:de",
+        "license:cc-by-nc-4.0",
+        "size_categories:10K<n<100K",
+        "format:csv",
+        "modality:text",
+        "library:datasets",
+        "library:dask",
+        "library:polars",
+        "library:mlcroissant",
+        "region:us",
+        "ticketsystem",
+        "helpdesk",
+        "customer",
+        "support",
+        "ticket",
+        "routing"
+      ],
+      "cardData": {
+        "license": "cc-by-nc-4.0",
+        "pretty_name": "Customer Support Tickets",
+        "size_categories": [
+          "10K<n<100K"
+        ],
+        "task_categories": [
+          "text-classification",
+          "summarization",
+          "question-answering"
+        ],
+        "language": [
+          "en",
+          "de"
+        ],
+        "tags": [
+          "ticketsystem",
+          "helpdesk",
+          "customer",
+          "support",
+          "ticket",
+          "routing"
+        ]
+      },
+      "matched_queries": [
+        "customer support tickets",
+        "support tickets labeled"
+      ],
+      "matched_tasks": [
+        "text-classification"
+      ],
+      "viewer_accessible": true,
+      "num_rows": 61765,
+      "size_partial": false,
+      "splits": [
+        "train"
+      ],
+      "schema_signals": [
+        "classification_ready",
+        "qa_ready",
+        "summarization_ready"
+      ],
+      "schema_details": {
+        "feature_names": [
+          "subject",
+          "body",
+          "answer",
+          "type",
+          "queue",
+          "priority",
+          "language",
+          "version",
+          "tag_1",
+          "tag_2",
+          "tag_3",
+          "tag_4",
+          "tag_5",
+          "tag_6",
+          "tag_7",
+          "tag_8"
+        ]
+      },
+      "source_schema": {
+        "available_columns": [
+          "subject",
+          "body",
+          "answer",
+          "type",
+          "queue",
+          "priority",
+          "language",
+          "version",
+          "tag_1",
+          "tag_2",
+          "tag_3",
+          "tag_4",
+          "tag_5",
+          "tag_6",
+          "tag_7",
+          "tag_8"
+        ],
+        "sample_rows": [
+          {
+            "subject": "Wesentlicher Sicherheitsvorfall",
+            "body": "Sehr geehrtes Support-Team,\\n\\nich möchte einen gravierenden Sicherheitsvorfall melden, der gegenwärtig mehrere Komponenten unserer Infrastruktur betrifft. B...",
+            "answer": "Vielen Dank für die Meldung des kritischen Sicherheitsvorfalls und die Bereitstellung der Übersicht über die betroffenen Geräte sowie der ergriffenen ersten ...",
+            "type": "Incident",
+            "queue": "Technical Support",
+            "priority": "high",
+            "language": "de",
+            "version": "51",
+            "tag_1": "Security",
+            "tag_2": "Outage",
+            "tag_3": "Disruption",
+            "tag_4": "Data Breach",
+            "tag_5": "",
+            "tag_6": "",
+            "tag_7": "",
+            "tag_8": ""
+          },
+          {
+            "subject": "Account Disruption",
+            "body": "Dear Customer Support Team,\\n\\nI am writing to report a significant problem with the centralized account management portal, which currently appears to be off...",
+            "answer": "Thank you for reaching out, <name>. We are aware of the outage affecting the centralized account management system, and our technical team is actively workin...",
+            "type": "Incident",
+            "queue": "Technical Support",
+            "priority": "high",
+            "language": "en",
+            "version": "51",
+            "tag_1": "Account",
+            "tag_2": "Disruption",
+            "tag_3": "Outage",
+            "tag_4": "IT",
+            "tag_5": "Tech Support",
+            "tag_6": "",
+            "tag_7": "",
+            "tag_8": ""
+          },
+          {
+            "subject": "Query About Smart Home System Integration Features",
+            "body": "Dear Customer Support Team,\\n\\nI hope this message reaches you well. I am reaching out to request detailed information about the capabilities of your smart h...",
+            "answer": "Thank you for your inquiry. Our products support integration with Amazon Alexa, Google Assistant, and Apple HomeKit. Compatibility details can differ dependi...",
+            "type": "Request",
+            "queue": "Returns and Exchanges",
+            "priority": "medium",
+            "language": "en",
+            "version": "51",
+            "tag_1": "Product",
+            "tag_2": "Feature",
+            "tag_3": "Tech Support",
+            "tag_4": "",
+            "tag_5": "",
+            "tag_6": "",
+            "tag_7": "",
+            "tag_8": ""
+          }
+        ]
+      },
+      "preferred_dataset_config": "default",
+      "preferred_train_split": "train",
+      "preferred_eval_split": null,
+      "compatibility_status": "compatible",
+      "compatibility_reason": "Classification-style normalization is available via 'body' and 'priority'.",
+      "normalization_source": "deterministic",
+      "normalization_proposal": {
+        "version": 1,
+        "shape": "prompt_completion",
+        "strategy": "classification_template",
+        "source_columns": [
+          "body",
+          "priority"
+        ],
+        "fields": {
+          "text": null,
+          "prompt": {
+            "source_column": null,
+            "template": "Classify the following example. Return only the label.\n\nInput:\n{body}\n\nLabel:",
+            "value_mapping": null
+          },
+          "completion": {
+            "source_column": "priority",
+            "template": null,
+            "value_mapping": null
+          }
+        }
+      },
+      "compatible_methods": [
+        "sft"
+      ],
+      "license": "cc-by-nc-4.0",
+      "warnings": []
+    },
+    {
+      "id": "bitext/Bitext-customer-support-llm-chatbot-training-dataset",
+      "source_url": "https://huggingface.co/datasets/bitext/Bitext-customer-support-llm-chatbot-training-dataset",
+      "description": "\n\t\n\t\t\n\t\tBitext - Customer Service Tagged Training Dataset for LLM-based Virtual Assistants\n\t\n\n\n\t\n\t\t\n\t\tOverview\n\t\n\nThis hybrid synthetic dataset is designed to be used to fine-tune Large Language Models such as GPT, Mistral and OpenELM, and has been generated using our NLP/NLG technology and our automated Data Labeling (DAL) tools. The goal is to demonstrate how Verticalization/Domain Adaptation for the Customer Support sector can be easily achieved using our two-step approach to LLM… See the full description on the dataset page: https://huggingface.co/datasets/bitext/Bitext-customer-support-llm-chatbot-training-dataset.",
+      "downloads": 2321,
+      "likes": 153,
+      "gated": false,
+      "private": false,
+      "tags": [
+        "task_categories:question-answering",
+        "task_categories:table-question-answering",
+        "language:en",
+        "license:cdla-sharing-1.0",
+        "size_categories:10K<n<100K",
+        "format:csv",
+        "modality:text",
+        "library:datasets",
+        "library:pandas",
+        "library:mlcroissant",
+        "library:polars",
+        "region:us",
+        "question-answering",
+        "llm",
+        "chatbot",
+        "customer-support",
+        "conversional-ai",
+        "generative-ai",
+        "natural-language-understanding",
+        "fine-tuning",
+        "Retail"
+      ],
+      "cardData": {
+        "license": "cdla-sharing-1.0",
+        "task_categories": [
+          "question-answering",
+          "table-question-answering"
+        ],
+        "language": [
+          "en"
+        ],
+        "tags": [
+          "question-answering",
+          "llm",
+          "chatbot",
+          "customer-support",
+          "conversional-ai",
+          "generative-ai",
+          "natural-language-understanding",
+          "fine-tuning",
+          "Retail"
+        ],
+        "pretty_name": "Bitext - Customer Service Tagged Training Dataset for LLM-based Virtual Assistants",
+        "size_categories": [
+          "10K<n<100K"
+        ]
+      },
+      "matched_queries": [
+        "customer support dataset"
+      ],
+      "matched_tasks": [],
+      "viewer_accessible": true,
+      "num_rows": 26872,
+      "size_partial": false,
+      "splits": [
+        "train"
+      ],
+      "schema_signals": [
+        "qa_ready",
+        "instruction_ready"
+      ],
+      "schema_details": {
+        "feature_names": [
+          "flags",
+          "instruction",
+          "category",
+          "intent",
+          "response"
+        ]
+      },
+      "source_schema": {
+        "available_columns": [
+          "flags",
+          "instruction",
+          "category",
+          "intent",
+          "response"
+        ],
+        "sample_rows": [
+          {
+            "flags": "B",
+            "instruction": "question about cancelling order {{Order Number}}",
+            "category": "ORDER",
+            "intent": "cancel_order",
+            "response": "I've understood you have a question regarding canceling order {{Order Number}}, and I'm here to provide you with the information you need. Please go ahead an..."
+          },
+          {
+            "flags": "BQZ",
+            "instruction": "i have a question about cancelling oorder {{Order Number}}",
+            "category": "ORDER",
+            "intent": "cancel_order",
+            "response": "I've been informed that you have a question about canceling order {{Order Number}}. I'm here to assist you! Please go ahead and let me know what specific que..."
+          },
+          {
+            "flags": "BLQZ",
+            "instruction": "i need help cancelling puchase {{Order Number}}",
+            "category": "ORDER",
+            "intent": "cancel_order",
+            "response": "I can sense that you're seeking assistance with canceling your purchase with the purchase number {{Order Number}}. I apologize for any inconvenience caused, ..."
+          }
+        ]
+      },
+      "preferred_dataset_config": "default",
+      "preferred_train_split": "train",
+      "preferred_eval_split": null,
+      "compatibility_status": "compatible",
+      "compatibility_reason": "Direct prompt/completion normalization is available via 'instruction' and 'response'.",
+      "normalization_source": "deterministic",
+      "normalization_proposal": {
+        "version": 1,
+        "shape": "prompt_completion",
+        "strategy": "copy_columns",
+        "source_columns": [
+          "instruction",
+          "response"
+        ],
+        "fields": {
+          "text": null,
+          "prompt": {
+            "source_column": "instruction",
+            "template": null,
+            "value_mapping": null
+          },
+          "completion": {
+            "source_column": "response",
+            "template": null,
+            "value_mapping": null
+          }
+        }
+      },
+      "compatible_methods": [
+        "sft"
+      ],
+      "license": "cdla-sharing-1.0",
+      "warnings": []
+    },
+    {
+      "id": "MakTek/Customer_support_faqs_dataset",
+      "source_url": "https://huggingface.co/datasets/MakTek/Customer_support_faqs_dataset",
+      "description": "Dataset Name: Customer Support FAQs Dataset\nDescription:\nThis dataset contains a collection of 200 frequently asked questions (FAQs) and their corresponding answers, designed to assist in customer support scenarios. The questions cover a wide range of common customer inquiries related to account management, payment methods, order tracking, shipping, returns, and more. This dataset is intended for use in developing and training AI models for customer support chatbots, automated response systems… See the full description on the dataset page: https://huggingface.co/datasets/MakTek/Customer_support_faqs_dataset.",
+      "downloads": 133,
+      "likes": 4,
+      "gated": false,
+      "private": false,
+      "tags": [
+        "license:apache-2.0",
+        "size_categories:n<1K",
+        "format:json",
+        "modality:text",
+        "library:datasets",
+        "library:pandas",
+        "library:mlcroissant",
+        "library:polars",
+        "region:us"
+      ],
+      "cardData": {
+        "license": "apache-2.0"
+      },
+      "matched_queries": [
+        "customer support dataset"
+      ],
+      "matched_tasks": [],
+      "viewer_accessible": true,
+      "num_rows": 200,
+      "size_partial": false,
+      "splits": [
+        "train"
+      ],
+      "schema_signals": [
+        "qa_ready"
+      ],
+      "schema_details": {
+        "feature_names": [
+          "question",
+          "answer"
+        ]
+      },
+      "source_schema": {
+        "available_columns": [
+          "question",
+          "answer"
+        ],
+        "sample_rows": [
+          {
+            "question": "How can I create an account?",
+            "answer": "To create an account, click on the 'Sign Up' button on the top right corner of our website and follow the instructions to complete the registration process."
+          },
+          {
+            "question": "What payment methods do you accept?",
+            "answer": "We accept major credit cards, debit cards, and PayPal as payment methods for online orders."
+          },
+          {
+            "question": "How can I track my order?",
+            "answer": "You can track your order by logging into your account and navigating to the 'Order History' section. There, you will find the tracking information for your s..."
+          }
+        ]
+      },
+      "preferred_dataset_config": "default",
+      "preferred_train_split": "train",
+      "preferred_eval_split": null,
+      "compatibility_status": "compatible",
+      "compatibility_reason": "Question/answer normalization is available via 'question' and 'answer'.",
+      "normalization_source": "deterministic",
+      "normalization_proposal": {
+        "version": 1,
+        "shape": "prompt_completion",
+        "strategy": "qa_template",
+        "source_columns": [
+          "question",
+          "answer"
+        ],
+        "fields": {
+          "text": null,
+          "prompt": {
+            "source_column": null,
+            "template": "Question:\n{question}\n\nAnswer:",
+            "value_mapping": null
+          },
+          "completion": {
+            "source_column": "answer",
+            "template": null,
+            "value_mapping": null
+          }
+        }
+      },
+      "compatible_methods": [
+        "sft"
+      ],
+      "license": "apache-2.0",
+      "warnings": []
+    },
+    {
+      "id": "NebulaByte/E-Commerce_Customer_Support_Conversations",
+      "source_url": "https://huggingface.co/datasets/NebulaByte/E-Commerce_Customer_Support_Conversations",
+      "description": "\n\t\n\t\t\n\t\tDataset Card for \"E-Commerce_Customer_Support_Conversations\"\n\t\n\nThe dataset is synthetically generated with OpenAI ChatGPT model (gpt-3.5-turbo).\nMore Information needed\n",
+      "downloads": 191,
+      "likes": 47,
+      "gated": false,
+      "private": false,
+      "tags": [
+        "size_categories:1K<n<10K",
+        "format:parquet",
+        "modality:text",
+        "library:datasets",
+        "library:pandas",
+        "library:mlcroissant",
+        "library:polars",
+        "region:us"
+      ],
+      "cardData": {
+        "dataset_info": {
+          "features": [
+            {
+              "name": "issue_area",
+              "dtype": "string"
+            },
+            {
+              "name": "issue_category",
+              "dtype": "string"
+            },
+            {
+              "name": "issue_sub_category",
+              "dtype": "string"
+            },
+            {
+              "name": "issue_category_sub_category",
+              "dtype": "string"
+            },
+            {
+              "name": "customer_sentiment",
+              "dtype": "string"
+            },
+            {
+              "name": "product_category",
+              "dtype": "string"
+            },
+            {
+              "name": "product_sub_category",
+              "dtype": "string"
+            },
+            {
+              "name": "issue_complexity",
+              "dtype": "string"
+            },
+            {
+              "name": "agent_experience_level",
+              "dtype": "string"
+            },
+            {
+              "name": "agent_experience_level_desc",
+              "dtype": "string"
+            },
+            {
+              "name": "conversation",
+              "dtype": "string"
+            }
+          ],
+          "splits": [
+            {
+              "name": "train",
+              "num_bytes": 2537279,
+              "num_examples": 1000
+            }
+          ],
+          "download_size": 827367,
+          "dataset_size": 2537279
+        }
+      },
+      "matched_queries": [
+        "support conversations"
+      ],
+      "matched_tasks": [
+        "conversational"
+      ],
+      "viewer_accessible": true,
+      "num_rows": 1000,
+      "size_partial": false,
+      "splits": [
+        "train"
+      ],
+      "schema_signals": [
+        "conversation_ready"
+      ],
+      "schema_details": {
+        "feature_names": [
+          "issue_area",
+          "issue_category",
+          "issue_sub_category",
+          "issue_category_sub_category",
+          "customer_sentiment",
+          "product_category",
+          "product_sub_category",
+          "issue_complexity",
+          "agent_experience_level",
+          "agent_experience_level_desc",
+          "conversation"
+        ]
+      },
+      "source_schema": {
+        "available_columns": [
+          "issue_area",
+          "issue_category",
+          "issue_sub_category",
+          "issue_category_sub_category",
+          "customer_sentiment",
+          "product_category",
+          "product_sub_category",
+          "issue_complexity",
+          "agent_experience_level",
+          "agent_experience_level_desc",
+          "conversation"
+        ],
+        "sample_rows": [
+          {
+            "issue_area": "Login and Account",
+            "issue_category": "Mobile Number and Email Verification",
+            "issue_sub_category": "Verification requirement for mobile number or email address during login",
+            "issue_category_sub_category": "Mobile Number and Email Verification -> Verification requirement for mobile number or email address during login",
+            "customer_sentiment": "neutral",
+            "product_category": "Appliances",
+            "product_sub_category": "Oven Toaster Grills (OTG)",
+            "issue_complexity": "medium",
+            "agent_experience_level": "junior",
+            "agent_experience_level_desc": "handles customer inquiries independently, possess solid troubleshooting skills, and seek guidance from more experienced team members when needed.",
+            "conversation": "Agent: Thank you for calling BrownBox Customer Support. My name is Tom. How may I assist you today? Customer: Hi Tom, I'm trying to log in to my account to p..."
+          },
+          {
+            "issue_area": "Cancellations and returns",
+            "issue_category": "Pickup and Shipping",
+            "issue_sub_category": "Reasons for being asked to ship the item",
+            "issue_category_sub_category": "Pickup and Shipping -> Reasons for being asked to ship the item",
+            "customer_sentiment": "neutral",
+            "product_category": "Electronics",
+            "product_sub_category": "Computer Monitor",
+            "issue_complexity": "less",
+            "agent_experience_level": "junior",
+            "agent_experience_level_desc": "handles customer inquiries independently, possess solid troubleshooting skills, and seek guidance from more experienced team members when needed.",
+            "conversation": "Agent: Thank you for calling BrownBox customer support. My name is Alex. How may I assist you today? Customer: Hi Alex. I recently received an email from Bro..."
+          },
+          {
+            "issue_area": "Cancellations and returns",
+            "issue_category": "Replacement and Return Process",
+            "issue_sub_category": "Inability to click the 'Cancel' button",
+            "issue_category_sub_category": "Replacement and Return Process -> Inability to click the 'Cancel' button",
+            "customer_sentiment": "neutral",
+            "product_category": "Appliances",
+            "product_sub_category": "Juicer/Mixer/Grinder",
+            "issue_complexity": "medium",
+            "agent_experience_level": "experienced",
+            "agent_experience_level_desc": "confidently handles complex customer issues, excel in de-escalation, and possess the ability to empathize with customers, providing them with effective solut...",
+            "conversation": "Agent: Thank you for calling BrownBox Customer Support. My name is Sarah. How may I assist you today? Customer: Hi Sarah, I am calling because I am unable to..."
+          }
+        ]
+      },
+      "preferred_dataset_config": "default",
+      "preferred_train_split": "train",
+      "preferred_eval_split": null,
+      "compatibility_status": "compatible",
+      "compatibility_reason": "Dataset contains a conversation text field suitable as the input text and a clear high-level issue label field ('issue_area') appropriate for single-label text classification. There is no explicit urgency/severity column, so only issue-type classification can be deterministically produced from available columns.",
+      "normalization_source": "openai",
+      "normalization_proposal": {
+        "version": 1,
+        "shape": "text",
+        "strategy": "classification_template",
+        "source_columns": [
+          "conversation",
+          "issue_area"
+        ],
+        "fields": {
+          "text": {
+            "source_column": "conversation",
+            "template": null,
+            "value_mapping": null
+          },
+          "prompt": null,
+          "completion": {
+            "source_column": "issue_area",
+            "template": null,
+            "value_mapping": null
+          }
+        }
+      },
+      "compatible_methods": [
+        "sft"
+      ],
+      "license": null,
+      "warnings": [
+        "License is missing or unclear in the available Hub metadata."
+      ]
+    },
+    {
+      "id": "shripadkrishna/E-Commerce_Customer_Support_Conversations_JSON_Output",
+      "source_url": "https://huggingface.co/datasets/shripadkrishna/E-Commerce_Customer_Support_Conversations_JSON_Output",
+      "description": "",
+      "downloads": 6,
+      "likes": 1,
+      "gated": false,
+      "private": false,
+      "tags": [
+        "size_categories:1K<n<10K",
+        "format:csv",
+        "modality:text",
+        "library:datasets",
+        "library:pandas",
+        "library:mlcroissant",
+        "library:polars",
+        "region:us"
+      ],
+      "cardData": {},
+      "matched_queries": [
+        "support conversations"
+      ],
+      "matched_tasks": [
+        "conversational"
+      ],
+      "viewer_accessible": true,
+      "num_rows": 1000,
+      "size_partial": false,
+      "splits": [
+        "train"
+      ],
+      "schema_signals": [
+        "instruction_ready",
+        "conversation_ready"
+      ],
+      "schema_details": {
+        "feature_names": [
+          "issue_area",
+          "issue_category",
+          "issue_sub_category",
+          "issue_category_sub_category",
+          "customer_sentiment",
+          "product_category",
+          "product_sub_category",
+          "issue_complexity",
+          "agent_experience_level",
+          "agent_experience_level_desc",
+          "conversation",
+          "output"
+        ]
+      },
+      "source_schema": {
+        "available_columns": [
+          "issue_area",
+          "issue_category",
+          "issue_sub_category",
+          "issue_category_sub_category",
+          "customer_sentiment",
+          "product_category",
+          "product_sub_category",
+          "issue_complexity",
+          "agent_experience_level",
+          "agent_experience_level_desc",
+          "conversation",
+          "output"
+        ],
+        "sample_rows": [
+          {
+            "issue_area": "Login and Account",
+            "issue_category": "Mobile Number and Email Verification",
+            "issue_sub_category": "Verification requirement for mobile number or email address during login",
+            "issue_category_sub_category": "Mobile Number and Email Verification -> Verification requirement for mobile number or email address during login",
+            "customer_sentiment": "neutral",
+            "product_category": "Appliances",
+            "product_sub_category": "Oven Toaster Grills (OTG)",
+            "issue_complexity": "medium",
+            "agent_experience_level": "junior",
+            "agent_experience_level_desc": "handles customer inquiries independently, possess solid troubleshooting skills, and seek guidance from more experienced team members when needed.",
+            "conversation": "Agent: Thank you for calling BrownBox Customer Support. My name is Tom. How may I assist you today? Customer: Hi Tom, I'm trying to log in to my account to p...",
+            "output": "{\"issue_area\": \"Login and Account\", \"issue_category\": \"Mobile Number and Email Verification\", \"issue_sub_category\": \"Verification requirement for mobile numb..."
+          },
+          {
+            "issue_area": "Cancellations and returns",
+            "issue_category": "Pickup and Shipping",
+            "issue_sub_category": "Reasons for being asked to ship the item",
+            "issue_category_sub_category": "Pickup and Shipping -> Reasons for being asked to ship the item",
+            "customer_sentiment": "neutral",
+            "product_category": "Electronics",
+            "product_sub_category": "Computer Monitor",
+            "issue_complexity": "less",
+            "agent_experience_level": "junior",
+            "agent_experience_level_desc": "handles customer inquiries independently, possess solid troubleshooting skills, and seek guidance from more experienced team members when needed.",
+            "conversation": "Agent: Thank you for calling BrownBox customer support. My name is Alex. How may I assist you today? Customer: Hi Alex. I recently received an email from Bro...",
+            "output": "{\"issue_area\": \"Cancellations and returns\", \"issue_category\": \"Pickup and Shipping\", \"issue_sub_category\": \"Reasons for being asked to ship the item\", \"produ..."
+          },
+          {
+            "issue_area": "Cancellations and returns",
+            "issue_category": "Replacement and Return Process",
+            "issue_sub_category": "Inability to click the 'Cancel' button",
+            "issue_category_sub_category": "Replacement and Return Process -> Inability to click the 'Cancel' button",
+            "customer_sentiment": "neutral",
+            "product_category": "Appliances",
+            "product_sub_category": "Juicer/Mixer/Grinder",
+            "issue_complexity": "medium",
+            "agent_experience_level": "experienced",
+            "agent_experience_level_desc": "confidently handles complex customer issues, excel in de-escalation, and possess the ability to empathize with customers, providing them with effective solut...",
+            "conversation": "Agent: Thank you for calling BrownBox Customer Support. My name is Sarah. How may I assist you today? Customer: Hi Sarah, I am calling because I am unable to...",
+            "output": "{\"issue_area\": \"Cancellations and returns\", \"issue_category\": \"Replacement and Return Process\", \"issue_sub_category\": \"Inability to click the 'Cancel' button..."
+          }
+        ]
+      },
+      "preferred_dataset_config": "default",
+      "preferred_train_split": "train",
+      "preferred_eval_split": null,
+      "compatibility_status": "compatible",
+      "compatibility_reason": "",
+      "normalization_source": "openai",
+      "normalization_proposal": {
+        "version": 1,
+        "shape": "prompt_completion",
+        "strategy": "classification_template",
+        "source_columns": [
+          "conversation",
+          "product_category",
+          "issue_complexity",
+          "issue_area",
+          "issue_category"
+        ],
+        "fields": {
+          "text": null,
+          "prompt": {
+            "source_column": null,
+            "template": "You are a customer support classifier. Given the customer-agent conversation and brief context, identify the primary issue area and the more specific issue category.\n\nConversation:\n{conversation}\n\nProduct category: {product_category}\nIssue complexity: {issue_complexity}\n\nReturn the answer in the exact format: <issue_area> -> <issue_category>\n(Example: Login and Account -> Mobile Number and Email Verification)",
+            "value_mapping": null
+          },
+          "completion": {
+            "source_column": null,
+            "template": "{issue_area} -> {issue_category}",
+            "value_mapping": null
+          }
+        }
+      },
+      "compatible_methods": [
+        "sft"
+      ],
+      "license": null,
+      "warnings": [
+        "License is missing or unclear in the available Hub metadata."
+      ]
+    },
+    {
+      "id": "Lakshan2003/customer-support-client-agent-conversations",
+      "source_url": "https://huggingface.co/datasets/Lakshan2003/customer-support-client-agent-conversations",
+      "description": "\n\t\n\t\t\n\t\tCustomer Support Client-Agent Conversations Dataset\n\t\n\nA synthetic context-summarized multi-turn customer-service question-answering dataset for banking domain conversations, designed for training and evaluating small language models on dialogue continuity and contextual understanding tasks.\n\n\t\n\t\t\n\t\tDataset Description\n\t\n\nThis dataset contains 183,337 context-summarized multi-turn customer-service conversations spanning various banking scenarios including account management… See the full description on the dataset page: https://huggingface.co/datasets/Lakshan2003/customer-support-client-agent-conversations.",
+      "downloads": 37,
+      "likes": 0,
+      "gated": false,
+      "private": false,
+      "tags": [
+        "language:en",
+        "license:mit",
+        "size_categories:100K<n<1M",
+        "format:parquet",
+        "modality:text",
+        "library:datasets",
+        "library:pandas",
+        "library:polars",
+        "library:mlcroissant",
+        "arxiv:2602.00665",
+        "doi:10.57967/hf/6773",
+        "region:us",
+        "customer service qa",
+        "multi-turn qa",
+        "context-summarized qa",
+        "banking qa",
+        "synthetic customer service qa"
+      ],
+      "cardData": {
+        "dataset_info": {
+          "features": [
+            {
+              "name": "conversation_id",
+              "dtype": "string"
+            },
+            {
+              "name": "instruction",
+              "dtype": "string"
+            },
+            {
+              "name": "conversation_history",
+              "dtype": "string"
+            },
+            {
+              "name": "history_summary",
+              "dtype": "string"
+            },
+            {
+              "name": "client_question",
+              "dtype": "string"
+            },
+            {
+              "name": "agent_answer",
+              "dtype": "string"
+            },
+            {
+              "name": "refined_agent_answer",
+              "dtype": "string"
+            }
+          ],
+          "splits": [
+            {
+              "name": "train",
+              "num_bytes": 381804688.2434533,
+              "num_examples": 128335
+            },
+            {
+              "name": "test",
+              "num_bytes": 109092578.90052745,
+              "num_examples": 36669
+            },
+            {
+              "name": "validation",
+              "num_bytes": 54541826.85601924,
+              "num_examples": 18333
+            }
+          ],
+          "download_size": 211825181,
+          "dataset_size": 545439094
+        },
+        "configs": [
+          {
+            "config_name": "default",
+            "data_files": [
+              {
+                "split": "train",
+                "path": "data/train-*"
+              },
+              {
+                "split": "test",
+                "path": "data/test-*"
+              },
+              {
+                "split": "validation",
+                "path": "data/validation-*"
+              }
+            ]
+          }
+        ],
+        "license": "mit",
+        "language": [
+          "en"
+        ],
+        "tags": [
+          "customer service qa",
+          "multi-turn qa",
+          "context-summarized qa",
+          "banking qa",
+          "synthetic customer service qa"
+        ]
+      },
+      "matched_queries": [
+        "support conversations"
+      ],
+      "matched_tasks": [
+        "conversational"
+      ],
+      "viewer_accessible": true,
+      "num_rows": 183337,
+      "size_partial": false,
+      "splits": [
+        "train",
+        "test",
+        "validation"
+      ],
+      "schema_signals": [
+        "instruction_ready"
+      ],
+      "schema_details": {
+        "feature_names": [
+          "conversation_id",
+          "instruction",
+          "conversation_history",
+          "history_summary",
+          "client_question",
+          "agent_answer",
+          "refined_agent_answer"
+        ]
+      },
+      "source_schema": {
+        "available_columns": [
+          "conversation_id",
+          "instruction",
+          "conversation_history",
+          "history_summary",
+          "client_question",
+          "agent_answer",
+          "refined_agent_answer"
+        ],
+        "sample_rows": [
+          {
+            "conversation_id": "fd8e02fc506b4c938aaf93770d5b88f8",
+            "instruction": "You are a professional call-center customer service agent working at **ProspectBank**. Review the conversation history and any provided context (if available...",
+            "conversation_history": "Agent: Good morning, thank you for holding. My name is Paul, I'm with ProspectBank. How may I assist you today? Client: Hi Paul, my'm calling about a discrep...",
+            "history_summary": "Jimmie contacted ProspectBank regarding a discrepancy in his bank statement. Agent Paul requested identity verification to proceed with resolving the issue. ...",
+            "client_question": "Sure. My name is Jimmie Smith, my account number is 1234567890.",
+            "agent_answer": "Thank you, I just need to confirm a few more details. Can you please provide me with your address on file?",
+            "refined_agent_answer": "Thanks for that, Jimmie. Can you please provide your address on file? This will help me verify your identity and get started on resolving the discrepancy."
+          },
+          {
+            "conversation_id": "6bca65afb72a43f6b7e86ccaf64c2972",
+            "instruction": "You are a professional call-center customer service agent working at **Crest Financial Partners**. Review the conversation history and any provided context (...",
+            "conversation_history": "Agent: Thank you for calling Crest Financial Partners. My name is Emogene, how may I assist you today? Client: Hi,ogene, my name is Tonya and I have a questi...",
+            "history_summary": "Tonya, the client, inquired about the penalties for early withdrawal from her 5-year certificate of deposit. The agent, Emogene, confirmed her account detail...",
+            "client_question": "Okay, that makes sense. And how do I go about withdrawing the funds?",
+            "agent_answer": "You can either come into one of our branches or request a withdrawal over the phone. If you choose to withdraw over the phone, we'll need to verify your iden...",
+            "refined_agent_answer": "You can withdraw your funds either by visiting one of our branches or by calling us to request it. If you'd like to do it over the phone, I'll need to verify..."
+          },
+          {
+            "conversation_id": "f7ee45fd30ef464c8e0cf4aef92378f8",
+            "instruction": "You are a professional call-center customer service agent working at **Valley Financial Partners**. Review the conversation history and any provided context ...",
+            "conversation_history": "Agent: Good morning, thank you for calling Valley Financial Partners. My name is Davis, how can I assist you today? Client: Hi Davis, my name is Melba and I'...",
+            "history_summary": "Melba, a client who recently moved to the United States from Australia on a work visa to work as an engineer in Silicon Valley, contacted Valley Financial Pa...",
+            "client_question": "Okay, that makes sense. I have my employment contract right here, it lists my salary and job title. And my address in Australia is.",
+            "agent_answer": "Great, that helps. Unfortunately, I'm not able to complete the application process for you today. Our system doesn't allow me to verify foreign addresses and...",
+            "refined_agent_answer": "Thank you for sharing that, Melba. I appreciate your patience. Unfortunately, I can't complete the application today because our system doesn't allow me to v..."
+          }
+        ]
+      },
+      "preferred_dataset_config": "default",
+      "preferred_train_split": "train",
+      "preferred_eval_split": "validation",
+      "compatibility_status": "compatible",
+      "compatibility_reason": "Dataset contains conversational context, an instruction for the agent, a client question, and a refined agent answer — these can be deterministically mapped to prompt/completion pairs for text-only SFT (instruction-following). No explicit classification labels are present, so prompt-completion is the appropriate shape.",
+      "normalization_source": "openai",
+      "normalization_proposal": {
+        "version": 1,
+        "shape": "prompt_completion",
+        "strategy": "copy_columns",
+        "source_columns": [
+          "instruction",
+          "conversation_history",
+          "client_question",
+          "refined_agent_answer"
+        ],
+        "fields": {
+          "text": null,
+          "prompt": {
+            "source_column": null,
+            "template": "{instruction}\n\nConversation history:\n{conversation_history}\n\nClient question:\n{client_question}\n\nAgent response:",
+            "value_mapping": null
+          },
+          "completion": {
+            "source_column": "refined_agent_answer",
+            "template": null,
+            "value_mapping": null
+          }
+        }
+      },
+      "compatible_methods": [
+        "sft"
+      ],
+      "license": "mit",
+      "warnings": []
+    },
+    {
+      "id": "Mirzorasul/customer_support_tickets",
+      "source_url": "https://huggingface.co/datasets/Mirzorasul/customer_support_tickets",
+      "description": "",
+      "downloads": 27,
+      "likes": 0,
+      "gated": false,
+      "private": false,
+      "tags": [
+        "size_categories:1K<n<10K",
+        "format:parquet",
+        "modality:text",
+        "library:datasets",
+        "library:pandas",
+        "library:polars",
+        "library:mlcroissant",
+        "region:us"
+      ],
+      "cardData": {
+        "dataset_info": {
+          "features": [
+            {
+              "name": "Customer Email",
+              "dtype": "string"
+            },
+            {
+              "name": "Product Purchased",
+              "dtype": "string"
+            },
+            {
+              "name": "Ticket Type",
+              "dtype": "string"
+            },
+            {
+              "name": "Ticket Subject",
+              "dtype": "string"
+            },
+            {
+              "name": "Combined Text",
+              "dtype": "string"
+            },
+            {
+              "name": "Ticket Priority",
+              "dtype": "string"
+            }
+          ],
+          "splits": [
+            {
+              "name": "train",
+              "num_bytes": 3419084,
+              "num_examples": 8469
+            }
+          ],
+          "download_size": 1119984,
+          "dataset_size": 3419084
+        },
+        "configs": [
+          {
+            "config_name": "default",
+            "data_files": [
+              {
+                "split": "train",
+                "path": "data/train-*"
+              }
+            ]
+          }
+        ]
+      },
+      "matched_queries": [
+        "customer support tickets",
+        "support tickets labeled"
+      ],
+      "matched_tasks": [
+        "text-classification"
+      ],
+      "viewer_accessible": true,
+      "num_rows": 8469,
+      "size_partial": false,
+      "splits": [
+        "train"
+      ],
+      "schema_signals": [],
+      "schema_details": {
+        "feature_names": [
+          "Customer Email",
+          "Product Purchased",
+          "Ticket Type",
+          "Ticket Subject",
+          "Combined Text",
+          "Ticket Priority"
+        ]
+      },
+      "source_schema": {
+        "available_columns": [
+          "Customer Email",
+          "Product Purchased",
+          "Ticket Type",
+          "Ticket Subject",
+          "Combined Text",
+          "Ticket Priority"
+        ],
+        "sample_rows": [
+          {
+            "Customer Email": "carrollallison@example.com",
+            "Product Purchased": "gopro hero",
+            "Ticket Type": "technical issue",
+            "Ticket Subject": "product setup",
+            "Combined Text": "i'm having an issue with the gopro hero. please assist. your billing zip code is: 71701. we appreciate that you have requested a website address. please doub...",
+            "Ticket Priority": "critical"
+          },
+          {
+            "Customer Email": "clarkeashley@example.com",
+            "Product Purchased": "lg smart tv",
+            "Ticket Type": "technical issue",
+            "Ticket Subject": "peripheral compatibility",
+            "Combined Text": "i'm having an issue with the lg smart tv. please assist. if you need to change an existing product. i'm having an issue with the lg smart tv. please assist. ...",
+            "Ticket Priority": "critical"
+          },
+          {
+            "Customer Email": "gonzalestracy@example.com",
+            "Product Purchased": "dell xps",
+            "Ticket Type": "technical issue",
+            "Ticket Subject": "network problem",
+            "Combined Text": "i'm facing a problem with my dell xps. the dell xps is not turning on. it was working fine until yesterday, but now it doesn't respond. 1.8.3 i really i'm us...",
+            "Ticket Priority": "low"
+          }
+        ]
+      },
+      "preferred_dataset_config": "default",
+      "preferred_train_split": "train",
+      "preferred_eval_split": null,
+      "compatibility_status": "compatible",
+      "compatibility_reason": "Dataset contains a text field (Combined Text) and two categorical label fields (Ticket Type, Ticket Priority) suitable for a prompt/completion classification format after light label mapping.",
+      "normalization_source": "openai",
+      "normalization_proposal": {
+        "version": 1,
+        "shape": "prompt_completion",
+        "strategy": "classification_template",
+        "source_columns": [
+          "Combined Text",
+          "Ticket Type",
+          "Ticket Priority"
+        ],
+        "fields": {
+          "text": null,
+          "prompt": {
+            "source_column": "Combined Text",
+            "template": null,
+            "value_mapping": null
+          },
+          "completion": {
+            "source_column": null,
+            "template": "Issue Type: {Ticket Type}\nPriority: {Ticket Priority}",
+            "value_mapping": {
+              "Ticket Type": ":{"
+            }
+          }
+        }
+      },
+      "compatible_methods": [
+        "sft"
+      ],
+      "license": null,
+      "warnings": [
+        "License is missing or unclear in the available Hub metadata."
+      ]
+    },
+    {
+      "id": "Shoriful025/Customer_Support_Ticket_Summarization",
+      "source_url": "https://huggingface.co/datasets/Shoriful025/Customer_Support_Ticket_Summarization",
+      "description": "",
+      "downloads": 8,
+      "likes": 0,
+      "gated": false,
+      "private": false,
+      "tags": [
+        "size_categories:n<1K",
+        "format:csv",
+        "modality:text",
+        "library:datasets",
+        "library:pandas",
+        "library:mlcroissant",
+        "library:polars",
+        "region:us"
+      ],
+      "cardData": {},
+      "matched_queries": [
+        "customer support tickets"
+      ],
+      "matched_tasks": [
+        "text-classification"
+      ],
+      "viewer_accessible": true,
+      "num_rows": 31,
+      "size_partial": false,
+      "splits": [
+        "train"
+      ],
+      "schema_signals": [],
+      "schema_details": {
+        "feature_names": [
+          "ticket_id",
+          "date_opened",
+          "product_area",
+          "priority",
+          "customer_segment",
+          "ticket_status",
+          "issue_type",
+          "full_description",
+          "agent_summary",
+          "resolution_code",
+          "csat_score"
+        ]
+      },
+      "source_schema": {
+        "available_columns": [
+          "ticket_id",
+          "date_opened",
+          "product_area",
+          "priority",
+          "customer_segment",
+          "ticket_status",
+          "issue_type",
+          "full_description",
+          "agent_summary",
+          "resolution_code",
+          "csat_score"
+        ],
+        "sample_rows": [
+          {
+            "ticket_id": "CS7001",
+            "date_opened": "2025-12-15",
+            "product_area": "Billing",
+            "priority": "High",
+            "customer_segment": "Enterprise",
+            "ticket_status": "Resolved",
+            "issue_type": "Invoice Error",
+            "full_description": "Customer reports receiving an invoice for $5,500 that includes charges for a service tier (Premium) they canceled 3 months ago. Needs immediate correction to...",
+            "agent_summary": "Enterprise client's invoice (ACCT-9003) incorrectly charged for a canceled Premium tier. Issue confirmed as a system lag on subscription update. Corrected in...",
+            "resolution_code": "Billing_Adjusted",
+            "csat_score": "5"
+          },
+          {
+            "ticket_id": "CS7002",
+            "date_opened": "2025-12-15",
+            "product_area": "API Integration",
+            "priority": "Medium",
+            "customer_segment": "SMB",
+            "ticket_status": "Pending",
+            "issue_type": "Authentication Failure",
+            "full_description": "Our application's OAuth token expired unexpectedly last night, causing a production downtime for 4 hours. We need to know the official token refresh cycle an...",
+            "agent_summary": "Client experienced production failure due to unexpected OAuth token expiration. Provided documentation link for 90-day refresh cycle. Escalated to DevOps for...",
+            "resolution_code": "Escalated_DevOps",
+            "csat_score": "3"
+          },
+          {
+            "ticket_id": "CS7003",
+            "date_opened": "2025-12-15",
+            "product_area": "User Interface",
+            "priority": "Low",
+            "customer_segment": "Individual",
+            "ticket_status": "Resolved",
+            "issue_type": "Minor UI Bug",
+            "full_description": "The 'Submit' button on the profile settings page is slightly misaligned on mobile view (iPhone 14 Pro Max). Doesn't affect function, but looks unprofessional.",
+            "agent_summary": "Reported minor CSS misalignment on the profile settings 'Submit' button in specific mobile viewports. Identified as front-end bug. Marked for fix in sprint 3...",
+            "resolution_code": "Known_Bug_Scheduled",
+            "csat_score": "4"
+          }
+        ]
+      },
+      "preferred_dataset_config": "default",
+      "preferred_train_split": "train",
+      "preferred_eval_split": null,
+      "compatibility_status": "compatible",
+      "compatibility_reason": "",
+      "normalization_source": "openai",
+      "normalization_proposal": {
+        "version": 1,
+        "shape": "text",
+        "strategy": "classification_template",
+        "source_columns": [
+          "product_area",
+          "customer_segment",
+          "priority",
+          "full_description",
+          "issue_type"
+        ],
+        "fields": {
+          "text": {
+            "source_column": null,
+            "template": "Product area: {product_area}\nCustomer segment: {customer_segment}\nPriority: {priority}\nDescription: {full_description}",
+            "value_mapping": null
+          },
+          "prompt": null,
+          "completion": {
+            "source_column": "issue_type",
+            "template": null,
+            "value_mapping": {
+              "Invoice Error": "billing",
+              "Payment Failure": "billing",
+              "Billing Dispute": "billing",
+              "Authentication Failure": "technical",
+              "OAuth Token Expired": "technical",
+              "Minor UI Bug": "technical",
+              "UI Bug": "technical",
+              "Performance Degradation": "technical",
+              "Outage": "technical",
+              "Account Access": "account",
+              "Account Issue": "account",
+              "Password Reset": "account",
+              "Feature Request": "feature_request",
+              "Product Enhancement": "feature_request",
+              "Other": "other"
+            }
+          }
+        }
+      },
+      "compatible_methods": [
+        "sft"
+      ],
+      "license": null,
+      "warnings": [
+        "License is missing or unclear in the available Hub metadata."
+      ]
+    },
+    {
+      "id": "lhoestq/E-Commerce_Customer_Support_Conversations_More_Concise",
+      "source_url": "https://huggingface.co/datasets/lhoestq/E-Commerce_Customer_Support_Conversations_More_Concise",
+      "description": "Computed from NebulaByte/E-Commerce_Customer_Support_Conversations using this prompt and google/gemma-3-1b-it:\nprompt = (\n    \"Here is a conversation between an agent and a customer. \"\n    \"Your job is to rewrite the same discussion but this time make the customer significantly more direct and concise. \"\n    \"It's also very important that all the customer's messages look like SMS language and a emotion-less / monotonic tone. \"\n    \"Moreover you should absolutely add typos and remove most of… See the full description on the dataset page: https://huggingface.co/datasets/lhoestq/E-Commerce_Customer_Support_Conversations_More_Concise.",
+      "downloads": 13,
+      "likes": 1,
+      "gated": false,
+      "private": false,
+      "tags": [
+        "size_categories:1K<n<10K",
+        "format:parquet",
+        "modality:text",
+        "library:datasets",
+        "library:pandas",
+        "library:mlcroissant",
+        "library:polars",
+        "region:us"
+      ],
+      "cardData": {
+        "dataset_info": {
+          "features": [
+            {
+              "name": "issue_area",
+              "dtype": "string"
+            },
+            {
+              "name": "issue_category",
+              "dtype": "string"
+            },
+            {
+              "name": "issue_sub_category",
+              "dtype": "string"
+            },
+            {
+              "name": "issue_category_sub_category",
+              "dtype": "string"
+            },
+            {
+              "name": "customer_sentiment",
+              "dtype": "string"
+            },
+            {
+              "name": "product_category",
+              "dtype": "string"
+            },
+            {
+              "name": "product_sub_category",
+              "dtype": "string"
+            },
+            {
+              "name": "issue_complexity",
+              "dtype": "string"
+            },
+            {
+              "name": "agent_experience_level",
+              "dtype": "string"
+            },
+            {
+              "name": "agent_experience_level_desc",
+              "dtype": "string"
+            },
+            {
+              "name": "conversation",
+              "dtype": "string"
+            }
+          ],
+          "splits": [
+            {
+              "name": "train",
+              "num_bytes": 2099326,
+              "num_examples": 1000
+            }
+          ],
+          "download_size": 748091,
+          "dataset_size": 2099326
+        },
+        "configs": [
+          {
+            "config_name": "default",
+            "data_files": [
+              {
+                "split": "train",
+                "path": "data/train-*"
+              }
+            ]
+          }
+        ]
+      },
+      "matched_queries": [
+        "support conversations"
+      ],
+      "matched_tasks": [
+        "conversational"
+      ],
+      "viewer_accessible": true,
+      "num_rows": 1000,
+      "size_partial": false,
+      "splits": [
+        "train"
+      ],
+      "schema_signals": [
+        "conversation_ready"
+      ],
+      "schema_details": {
+        "feature_names": [
+          "issue_area",
+          "issue_category",
+          "issue_sub_category",
+          "issue_category_sub_category",
+          "customer_sentiment",
+          "product_category",
+          "product_sub_category",
+          "issue_complexity",
+          "agent_experience_level",
+          "agent_experience_level_desc",
+          "conversation"
+        ]
+      },
+      "source_schema": {
+        "available_columns": [
+          "issue_area",
+          "issue_category",
+          "issue_sub_category",
+          "issue_category_sub_category",
+          "customer_sentiment",
+          "product_category",
+          "product_sub_category",
+          "issue_complexity",
+          "agent_experience_level",
+          "agent_experience_level_desc",
+          "conversation"
+        ],
+        "sample_rows": [
+          {
+            "issue_area": "Login and Account",
+            "issue_category": "Mobile Number and Email Verification",
+            "issue_sub_category": "Verification requirement for mobile number or email address during login",
+            "issue_category_sub_category": "Mobile Number and Email Verification -> Verification requirement for mobile number or email address during login",
+            "customer_sentiment": "neutral",
+            "product_category": "Appliances",
+            "product_sub_category": "Oven Toaster Grills (OTG)",
+            "issue_complexity": "medium",
+            "agent_experience_level": "junior",
+            "agent_experience_level_desc": "handles customer inquiries independently, possess solid troubleshooting skills, and seek guidance from more experienced team members when needed.",
+            "conversation": "Agent: Hello BrownBox. My name is Tom. How can I help you? Customer: Hi Tom. I'm trying to log in to my account to buy an Oven Toaster Grill (OTG). But I can..."
+          },
+          {
+            "issue_area": "Cancellations and returns",
+            "issue_category": "Pickup and Shipping",
+            "issue_sub_category": "Reasons for being asked to ship the item",
+            "issue_category_sub_category": "Pickup and Shipping -> Reasons for being asked to ship the item",
+            "customer_sentiment": "neutral",
+            "product_category": "Electronics",
+            "product_sub_category": "Computer Monitor",
+            "issue_complexity": "less",
+            "agent_experience_level": "junior",
+            "agent_experience_level_desc": "handles customer inquiries independently, possess solid troubleshooting skills, and seek guidance from more experienced team members when needed.",
+            "conversation": "Agent: Hi BrownBox. My name is Alex. How can I help? Customer: Hi Alex. Received an email from BrownBox about a monitor. Why am I getting a return request? A..."
+          },
+          {
+            "issue_area": "Cancellations and returns",
+            "issue_category": "Replacement and Return Process",
+            "issue_sub_category": "Inability to click the 'Cancel' button",
+            "issue_category_sub_category": "Replacement and Return Process -> Inability to click the 'Cancel' button",
+            "customer_sentiment": "neutral",
+            "product_category": "Appliances",
+            "product_sub_category": "Juicer/Mixer/Grinder",
+            "issue_complexity": "medium",
+            "agent_experience_level": "experienced",
+            "agent_experience_level_desc": "confidently handles complex customer issues, excel in de-escalation, and possess the ability to empathize with customers, providing them with effective solut...",
+            "conversation": "Okay, here’s the rewritten conversation with the requested changes – significantly more direct, SMS-like language, emotionless tone, and punctuation removal...."
+          }
+        ]
+      },
+      "preferred_dataset_config": "default",
+      "preferred_train_split": "train",
+      "preferred_eval_split": null,
+      "compatibility_status": "incompatible",
+      "compatibility_reason": "No deterministic SFT normalization could be inferred from the available native dataset fields.",
+      "normalization_source": null,
+      "normalization_proposal": null,
+      "compatible_methods": [],
+      "license": null,
+      "warnings": [
+        "Discarded invalid normalization proposal: normalization.fields.prompt cannot define both source_column and template. normalization.fields.completion cannot define both source_column and template.",
+        "License is missing or unclear in the available Hub metadata."
+      ]
+    },
+    {
+      "id": "strova-ai/customer_support_conversations_dataset",
+      "source_url": "https://huggingface.co/datasets/strova-ai/customer_support_conversations_dataset",
+      "description": "\n\t\n\t\t\n\t\t💬 Customer Support Conversation Dataset — Powered by Syncora.ai\n\t\n\nA free synthetic dataset for chatbot training, LLM fine-tuning, and synthetic data generation research.Created using Syncora.ai’s privacy-safe synthetic data engine, this dataset is ideal for developing, testing, and benchmarking AI customer support systems.\nIt serves as a dataset for chatbot training and a dataset for LLM training, offering rich, structured conversation data for real-world simulation.\n\n\n\t\n\t\t\n\t\n\t\n\t\t🌟… See the full description on the dataset page: https://huggingface.co/datasets/strova-ai/customer_support_conversations_dataset.",
+      "downloads": 171,
+      "likes": 1,
+      "gated": false,
+      "private": false,
+      "tags": [
+        "region:us"
+      ],
+      "cardData": {
+        "dataset_info": {
+          "features": [
+            {
+              "name": "conversation_id",
+              "dtype": "string"
+            },
+            {
+              "name": "turn_id",
+              "dtype": "int32"
+            },
+            {
+              "name": "role",
+              "dtype": "string"
+            },
+            {
+              "name": "message",
+              "dtype": "string"
+            },
+            {
+              "name": "timestamp",
+              "dtype": "string"
+            },
+            {
+              "name": "industry",
+              "dtype": "string"
+            },
+            {
+              "name": "category",
+              "dtype": "string"
+            },
+            {
+              "name": "sub_category",
+              "dtype": "string"
+            },
+            {
+              "name": "locale",
+              "dtype": "string"
+            },
+            {
+              "name": "channel",
+              "dtype": "string"
+            },
+            {
+              "name": "customer_id",
+              "dtype": "string"
+            },
+            {
+              "name": "agent_id",
+              "dtype": "string"
+            },
+            {
+              "name": "sentiment",
+              "dtype": "string"
+            },
+            {
+              "name": "priority",
+              "dtype": "string"
+            },
+            {
+              "name": "status",
+              "dtype": "string"
+            },
+            {
+              "name": "intent",
+              "dtype": "string"
+            }
+          ],
+          "task_categories": [
+            "conversational-ai",
+            "sentiment-analysis",
+            "intent-classification",
+            "dialogue-state-tracking"
+          ],
+          "size_categories": [
+            "10K<n<100K"
+          ],
+          "license": "MIT"
+        }
+      },
+      "matched_queries": [
+        "support conversations",
+        "customer support dataset"
+      ],
+      "matched_tasks": [
+        "conversational"
+      ],
+      "viewer_accessible": false,
+      "num_rows": 0,
+      "size_partial": false,
+      "splits": [
+        "train"
+      ],
+      "schema_signals": [],
+      "schema_details": {
+        "feature_names": []
+      },
+      "source_schema": {
+        "available_columns": [],
+        "sample_rows": []
+      },
+      "preferred_dataset_config": "default",
+      "preferred_train_split": "train",
+      "preferred_eval_split": null,
+      "compatibility_status": "incompatible",
+      "compatibility_reason": "No deterministic SFT normalization could be inferred from the available native dataset fields.",
+      "normalization_source": null,
+      "normalization_proposal": null,
+      "compatible_methods": [],
+      "license": null,
+      "warnings": [
+        "License is missing or unclear in the available Hub metadata."
+      ]
+    },
+    {
+      "id": "Venkatrajan247/ecommerce-customer-support-conversations",
+      "source_url": "https://huggingface.co/datasets/Venkatrajan247/ecommerce-customer-support-conversations",
+      "description": "E-Commerce Customer Support Conversations\nDataset Summary:\nThis dataset contains customer support queries and responses from an e-commerce context. \nIt is designed for training and fine-tuning AI models for automated customer service, chatbots, and natural language processing (NLP) applications.\nUse Cases:\nFine-tuning conversational AI models (e.g., GPT, BERT)\nTraining chatbots for e-commerce support\nImproving customer service automation\nSentiment and intent analysis\nDataset Format:\nThe… See the full description on the dataset page: https://huggingface.co/datasets/Venkatrajan247/ecommerce-customer-support-conversations.",
+      "downloads": 17,
+      "likes": 0,
+      "gated": false,
+      "private": false,
+      "tags": [
+        "license:llama3.3",
+        "size_categories:n<1K",
+        "format:json",
+        "modality:text",
+        "library:datasets",
+        "library:pandas",
+        "library:mlcroissant",
+        "library:polars",
+        "region:us"
+      ],
+      "cardData": {
+        "license": "llama3.3"
+      },
+      "matched_queries": [
+        "support conversations"
+      ],
+      "matched_tasks": [
+        "conversational"
+      ],
+      "viewer_accessible": true,
+      "num_rows": 20,
+      "size_partial": false,
+      "splits": [
+        "train"
+      ],
+      "schema_signals": [
+        "conversation_ready"
+      ],
+      "schema_details": {
+        "feature_names": [
+          "messages"
+        ]
+      },
+      "source_schema": {
+        "available_columns": [
+          "messages"
+        ],
+        "sample_rows": [
+          {
+            "messages": [
+              {
+                "role": "user",
+                "content": "Where is my order?"
+              },
+              {
+                "role": "assistant",
+                "content": "You can track your order using the tracking link sent to your email. Let me know if you need further assistance."
+              }
+            ]
+          },
+          {
+            "messages": [
+              {
+                "role": "user",
+                "content": "Can I cancel my order after placing it?"
+              },
+              {
+                "role": "assistant",
+                "content": "Yes, you can cancel your order within 24 hours of placing it. Go to 'My Orders' and select 'Cancel'."
+              }
+            ]
+          },
+          {
+            "messages": [
+              {
+                "role": "user",
+                "content": "How do I return a product?"
+              },
+              {
+                "role": "assistant",
+                "content": "You can initiate a return within 30 days of delivery by visiting the 'Returns' section in your account."
+              }
+            ]
+          }
+        ]
+      },
+      "preferred_dataset_config": "default",
+      "preferred_train_split": "train",
+      "preferred_eval_split": null,
+      "compatibility_status": "incompatible",
+      "compatibility_reason": "Dataset contains a single column 'messages' which is a list of role/content objects (chat turns). There are no explicit label columns (e.g., issue type, urgency, category, label) that can be deterministically mapped to a text-classification target. While the messages can be used for response-generation (prompt→assistant reply), the dataset does not provide ground-truth categorical labels required for supervised text-classification, so a deterministic normalization for text-classification is not possible.",
+      "normalization_source": null,
+      "normalization_proposal": null,
+      "compatible_methods": [],
+      "license": "llama3.3",
+      "warnings": []
+    },
+    {
+      "id": "Lakshan2003/customer-support-client-agent-conversations-sinhala",
+      "source_url": "https://huggingface.co/datasets/Lakshan2003/customer-support-client-agent-conversations-sinhala",
+      "description": "",
+      "downloads": 12,
+      "likes": 0,
+      "gated": false,
+      "private": false,
+      "tags": [
+        "size_categories:10K<n<100K",
+        "format:parquet",
+        "modality:text",
+        "library:datasets",
+        "library:pandas",
+        "library:polars",
+        "library:mlcroissant",
+        "region:us"
+      ],
+      "cardData": {
+        "dataset_info": {
+          "features": [
+            {
+              "name": "conversation_id",
+              "dtype": "string"
+            },
+            {
+              "name": "instruction",
+              "dtype": "string"
+            },
+            {
+              "name": "conversation_history",
+              "dtype": "string"
+            },
+            {
+              "name": "history_summary",
+              "dtype": "string"
+            },
+            {
+              "name": "client_question",
+              "dtype": "string"
+            },
+            {
+              "name": "agent_answer",
+              "dtype": "string"
+            },
+            {
+              "name": "refined_agent_answer",
+              "dtype": "string"
+            },
+            {
+              "name": "translation_source",
+              "dtype": "string"
+            }
+          ],
+          "splits": [
+            {
+              "name": "train",
+              "num_bytes": 166069252,
+              "num_examples": 22304
+            }
+          ],
+          "download_size": 47720778,
+          "dataset_size": 166069252
+        },
+        "configs": [
+          {
+            "config_name": "default",
+            "data_files": [
+              {
+                "split": "train",
+                "path": "data/train-*"
+              }
+            ]
+          }
+        ]
+      },
+      "matched_queries": [
+        "support conversations"
+      ],
+      "matched_tasks": [
+        "conversational"
+      ],
+      "viewer_accessible": true,
+      "num_rows": 22304,
+      "size_partial": false,
+      "splits": [
+        "train"
+      ],
+      "schema_signals": [
+        "instruction_ready"
+      ],
+      "schema_details": {
+        "feature_names": [
+          "conversation_id",
+          "instruction",
+          "conversation_history",
+          "history_summary",
+          "client_question",
+          "agent_answer",
+          "refined_agent_answer",
+          "translation_source"
+        ]
+      },
+      "source_schema": {
+        "available_columns": [
+          "conversation_id",
+          "instruction",
+          "conversation_history",
+          "history_summary",
+          "client_question",
+          "agent_answer",
+          "refined_agent_answer",
+          "translation_source"
+        ],
+        "sample_rows": [
+          {
+            "conversation_id": "fd8e02fc506b4c938aaf93770d5b88f8",
+            "instruction": "ඔබ **ProspectBank** හි සේවය කරන වෘත්තීය ඇමතුම් මධ්‍යස්ථාන පාරිභෝගික සේවා නියෝජිතයෙකි. සංවාද ඉතිහාසය සහ සපයන ලද ඕනෑම සන්දර්භය (තිබේ නම්) සමාලෝචනය කරන්න. ඔබගේ ...",
+            "conversation_history": "නියෝජිත: සුභ උදෑසනක්, රඳවා තබා ගැනීම ගැන ඔබට ස්තුතියි. මගේ නම පෝල්, මම ProspectBank සමඟ සිටිමි. අද මම ඔබට උදව් කරන්නේ කෙසේද? සේවාදායකයා: හායි පෝල්, මගේ බැංකු...",
+            "history_summary": "Jimmie ඔහුගේ බැංකු ප්‍රකාශයේ විෂමතාවයක් සම්බන්ධයෙන් ProspectBank හා සම්බන්ධ විය. නියෝජිත පෝල් ගැටලුව විසඳීමට ඉදිරියට යාමට අනන්‍යතා සත්‍යාපනය ඉල්ලා සිටියේය. ව...",
+            "client_question": "ෂුවර්. මගේ නම ජිමී ස්මිත්, මගේ ගිණුම් අංකය 1234567890.",
+            "agent_answer": "ස්තූතියි, මට තව විස්තර කිහිපයක් තහවුරු කිරීමට අවශ්‍යයි. කරුණාකර ගොනුවේ ඇති ඔබගේ ලිපිනය මට ලබා දිය හැකිද?",
+            "refined_agent_answer": "ඒකට ස්තූතියි, ජිමී. කරුණාකර ගොනුවේ ඔබගේ ලිපිනය ලබා දිය හැකිද? මෙය ඔබගේ අනන්‍යතාවය සත්‍යාපනය කිරීමට සහ විෂමතාවය නිරාකරණය කිරීම ආරම්භ කිරීමට මට උදවු කරයි.",
+            "translation_source": "Google Translate (deep_translator)"
+          },
+          {
+            "conversation_id": "6bca65afb72a43f6b7e86ccaf64c2972",
+            "instruction": "ඔබ **Crest Financial Partners** හි සේවය කරන වෘත්තීය ඇමතුම් මධ්‍යස්ථාන පාරිභෝගික සේවා නියෝජිතයෙකි. සංවාද ඉතිහාසය සහ සපයන ලද ඕනෑම සන්දර්භය (තිබේ නම්) සමාලෝචනය ...",
+            "conversation_history": "නියෝජිත: Crest Financial Partners ඇමතීමට ස්තූතියි. මගේ නම ඉමොජින්, අද මම ඔබට උදව් කරන්නේ කෙසේද? සේවාලාභියා: හායි,ජීන්, මගේ නම ටෝනියා වන අතර මට තැන්පතු සහතිකය...",
+            "history_summary": "ටෝන්යා, සේවාදායකයා, ඇයගේ 5 වසරක තැන්පතු සහතිකයෙන් කලින් මුදල් ආපසු ගැනීම සඳහා වන දඬුවම් පිළිබඳව විමසා සිටියාය. නියෝජිතයා, Emogene, ඇගේ ගිණුම් තොරතුරු තහවුරු ...",
+            "client_question": "හරි, ඒක තේරුමක්. සහ අරමුදල් ආපසු ගැනීමට මා යන්නේ කෙසේද?",
+            "agent_answer": "ඔබට අපගේ ශාඛාවකට පැමිණ හෝ දුරකථනයෙන් මුදල් ආපසු ගැනීමක් ඉල්ලා සිටිය හැක. ඔබ දුරකථනයෙන් ඉවත් වීමට තෝරා ගන්නේ නම්, අපට ඔබේ අනන්‍යතාවය තහවුරු කර ක්‍රියාවලිය සම්...",
+            "refined_agent_answer": "අපගේ ශාඛාවකට පිවිසීමෙන් හෝ එය ඉල්ලීමට අප ඇමතීමෙන් ඔබට ඔබේ අරමුදල් ආපසු ලබාගත හැක. ඔබ එය දුරකථනයෙන් කිරීමට කැමති නම්, මට පළමුව ඔබේ අනන්‍යතාවය තහවුරු කිරීමට අව...",
+            "translation_source": "Google Translate (deep_translator)"
+          },
+          {
+            "conversation_id": "f7ee45fd30ef464c8e0cf4aef92378f8",
+            "instruction": "ඔබ **වැලි මූල්‍ය හවුල්කරුවන්** හි සේවය කරන වෘත්තීය ඇමතුම් මධ්‍යස්ථාන පාරිභෝගික සේවා නියෝජිතයෙකි. සංවාද ඉතිහාසය සහ සපයන ලද ඕනෑම සන්දර්භය (තිබේ නම්) සමාලෝචනය ක...",
+            "conversation_history": "නියෝජිත: සුබ උදෑසනක්, Valley Financial Partners ඇමතීමට ස්තූතියි. මගේ නම ඩේවිස්, අද මම ඔබට උදව් කරන්නේ කෙසේද? සේවාදායකයා: හායි ඩේවිස්, මගේ නම මෙල්බා සහ මම අමත...",
+            "history_summary": "සිලිකන් නිම්නයේ ඉංජිනේරුවෙකු ලෙස සේවය කිරීම සඳහා රැකියා වීසා බලපත්‍රයක් මත ඕස්ට්‍රේලියාවේ සිට මෑතකදී එක්සත් ජනපදයට ගිය සේවාදායකයියක් වන මෙල්බා, බැංකු ගිණුමක්...",
+            "client_question": "හරි, ඒක තේරුමක්. මගේ රැකියා කොන්ත්‍රාත්තුව මෙහි ඇත, එය මගේ වැටුප සහ රැකියා මාතෘකාව ලැයිස්තුගත කරයි. ඒ වගේම මගේ ලිපිනය ඕස්ට්‍රේලියාවේ.",
+            "agent_answer": "නියමයි, එය උපකාරී වේ. අවාසනාවකට, මට අද ඔබ සඳහා අයදුම් කිරීමේ ක්‍රියාවලිය සම්පූර්ණ කිරීමට නොහැකි විය. අපගේ පද්ධතිය මට විදේශීය ලිපින සත්‍යාපනය කිරීමට ඉඩ නොදෙන ...",
+            "refined_agent_answer": "එය බෙදාගත්තාට ස්තුතියි, මෙල්බා. ඔබගේ ඉවසීම අගය කරමි. අවාසනාවකට, අපගේ පද්ධතිය මට විදේශීය ලිපින සත්‍යාපනය කිරීමට ඉඩ නොදෙන නිසා මට අද අයදුම්පත සම්පූර්ණ කළ නොහැක...",
+            "translation_source": "Google Translate (deep_translator)"
+          }
+        ]
+      },
+      "preferred_dataset_config": "default",
+      "preferred_train_split": "train",
+      "preferred_eval_split": null,
+      "compatibility_status": "incompatible",
+      "compatibility_reason": "Dataset contains only conversational text fields (instruction, conversation_history, history_summary, client_question, agent_answer, refined_agent_answer, translation_source) and an identifier (conversation_id) but no target label columns for text-classification (e.g., issue type, urgency/severity). Without explicit labels a deterministic prompt→label (prompt/completion) normalization for supervised classification SFT is not possible. If labeled columns (issue_type, urgency, etc.) were added, a deterministic mapping using instruction + conversation_history + client_question as the prompt and the label column as the completion could be created.",
+      "normalization_source": null,
+      "normalization_proposal": null,
+      "compatible_methods": [],
+      "license": null,
+      "warnings": [
+        "License is missing or unclear in the available Hub metadata."
+      ]
+    },
+    {
+      "id": "Katipezi/customer_support_conversations_dataset",
+      "source_url": "https://huggingface.co/datasets/Katipezi/customer_support_conversations_dataset",
+      "description": "\n\t\n\t\t\n\t\t💬 Customer Support Conversation Dataset — Powered by Syncora.ai\n\t\n\nA free synthetic dataset for chatbot training, LLM fine-tuning, and synthetic data generation research.Created using Syncora.ai’s privacy-safe synthetic data engine, this dataset is ideal for developing, testing, and benchmarking AI customer support systems.\nIt serves as a dataset for chatbot training and a dataset for LLM training, offering rich, structured conversation data for real-world simulation.\n\n\n\t\n\t\t\n\t\n\t\n\t\t🌟… See the full description on the dataset page: https://huggingface.co/datasets/Katipezi/customer_support_conversations_dataset.",
+      "downloads": 12,
+      "likes": 0,
+      "gated": false,
+      "private": false,
+      "tags": [
+        "region:us"
+      ],
+      "cardData": {
+        "dataset_info": {
+          "features": [
+            {
+              "name": "conversation_id",
+              "dtype": "string"
+            },
+            {
+              "name": "turn_id",
+              "dtype": "int32"
+            },
+            {
+              "name": "role",
+              "dtype": "string"
+            },
+            {
+              "name": "message",
+              "dtype": "string"
+            },
+            {
+              "name": "timestamp",
+              "dtype": "string"
+            },
+            {
+              "name": "industry",
+              "dtype": "string"
+            },
+            {
+              "name": "category",
+              "dtype": "string"
+            },
+            {
+              "name": "sub_category",
+              "dtype": "string"
+            },
+            {
+              "name": "locale",
+              "dtype": "string"
+            },
+            {
+              "name": "channel",
+              "dtype": "string"
+            },
+            {
+              "name": "customer_id",
+              "dtype": "string"
+            },
+            {
+              "name": "agent_id",
+              "dtype": "string"
+            },
+            {
+              "name": "sentiment",
+              "dtype": "string"
+            },
+            {
+              "name": "priority",
+              "dtype": "string"
+            },
+            {
+              "name": "status",
+              "dtype": "string"
+            },
+            {
+              "name": "intent",
+              "dtype": "string"
+            }
+          ],
+          "task_categories": [
+            "conversational-ai",
+            "sentiment-analysis",
+            "intent-classification",
+            "dialogue-state-tracking"
+          ],
+          "size_categories": [
+            "10K<n<100K"
+          ],
+          "license": "MIT"
+        }
+      },
+      "matched_queries": [
+        "support conversations",
+        "customer support dataset"
+      ],
+      "matched_tasks": [
+        "conversational"
+      ],
+      "viewer_accessible": false,
+      "num_rows": 0,
+      "size_partial": false,
+      "splits": [
+        "train"
+      ],
+      "schema_signals": [],
+      "schema_details": {
+        "feature_names": []
+      },
+      "source_schema": {
+        "available_columns": [],
+        "sample_rows": []
+      },
+      "preferred_dataset_config": "default",
+      "preferred_train_split": "train",
+      "preferred_eval_split": null,
+      "compatibility_status": "incompatible",
+      "compatibility_reason": "No deterministic SFT normalization could be inferred from the available native dataset fields.",
+      "normalization_source": null,
+      "normalization_proposal": null,
+      "compatible_methods": [],
+      "license": null,
+      "warnings": [
+        "License is missing or unclear in the available Hub metadata."
+      ]
+    },
+    {
+      "id": "gorkemsevinc/customer_support_tickets",
+      "source_url": "https://huggingface.co/datasets/gorkemsevinc/customer_support_tickets",
+      "description": "",
+      "downloads": 122,
+      "likes": 3,
+      "gated": false,
+      "private": false,
+      "tags": [
+        "size_categories:1K<n<10K",
+        "format:parquet",
+        "modality:text",
+        "library:datasets",
+        "library:pandas",
+        "library:mlcroissant",
+        "library:polars",
+        "region:us"
+      ],
+      "cardData": {
+        "dataset_info": {
+          "features": [
+            {
+              "name": "Customer Email",
+              "dtype": "string"
+            },
+            {
+              "name": "Product Purchased",
+              "dtype": "string"
+            },
+            {
+              "name": "Ticket Type",
+              "dtype": "string"
+            },
+            {
+              "name": "Ticket Subject",
+              "dtype": "string"
+            },
+            {
+              "name": "Combined Text",
+              "dtype": "string"
+            },
+            {
+              "name": "Ticket Priority",
+              "dtype": "string"
+            }
+          ],
+          "splits": [
+            {
+              "name": "train",
+              "num_bytes": 3419084,
+              "num_examples": 8469
+            }
+          ],
+          "download_size": 1119984,
+          "dataset_size": 3419084
+        },
+        "configs": [
+          {
+            "config_name": "default",
+            "data_files": [
+              {
+                "split": "train",
+                "path": "data/train-*"
+              }
+            ]
+          }
+        ]
+      },
+      "matched_queries": [
+        "customer support tickets",
+        "support tickets labeled"
+      ],
+      "matched_tasks": [
+        "text-classification"
+      ],
+      "viewer_accessible": true,
+      "num_rows": 8469,
+      "size_partial": false,
+      "splits": [
+        "train"
+      ],
+      "schema_signals": [],
+      "schema_details": {
+        "feature_names": [
+          "Customer Email",
+          "Product Purchased",
+          "Ticket Type",
+          "Ticket Subject",
+          "Combined Text",
+          "Ticket Priority"
+        ]
+      },
+      "source_schema": {
+        "available_columns": [
+          "Customer Email",
+          "Product Purchased",
+          "Ticket Type",
+          "Ticket Subject",
+          "Combined Text",
+          "Ticket Priority"
+        ],
+        "sample_rows": [
+          {
+            "Customer Email": "carrollallison@example.com",
+            "Product Purchased": "gopro hero",
+            "Ticket Type": "technical issue",
+            "Ticket Subject": "product setup",
+            "Combined Text": "i'm having an issue with the gopro hero. please assist. your billing zip code is: 71701. we appreciate that you have requested a website address. please doub...",
+            "Ticket Priority": "critical"
+          },
+          {
+            "Customer Email": "clarkeashley@example.com",
+            "Product Purchased": "lg smart tv",
+            "Ticket Type": "technical issue",
+            "Ticket Subject": "peripheral compatibility",
+            "Combined Text": "i'm having an issue with the lg smart tv. please assist. if you need to change an existing product. i'm having an issue with the lg smart tv. please assist. ...",
+            "Ticket Priority": "critical"
+          },
+          {
+            "Customer Email": "gonzalestracy@example.com",
+            "Product Purchased": "dell xps",
+            "Ticket Type": "technical issue",
+            "Ticket Subject": "network problem",
+            "Combined Text": "i'm facing a problem with my dell xps. the dell xps is not turning on. it was working fine until yesterday, but now it doesn't respond. 1.8.3 i really i'm us...",
+            "Ticket Priority": "low"
+          }
+        ]
+      },
+      "preferred_dataset_config": "default",
+      "preferred_train_split": "train",
+      "preferred_eval_split": null,
+      "compatibility_status": "incompatible",
+      "compatibility_reason": "No deterministic SFT normalization could be inferred from the available native dataset fields.",
+      "normalization_source": null,
+      "normalization_proposal": null,
+      "compatible_methods": [],
+      "license": null,
+      "warnings": [
+        "Discarded invalid normalization proposal: normalization.fields.prompt must be an object.",
+        "License is missing or unclear in the available Hub metadata."
+      ]
+    }
+  ],
+  "recommended_datasets": [
+    {
+      "dataset": "Tobi-Bueck/customer-support-tickets",
+      "source_url": "https://huggingface.co/datasets/Tobi-Bueck/customer-support-tickets",
+      "score": 95,
+      "why": "Medium-sized (61,765 rows) ticket/email dataset with deterministic classification-ready fields ('body' + 'priority') giving direct issue-type and urgency labels. Covers English and German, includes queue/type fields useful for mapping to your taxonomy, and supports multiple downstream shapes (classification, QA, summarization). License is explicitly provided (cc-by-nc-4.0) and normalization is deterministic (no template synthesis), minimizing preprocessing work while meeting the minimum-row floor for a single-core dataset.",
+      "matched_queries": [
+        "customer support tickets",
+        "support tickets labeled"
+      ],
+      "mapped_task_types": [
+        "text-classification"
+      ],
+      "downloads": 1707,
+      "likes": 20,
+      "num_rows": 61765,
+      "license": "cc-by-nc-4.0",
+      "splits": [
+        "train"
+      ],
+      "schema_signals": [
+        "classification_ready",
+        "qa_ready",
+        "summarization_ready"
+      ],
+      "compatibility_status": "compatible",
+      "compatibility_reason": "Classification-style normalization is available via 'body' and 'priority'.",
+      "normalization_source": "deterministic",
+      "normalization_proposal": {
+        "version": 1,
+        "shape": "prompt_completion",
+        "strategy": "classification_template",
+        "source_columns": [
+          "body",
+          "priority"
+        ],
+        "fields": {
+          "text": null,
+          "prompt": {
+            "source_column": null,
+            "template": "Classify the following example. Return only the label.\n\nInput:\n{body}\n\nLabel:",
+            "value_mapping": null
+          },
+          "completion": {
+            "source_column": "priority",
+            "template": null,
+            "value_mapping": null
+          }
+        }
+      },
+      "compatible_methods": [
+        "sft"
+      ],
+      "source_schema": {
+        "available_columns": [
+          "subject",
+          "body",
+          "answer",
+          "type",
+          "queue",
+          "priority",
+          "language",
+          "version",
+          "tag_1",
+          "tag_2",
+          "tag_3",
+          "tag_4",
+          "tag_5",
+          "tag_6",
+          "tag_7",
+          "tag_8"
+        ],
+        "sample_rows": [
+          {
+            "subject": "Wesentlicher Sicherheitsvorfall",
+            "body": "Sehr geehrtes Support-Team,\\n\\nich möchte einen gravierenden Sicherheitsvorfall melden, der gegenwärtig mehrere Komponenten unserer Infrastruktur betrifft. B...",
+            "answer": "Vielen Dank für die Meldung des kritischen Sicherheitsvorfalls und die Bereitstellung der Übersicht über die betroffenen Geräte sowie der ergriffenen ersten ...",
+            "type": "Incident",
+            "queue": "Technical Support",
+            "priority": "high",
+            "language": "de",
+            "version": "51",
+            "tag_1": "Security",
+            "tag_2": "Outage",
+            "tag_3": "Disruption",
+            "tag_4": "Data Breach",
+            "tag_5": "",
+            "tag_6": "",
+            "tag_7": "",
+            "tag_8": ""
+          },
+          {
+            "subject": "Account Disruption",
+            "body": "Dear Customer Support Team,\\n\\nI am writing to report a significant problem with the centralized account management portal, which currently appears to be off...",
+            "answer": "Thank you for reaching out, <name>. We are aware of the outage affecting the centralized account management system, and our technical team is actively workin...",
+            "type": "Incident",
+            "queue": "Technical Support",
+            "priority": "high",
+            "language": "en",
+            "version": "51",
+            "tag_1": "Account",
+            "tag_2": "Disruption",
+            "tag_3": "Outage",
+            "tag_4": "IT",
+            "tag_5": "Tech Support",
+            "tag_6": "",
+            "tag_7": "",
+            "tag_8": ""
+          },
+          {
+            "subject": "Query About Smart Home System Integration Features",
+            "body": "Dear Customer Support Team,\\n\\nI hope this message reaches you well. I am reaching out to request detailed information about the capabilities of your smart h...",
+            "answer": "Thank you for your inquiry. Our products support integration with Amazon Alexa, Google Assistant, and Apple HomeKit. Compatibility details can differ dependi...",
+            "type": "Request",
+            "queue": "Returns and Exchanges",
+            "priority": "medium",
+            "language": "en",
+            "version": "51",
+            "tag_1": "Product",
+            "tag_2": "Feature",
+            "tag_3": "Tech Support",
+            "tag_4": "",
+            "tag_5": "",
+            "tag_6": "",
+            "tag_7": "",
+            "tag_8": ""
+          }
+        ]
+      },
+      "preferred_dataset_config": "default",
+      "preferred_train_split": "train",
+      "preferred_eval_split": null,
+      "warnings": [
+        "License is CC-BY-NC-4.0 — restricts commercial use; verify fit with your use case.",
+        "Synthetic / generator-origin artifacts likely — validate label quality on a human-reviewed sample before wide deployment.",
+        "Class imbalance (high/critical cases are often rare) and taxonomy differences vs your production labels — plan label mapping and resampling.",
+        "Channel/format mismatch vs chat transcripts (emails vs conversations) — if you need chat-style examples consider adding a conversational dataset later."
+      ]
+    }
+  ]
+}

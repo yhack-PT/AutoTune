@@ -1,0 +1,264 @@
+{
+  "created_at": "2026-03-28T22:15:26.138Z",
+  "objective_summary": "Classify support tickets by issue type and urgency.",
+  "input_path": "/home/andrew/code/PT/backend/generated-posttraining-jobs/customer-support-classify-support-ticket-dc6d7998/recommendation.json",
+  "context_path": null,
+  "usable_candidates": [
+    {
+      "dataset": "Tobi-Bueck/customer-support-tickets",
+      "compatibility_status": "compatible",
+      "compatibility_reason": "Classification-style normalization is available via 'body' and 'priority'.",
+      "normalization_source": "deterministic",
+      "compatible_methods": [
+        "sft"
+      ],
+      "normalization_proposal": {
+        "version": 1,
+        "shape": "prompt_completion",
+        "strategy": "classification_template",
+        "source_columns": [
+          "body",
+          "priority"
+        ],
+        "fields": {
+          "text": null,
+          "prompt": {
+            "source_column": null,
+            "template": "Classify the following example. Return only the label.\n\nInput:\n{body}\n\nLabel:",
+            "value_mapping": null
+          },
+          "completion": {
+            "source_column": "priority",
+            "template": null,
+            "value_mapping": null
+          }
+        }
+      },
+      "source_schema": {
+        "available_columns": [
+          "subject",
+          "body",
+          "answer",
+          "type",
+          "queue",
+          "priority",
+          "language",
+          "version",
+          "tag_1",
+          "tag_2",
+          "tag_3",
+          "tag_4",
+          "tag_5",
+          "tag_6",
+          "tag_7",
+          "tag_8"
+        ],
+        "sample_rows": [
+          {
+            "subject": "Wesentlicher Sicherheitsvorfall",
+            "body": "Sehr geehrtes Support-Team,\\n\\nich möchte einen gravierenden Sicherheitsvorfall melden, der gegenwärtig mehrere Komponenten unserer Infrastruktur betrifft. B...",
+            "answer": "Vielen Dank für die Meldung des kritischen Sicherheitsvorfalls und die Bereitstellung der Übersicht über die betroffenen Geräte sowie der ergriffenen ersten ...",
+            "type": "Incident",
+            "queue": "Technical Support",
+            "priority": "high",
+            "language": "de",
+            "version": "51",
+            "tag_1": "Security",
+            "tag_2": "Outage",
+            "tag_3": "Disruption",
+            "tag_4": "Data Breach",
+            "tag_5": "",
+            "tag_6": "",
+            "tag_7": "",
+            "tag_8": ""
+          },
+          {
+            "subject": "Account Disruption",
+            "body": "Dear Customer Support Team,\\n\\nI am writing to report a significant problem with the centralized account management portal, which currently appears to be off...",
+            "answer": "Thank you for reaching out, <name>. We are aware of the outage affecting the centralized account management system, and our technical team is actively workin...",
+            "type": "Incident",
+            "queue": "Technical Support",
+            "priority": "high",
+            "language": "en",
+            "version": "51",
+            "tag_1": "Account",
+            "tag_2": "Disruption",
+            "tag_3": "Outage",
+            "tag_4": "IT",
+            "tag_5": "Tech Support",
+            "tag_6": "",
+            "tag_7": "",
+            "tag_8": ""
+          },
+          {
+            "subject": "Query About Smart Home System Integration Features",
+            "body": "Dear Customer Support Team,\\n\\nI hope this message reaches you well. I am reaching out to request detailed information about the capabilities of your smart h...",
+            "answer": "Thank you for your inquiry. Our products support integration with Amazon Alexa, Google Assistant, and Apple HomeKit. Compatibility details can differ dependi...",
+            "type": "Request",
+            "queue": "Returns and Exchanges",
+            "priority": "medium",
+            "language": "en",
+            "version": "51",
+            "tag_1": "Product",
+            "tag_2": "Feature",
+            "tag_3": "Tech Support",
+            "tag_4": "",
+            "tag_5": "",
+            "tag_6": "",
+            "tag_7": "",
+            "tag_8": ""
+          }
+        ]
+      },
+      "preferred_dataset_config": "default",
+      "preferred_train_split": "train",
+      "preferred_eval_split": null,
+      "warnings": [
+        "License is CC-BY-NC-4.0 — restricts commercial use; verify fit with your use case.",
+        "Synthetic / generator-origin artifacts likely — validate label quality on a human-reviewed sample before wide deployment.",
+        "Class imbalance (high/critical cases are often rare) and taxonomy differences vs your production labels — plan label mapping and resampling.",
+        "Channel/format mismatch vs chat transcripts (emails vs conversations) — if you need chat-style examples consider adding a conversational dataset later."
+      ]
+    }
+  ],
+  "attempts": [
+    {
+      "attempt": 1,
+      "response_id": "resp_0127493beeecd7cb0169c852da0d7c8193abf47e5cf44742e1",
+      "model": "gpt-5-mini-2025-08-07",
+      "spec": {
+        "objective_summary": "Classify support tickets by issue type and urgency.",
+        "method": "sft",
+        "adaptation_strategy": "lora",
+        "artifact_strategy": "adapter",
+        "base_model": {
+          "model_id": "Qwen/Qwen3-8B-Base",
+          "revision": "7b8a267e13df1a9427e7dfa2691f69a417c58d94"
+        },
+        "selected_datasets": [
+          {
+            "dataset": "Tobi-Bueck/customer-support-tickets",
+            "dataset_config": null,
+            "train_split": "train",
+            "eval_split": null,
+            "weight": 1,
+            "warnings": [
+              "License is CC-BY-NC-4.0 — restricts commercial use; verify fit with your use case.",
+              "Synthetic / generator-origin artifacts likely — validate label quality on a human-reviewed sample before wide deployment.",
+              "Class imbalance (high/critical cases are often rare) and taxonomy differences vs your production labels — plan label mapping and resampling.",
+              "Channel/format mismatch vs chat transcripts (emails vs conversations) — if you need chat-style examples consider adding a conversational dataset later."
+            ],
+            "include_reason": "Directly usable ticket/email dataset (61.7K rows) with deterministic classification fields ('body' -> input, 'priority' -> label). Serves as a single core SFT dataset covering issue-type and urgency without needing multi-dataset mapping."
+          }
+        ],
+        "compute_preset": {
+          "gpu_type": "L40S",
+          "max_length": 1024,
+          "per_device_train_batch_size": 8,
+          "per_device_eval_batch_size": 16,
+          "gradient_accumulation_steps": 4
+        },
+        "training_params": {
+          "learning_rate": 0.0002,
+          "num_train_epochs": 3,
+          "max_steps": 0,
+          "beta": 0,
+          "lora_r": 16,
+          "lora_alpha": 32,
+          "lora_dropout": 0.05,
+          "target_modules": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj"
+          ],
+          "logging_steps": 100,
+          "save_steps": 1000,
+          "eval_steps": 500
+        },
+        "seed_artifact": null,
+        "notes": [
+          "Normalization: use the dataset's provided prompt_completion classification_template (SFT-compatible) mapping 'body' -> prompt and 'priority' -> completion; keep final shape as prompt-completion.",
+          "Validate and remap label taxonomy to your production schema (issue-type buckets and urgency tiers); prepare resampling/upsampling for rare high-severity cases.",
+          "Perform PII scrubbing and sample-based label quality checks prior to full training.",
+          "Be mindful of CC-BY-NC-4.0 license restrictions for commercial deployment; retain provenance and review compliance.",
+          "If conversational/chat examples are later required, add only datasets that normalize to the same SFT prompt-completion shape to avoid mixing shapes."
+        ]
+      },
+      "validation_errors": [
+        "training_params.beta must be a positive number."
+      ]
+    },
+    {
+      "attempt": 2,
+      "response_id": "resp_0396e1fb40e5039e0169c852ef3b60819fb50f2dd59255f462",
+      "model": "gpt-5-mini-2025-08-07",
+      "spec": {
+        "objective_summary": "Classify support tickets by issue type and urgency.",
+        "method": "sft",
+        "adaptation_strategy": "lora",
+        "artifact_strategy": "adapter",
+        "base_model": {
+          "model_id": "Qwen/Qwen3-8B-Base",
+          "revision": "7b8a267e13df1a9427e7dfa2691f69a417c58d94"
+        },
+        "selected_datasets": [
+          {
+            "dataset": "Tobi-Bueck/customer-support-tickets",
+            "dataset_config": null,
+            "train_split": "train",
+            "eval_split": null,
+            "weight": 1,
+            "warnings": [
+              "License is CC-BY-NC-4.0 — restricts commercial use; verify fit with your use case.",
+              "Synthetic / generator-origin artifacts likely — validate label quality on a human-reviewed sample before wide deployment.",
+              "Class imbalance (high/critical cases are often rare) and taxonomy differences vs your production labels — plan label mapping and resampling.",
+              "Channel/format mismatch vs chat transcripts (emails vs conversations) — if you need chat-style examples consider adding a conversational dataset later."
+            ],
+            "include_reason": "Directly usable ticket/email dataset (61.7K rows) with deterministic classification fields ('body' -> input, 'priority' -> label). Serves as a single core SFT dataset covering issue-type and urgency without needing multi-dataset mapping."
+          }
+        ],
+        "compute_preset": {
+          "gpu_type": "L40S",
+          "max_length": 1024,
+          "per_device_train_batch_size": 8,
+          "per_device_eval_batch_size": 16,
+          "gradient_accumulation_steps": 4
+        },
+        "training_params": {
+          "learning_rate": 0.0002,
+          "num_train_epochs": 3,
+          "max_steps": 0,
+          "beta": 0.1,
+          "lora_r": 16,
+          "lora_alpha": 32,
+          "lora_dropout": 0.05,
+          "target_modules": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj"
+          ],
+          "logging_steps": 100,
+          "save_steps": 1000,
+          "eval_steps": 500
+        },
+        "seed_artifact": null,
+        "notes": [
+          "Normalization: use the dataset's provided prompt_completion classification_template (SFT-compatible) mapping 'body' -> prompt and 'priority' -> completion; keep final shape as prompt-completion.",
+          "Validate and remap label taxonomy to your production schema (issue-type buckets and urgency tiers); prepare resampling/upsampling for rare high-severity cases.",
+          "Perform PII scrubbing and sample-based label quality checks prior to full training.",
+          "Be mindful of CC-BY-NC-4.0 license restrictions for commercial deployment; retain provenance and review compliance.",
+          "If conversational/chat examples are later required, add only datasets that normalize to the same SFT prompt-completion shape to avoid mixing shapes."
+        ]
+      },
+      "validation_errors": []
+    }
+  ],
+  "output_files": {
+    "spec_yaml": "/home/andrew/code/PT/backend/generated-posttraining-jobs/customer-support-classify-support-ticket-dc6d7998/post_training_job_spec.yaml",
+    "compiled_yaml": "/home/andrew/code/PT/backend/generated-posttraining-jobs/customer-support-classify-support-ticket-dc6d7998/compiled_train_config.yaml",
+    "manifest_json": "/home/andrew/code/PT/backend/generated-posttraining-jobs/customer-support-classify-support-ticket-dc6d7998/prepared_dataset_manifest.json",
+    "trace_json": "/home/andrew/code/PT/backend/generated-posttraining-jobs/customer-support-classify-support-ticket-dc6d7998/compiler_trace.json"
+  }
+}
