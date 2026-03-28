@@ -194,9 +194,10 @@ export default function ChatPage() {
                   <Sparkles className="h-6 w-6 text-background" />
                 </div>
                 <h2 className="text-2xl font-semibold tracking-tight">
-                  How can I help you today?
+                  What should your AI do?
                 </h2>
                 <p className="text-sm text-muted-foreground max-w-md mx-auto">
+                  Build a specialized AI for any use case
                   Ask me anything — this is a UI demo with placeholder responses.
                 </p>
               </div>
