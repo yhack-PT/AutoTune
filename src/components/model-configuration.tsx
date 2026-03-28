@@ -40,47 +40,41 @@ export function ModelConfiguration() {
         </p>
       </div>
 
-      <div className="flex">
-        {/* Left Half - Input Fields */}
-        <div className="w-1/2 border-r border-border p-8">
-          <div className="space-y-6">
-            <div className="space-y-2">
-              <Label
-                htmlFor="domain"
-                className="text-sm font-medium text-foreground"
-              >
-                Domain
-              </Label>
-              <Input
-                id="domain"
-                placeholder="e.g., Healthcare, Finance, Legal..."
-                value={domain}
-                onChange={(e) => setDomain(e.target.value)}
-                className="h-11"
-              />
-            </div>
-
-            <div className="space-y-2">
-              <Label
-                htmlFor="task"
-                className="text-sm font-medium text-foreground"
-              >
-                What should the model do?
-              </Label>
-              <Textarea
-                id="task"
-                placeholder="Describe the task or capability you want the model to perform..."
-                value={task}
-                onChange={(e) => setTask(e.target.value)}
-                className="min-h-[120px] resize-none"
-              />
-            </div>
+      <div className="p-8">
+        <div className="space-y-6">
+          <div className="space-y-2">
+            <Label
+              htmlFor="domain"
+              className="text-sm font-medium text-foreground"
+            >
+              Domain
+            </Label>
+            <Input
+              id="domain"
+              placeholder="e.g., Healthcare, Finance, Legal..."
+              value={domain}
+              onChange={(e) => setDomain(e.target.value)}
+              className="h-11"
+            />
           </div>
-        </div>
 
-        {/* Right Half - Segmented Control */}
-        <div className="w-1/2 p-8">
-          <div className="space-y-4">
+          <div className="space-y-2">
+            <Label
+              htmlFor="task"
+              className="text-sm font-medium text-foreground"
+            >
+              What should the model do?
+            </Label>
+            <Textarea
+              id="task"
+              placeholder="Describe the task or capability you want the model to perform..."
+              value={task}
+              onChange={(e) => setTask(e.target.value)}
+              className="min-h-[120px] resize-none"
+            />
+          </div>
+
+          <div className="space-y-2">
             <Label className="text-sm font-medium text-foreground">
               Reasoning vs Speed
             </Label>
