@@ -78,63 +78,36 @@ export function ModelConfiguration() {
           </div>
         </div>
 
-        {/* Right Half - Vertical Slider */}
+        {/* Right Half - Segmented Control */}
         <div className="w-1/2 p-8">
           <div className="space-y-4">
             <Label className="text-sm font-medium text-foreground">
               Reasoning vs Speed
             </Label>
 
-            <div className="flex gap-6">
-              {/* Labels column */}
-              <div className="flex flex-col justify-between py-2 text-right">
-                {levels.map((level) => (
-                  <div
-                    key={level.value}
-                    className={`cursor-pointer transition-colors ${
-                      reasoningLevel === level.value
-                        ? "text-foreground"
-                        : "text-muted-foreground hover:text-foreground"
+            <div className="relative flex rounded-lg border border-neutral-200 bg-neutral-100 p-1">
+              {/* Sliding indicator */}
+              <div
+                className="absolute top-1 bottom-1 rounded-md bg-white shadow-sm ring-1 ring-neutral-200 transition-all duration-300 ease-[cubic-bezier(0.4,0,0.2,1)]"
+                style={{
+                  width: `calc((100% - 8px) / ${levels.length})`,
+                  left: `calc(4px + ${(reasoningLevel - 1)} * (100% - 8px) / ${levels.length})`,
+                }}
+              />
+              {levels.map((level) => (
+                <button
+                  key={level.value}
+                  onClick={() => setReasoningLevel(level.value)}
+                  className={`relative z-10 flex-1 rounded-md px-3 py-2.5 text-center transition-colors duration-200 ${reasoningLevel === level.value
+                      ? "text-neutral-900"
+                      : "text-neutral-500 hover:text-neutral-700"
                     }`}
-                    onClick={() => setReasoningLevel(level.value)}
-                  >
-                    <div className="text-sm font-medium">{level.label}</div>
-                    <div className="text-xs">{level.sublabel}</div>
-                  </div>
-                ))}
-              </div>
-
-              {/* Slider track */}
-              <div className="relative flex flex-col items-center">
-                <div className="relative h-64 w-2 rounded-full bg-muted">
-                  {/* Active track */}
-                  <div
-                    className="absolute w-full rounded-full bg-primary transition-all duration-200"
-                    style={{
-                      top: `${((reasoningLevel - 1) / 4) * 100}%`,
-                      bottom: 0,
-                    }}
-                  />
-
-                  {/* Snap points */}
-                  {levels.map((level, index) => (
-                    <button
-                      key={level.value}
-                      onClick={() => setReasoningLevel(level.value)}
-                      className={`absolute -left-1 h-4 w-4 rounded-full border-2 transition-all duration-200 ${
-                        reasoningLevel === level.value
-                          ? "scale-125 border-primary bg-primary"
-                          : "border-border bg-background hover:border-foreground/40"
-                      }`}
-                      style={{
-                        top: `${(index / 4) * 100}%`,
-                        transform: "translateY(-50%)",
-                      }}
-                      aria-label={`Select ${level.label}`}
-                    />
-                  ))}
-                </div>
-              </div>
+                  aria-label={`Select ${level.label}`}
+                >
+                  <div className="text-xs font-medium leading-tight">{level.label}</div>
+                  <div className="mt-0.5 text-[10px] leading-tight opacity-60">{level.sublabel}</div>
+                </button>
+              ))}
             </div>
           </div>
         </div>
