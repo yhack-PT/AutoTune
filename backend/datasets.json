@@ -1,0 +1,84 @@
+[
+  {
+    "dataset": "chhatramani/nepal_5_law_RAG_QA",
+    "source_url": "https://huggingface.co/datasets/chhatramani/nepal_5_law_RAG_QA",
+    "score": 100,
+    "why": "Bilingual (Nepali + English) QA dataset grounded in primary Nepali law texts with explicit citations — ideal for RAG fine-tuning and improving grounded answer generation and bilingual alignment. Adds legal specificity and precise source grounding missing from other candidates.",
+    "matched_queries": [
+      "Nepal law QA"
+    ],
+    "mapped_task_types": [
+      "question-answering",
+      "text-generation"
+    ],
+    "downloads": 25,
+    "likes": 0,
+    "num_rows": 4838,
+    "license": "cc-by-sa-4.0",
+    "splits": [
+      "train",
+      "test"
+    ],
+    "schema_signals": [
+      "qa_ready",
+      "instruction_ready"
+    ],
+    "warnings": [
+      "License: cc-by-sa-4.0 (share-alike) — imposes reuse requirements; confirm compatibility with your training/distribution plan.",
+      "Relatively small (4.8K rows) — high quality but insufficient alone for post-training; needs to be combined with other corpora.",
+      "Verify citation grounding and run spot checks for OCR/formatting issues in source passages."
+    ]
+  },
+  {
+    "dataset": "Ashalupreti/nepali_law_datasets",
+    "source_url": "https://huggingface.co/datasets/Ashalupreti/nepali_law_datasets",
+    "score": 85,
+    "why": "Nepali-language QA focused on Nepal legal framework (rights of persons with disabilities) and produced from official sources — provides domain-relevant Nepali raw text and question–answer pairs to bias the model toward Nepali legal phrasing and domain coverage.",
+    "matched_queries": [
+      "Nepali law"
+    ],
+    "mapped_task_types": [
+      "question-answering",
+      "text-generation"
+    ],
+    "downloads": 9,
+    "likes": 1,
+    "num_rows": 10980,
+    "license": "apache-2.0",
+    "splits": [
+      "train"
+    ],
+    "schema_signals": [],
+    "warnings": [
+      "License: apache-2.0 — permissive, but confirm metadata/source licensing for included source documents.",
+      "May contain domain-specific narrow coverage (disability rights); you should supplement for broader legal coverage.",
+      "Check for Devanagari encoding inconsistencies and OCR/noise; consider script normalization and PII redaction."
+    ]
+  },
+  {
+    "dataset": "Jiban4/Nepali_Law_QA_Dataset",
+    "source_url": "https://huggingface.co/datasets/Jiban4/Nepali_Law_QA_Dataset",
+    "score": 80,
+    "why": "Additional Nepali QA pairs that increase Nepali-language coverage and diversity of question styles and sources; Apache-2.0 license is permissive and useful for fine-tuning and evaluation.",
+    "matched_queries": [
+      "Nepali law"
+    ],
+    "mapped_task_types": [
+      "question-answering",
+      "text-generation"
+    ],
+    "downloads": 11,
+    "likes": 1,
+    "num_rows": 10980,
+    "license": "apache-2.0",
+    "splits": [
+      "train"
+    ],
+    "schema_signals": [],
+    "warnings": [
+      "Dataset size (~11K rows) helps increase row count but combined selection remains below the target 50K+ rows for robust post-training.",
+      "Potential overlap with other QA sets — deduplicate and validate content quality before weighting heavily.",
+      "Check for romanized Nepali, mixed-script entries, and PII in judgments or examples."
+    ]
+  }
+]
