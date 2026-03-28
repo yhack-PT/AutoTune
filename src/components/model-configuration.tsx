@@ -30,7 +30,7 @@ export function ModelConfiguration() {
   };
 
   return (
-    <div className="w-full max-w-5xl overflow-hidden rounded-xl border border-border bg-card text-card-foreground shadow-sm transition-colors">
+    <div className="w-full max-w-lg overflow-hidden rounded-xl border border-border bg-card text-card-foreground shadow-sm transition-colors">
       <div className="border-b border-border p-6">
         <h1 className="text-xl font-semibold text-foreground">
           Model Configuration
