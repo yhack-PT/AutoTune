@@ -436,12 +436,9 @@ export default function ChatPage() {
         >
           {isEmpty ? (
             /* Empty state */
-            <div className="h-full flex flex-col items-center justify-center px-6">
-              <div className="max-w-2xl w-full space-y-8">
-                <div className="text-center space-y-3">
-                  <div className="mx-auto w-12 h-12 rounded-2xl bg-foreground flex items-center justify-center mb-4">
-                    <Sparkles className="h-6 w-6 text-background" />
-                  </div>
+            <div className="h-full flex flex-col items-center justify-center px-6 pb-24">
+              <div className="max-w-2xl w-full space-y-5">
+                <div className="text-center space-y-1">
                   <h2 className="text-2xl font-semibold tracking-tight">
                     What should your AI do?
                   </h2>
