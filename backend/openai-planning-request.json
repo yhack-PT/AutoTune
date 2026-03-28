@@ -1,0 +1,28 @@
+[
+  {
+    "dataset": "Tobi-Bueck/customer-support-tickets",
+    "source_url": "https://huggingface.co/datasets/Tobi-Bueck/customer-support-tickets",
+    "score": 56.4,
+    "why": "Tobi-Bueck/customer-support-tickets ranks well because it shows size close to the requested band, public with usable viewer and split metadata, healthy community reuse signals.",
+    "matched_queries": [
+      "customer support tickets"
+    ],
+    "mapped_task_types": [
+      "text-classification",
+      "conversational"
+    ],
+    "downloads": 1707,
+    "likes": 20,
+    "num_rows": 61765,
+    "license": "cc-by-nc-4.0",
+    "splits": [
+      "train"
+    ],
+    "schema_signals": [
+      "classification_ready",
+      "qa_ready",
+      "summarization_ready"
+    ],
+    "warnings": []
+  }
+]

@@ -15,6 +15,7 @@ const LOG_PREFIX = "[hf-dataset-recommender]";
 const TRANSIENT_STATUS_CODES = new Set([408, 409, 429, 500, 502, 503, 504]);
 
 let dotEnvLoaded = false;
+let activeLogger = null;
 
 const DEFAULT_ANALYSIS = {
   domain_summary: "",
@@ -78,41 +79,56 @@ const QUERY_NOISE_TERMS = new Set([
 /**
  * Accepts a GPT-produced search plan and returns one or a few recommended Hugging Face datasets.
  */
-export async function recommendDatasets(input) {
-  logInfo(
-    `starting recommendDatasets in ${isSearchPlanInput(input) ? "search-plan" : "raw-input"} mode`,
-  );
-  logJson("input", input);
+async function withLoggerContext(logger, callback) {
+  const previousLogger = activeLogger;
+  activeLogger = logger ?? previousLogger;
+  try {
+    return await callback();
+  } finally {
+    activeLogger = previousLogger;
+  }
+}
 
-  const normalizedPlan = isSearchPlanInput(input)
-    ? validatePlan(input)
-    : await createPlanFromUserInputs(input);
+export async function recommendDatasets(input, options = {}) {
+  return withLoggerContext(options.logger, async () => {
+    logInfo(
+      `starting recommendDatasets in ${isSearchPlanInput(input) ? "search-plan" : "raw-input"} mode`,
+    );
+    logJson("input", input);
 
-  logJson("normalized plan", normalizedPlan);
-  const context = buildContext(normalizedPlan);
-  logInfo(
-    `running ${context.search_queries.length} HF searches with min row floor ${context.min_rows_floor || 0}`,
-  );
-  const discoveredCandidates = await discoverCandidates(context);
-  logInfo(`discovered ${discoveredCandidates.length} candidate datasets before enrichment`);
-  const enrichedCandidates = await enrichCandidates(discoveredCandidates, context);
-  logInfo(`enriched ${enrichedCandidates.length} candidate datasets`);
-  const recommendedDatasets = dedupeRankedDatasets(
-    await rankCandidatesWithOpenAI(
-      enrichedCandidates.filter((candidate) => !candidate.private && !candidate.gated),
-      context,
-    ),
-  );
-  logInfo(`returning ${recommendedDatasets.length} recommended datasets`);
-  await writeRankedDatasetsDebugFile(recommendedDatasets);
+    const normalizedPlan = isSearchPlanInput(input)
+      ? validatePlan(input)
+      : await createPlanFromUserInputs(input);
 
-  return {
-    analysis: normalizedPlan.analysis,
-    search_queries: normalizedPlan.search_queries,
-    ranking_criteria: normalizedPlan.ranking_criteria,
-    recommendation_guidance: buildRecommendationGuidance(recommendedDatasets, normalizedPlan),
-    recommended_datasets: recommendedDatasets,
-  };
+    logJson("normalized plan", normalizedPlan);
+    const context = buildContext(normalizedPlan);
+    logInfo(
+      `running ${context.search_queries.length} HF searches with min row floor ${context.min_rows_floor || 0}`,
+    );
+    const discoveredCandidates = await discoverCandidates(context);
+    logInfo(`discovered ${discoveredCandidates.length} candidate datasets before enrichment`);
+    const enrichedCandidates = await enrichCandidates(discoveredCandidates, context);
+    logInfo(`enriched ${enrichedCandidates.length} candidate datasets`);
+    const recommendedDatasets = dedupeRankedDatasets(
+      await rankCandidatesWithOpenAI(
+        enrichedCandidates.filter((candidate) => !candidate.private && !candidate.gated),
+        context,
+      ),
+    );
+    logInfo(`returning ${recommendedDatasets.length} recommended datasets`);
+
+    const result = {
+      analysis: normalizedPlan.analysis,
+      search_queries: normalizedPlan.search_queries,
+      ranking_criteria: normalizedPlan.ranking_criteria,
+      recommendation_guidance: buildRecommendationGuidance(recommendedDatasets, normalizedPlan),
+      recommended_datasets: recommendedDatasets,
+    };
+    if (!options.skipDebugWrite) {
+      await writeRankedDatasetsDebugFile(recommendedDatasets, options.debugOutputPath);
+    }
+    return result;
+  });
 }
 
 export default recommendDatasets;
@@ -1293,22 +1309,49 @@ function toNumber(value) {
 }
 
 function logInfo(message) {
+  if (activeLogger && typeof activeLogger.emit === "function") {
+    activeLogger.emit({ source: "hf-dataset-recommender", level: "info", message });
+    return;
+  }
   console.log(`${LOG_PREFIX} ${message}`);
 }
 
 function logJson(label, value) {
+  if (activeLogger && typeof activeLogger.emit === "function") {
+    activeLogger.emit({
+      source: "hf-dataset-recommender",
+      level: "info",
+      message: label,
+      data: value,
+    });
+    return;
+  }
   console.log(`${LOG_PREFIX} ${label}:`);
   console.log(JSON.stringify(value, null, 2));
 }
 
 function logMultiline(label, value) {
+  if (activeLogger && typeof activeLogger.emit === "function") {
+    activeLogger.emit({
+      source: "hf-dataset-recommender",
+      level: "info",
+      message: label,
+      data: String(value ?? ""),
+    });
+    return;
+  }
   console.log(`${LOG_PREFIX} ${label}:`);
   console.log(String(value ?? ""));
 }
 
-async function writeRankedDatasetsDebugFile(recommendedDatasets) {
-  await writeFile(RANKED_DATASETS_DEBUG_PATH, JSON.stringify(recommendedDatasets, null, 2));
-  logInfo(`wrote recommended datasets JSON to ${RANKED_DATASETS_DEBUG_PATH.pathname}`);
+async function writeRankedDatasetsDebugFile(recommendedDatasets, debugOutputPath) {
+  const targetPath = debugOutputPath ?? RANKED_DATASETS_DEBUG_PATH;
+  await writeFile(targetPath, JSON.stringify(recommendedDatasets, null, 2));
+  logInfo(
+    `wrote recommended datasets JSON to ${
+      typeof targetPath === "string" ? targetPath : targetPath.pathname
+    }`,
+  );
 }
 
 function taskSearchLabel(task) {
