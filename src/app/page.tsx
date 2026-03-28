@@ -488,7 +488,7 @@ export default function ChatPage() {
         </main>
 
         {/* Input bar — pinned at bottom */}
-        <div className="absolute bottom-0 left-0 right-0 px-4 pb-6 pt-8 bg-gradient-to-t from-background via-background/95 to-transparent pointer-events-none z-10">
+        <div className="absolute bottom-0 left-0 right-0 px-4 pb-8 pt-8 bg-gradient-to-t from-background via-background/95 to-transparent pointer-events-none z-10">
           <div className="max-w-3xl mx-auto pointer-events-auto">
             <div className="relative">
               <Textarea
@@ -531,9 +531,6 @@ export default function ChatPage() {
               </div>
             </div>
 
-            <p className="text-[11px] text-muted-foreground/60 text-center mt-2.5">
-              Demo mode — response stages and replies are mocked. No data is sent anywhere.
-            </p>
           </div>
         </div>
       </div>
