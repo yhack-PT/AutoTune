@@ -125,6 +125,6 @@
     @apply bg-background text-foreground;
   }
   html {
-    @apply font-sans;
+    font-family: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
   }
 }
