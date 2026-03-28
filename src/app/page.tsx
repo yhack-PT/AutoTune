@@ -3,7 +3,6 @@
 import { useState, useCallback, useRef, useEffect } from "react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
-import { PromptPill } from "@/components/prompt-pill";
 import { ArrowUp, Sparkles, Plus } from "lucide-react";
 import { cn } from "@/lib/utils";
 
