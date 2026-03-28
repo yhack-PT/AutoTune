@@ -197,8 +197,7 @@ export default function ChatPage() {
                   What should your AI do?
                 </h2>
                 <p className="text-sm text-muted-foreground max-w-md mx-auto">
-                  Build a specialized AI for any use case
-                  Ask me anything — this is a UI demo with placeholder responses.
+                  Build a specialized AI for any use case.
                 </p>
               </div>
 
