@@ -26,6 +26,7 @@ const REQUEST_TIMEOUT_MS = 8000;
 const ENRICHMENT_CONCURRENCY = 5;
 const DEFAULT_OPENAI_MODEL = "gpt-5-mini";
 const DEFAULT_DATASET_SELECTION_MODEL = "gpt-5.4";
+const DEFAULT_SMALLER_TIME_BUDGET_RETRIES = 3;
 const LOG_PREFIX = "[hf-dataset-recommender]";
 const TRANSIENT_STATUS_CODES = new Set([408, 409, 429, 500, 502, 503, 504]);
 
@@ -127,12 +128,13 @@ export class RecommendationFailure extends Error {
 
 export async function recommendDatasets(input, options = {}) {
   return withLoggerContext(options.logger, async () => {
+    const inputIsSearchPlan = isSearchPlanInput(input);
     logInfo(
-      `starting recommendDatasets in ${isSearchPlanInput(input) ? "search-plan" : "text"} mode`,
+      `starting recommendDatasets in ${inputIsSearchPlan ? "search-plan" : "text"} mode`,
     );
     logJson("input", input);
 
-    const normalizedPlan = isSearchPlanInput(input)
+    let normalizedPlan = inputIsSearchPlan
       ? validatePlan(input)
       : await createPlanFromUserInputs(input, options);
 
@@ -163,72 +165,125 @@ export async function recommendDatasets(input, options = {}) {
       throw new RecommendationFailure(recommendation.fatal_error.message, recommendation);
     }
 
-    logJson("normalized plan", normalizedPlan);
-    const context = buildContext(normalizedPlan);
-    logInfo(
-      `running ${context.search_queries.length} HF searches with min row floor ${context.min_rows_floor || 0}`,
-    );
-    const discoveredCandidates = await (
-      typeof options.discoverCandidates === "function"
-        ? options.discoverCandidates(context)
-        : discoverCandidates(context)
-    );
-    logInfo(`discovered ${discoveredCandidates.length} candidate datasets before enrichment`);
-    const enrichedCandidates = await (
-      typeof options.enrichCandidates === "function"
-        ? options.enrichCandidates(discoveredCandidates, context, options)
-        : enrichCandidates(discoveredCandidates, context, options)
-    );
-    logInfo(`enriched ${enrichedCandidates.length} candidate datasets`);
-    const publicCandidates = enrichedCandidates.filter((candidate) => !candidate.private && !candidate.gated);
-    const rankedDatasets = sortCandidatesForDiagnostics(publicCandidates);
-    const compatibleCandidates = publicCandidates.filter((candidate) => candidate.compatibility_status === "compatible");
+    const maxSmallerTimeBudgetRetries =
+      inputIsSearchPlan
+        ? 0
+        : normalizeNonNegativeInt(options.maxSmallerTimeBudgetRetries) ??
+          DEFAULT_SMALLER_TIME_BUDGET_RETRIES;
+    const retryWarnings = [];
 
-    if (compatibleCandidates.length === 0) {
-      const recommendation = {
-        analysis: normalizedPlan.analysis,
-        task_spec: normalizedPlan.task_spec,
-        search_queries: normalizedPlan.search_queries,
-        ranking_criteria: normalizedPlan.ranking_criteria,
-        recommendation_guidance: buildRecommendationGuidance([], normalizedPlan),
-        compatibility_summary: buildCompatibilitySummary(publicCandidates),
-        ranked_datasets: rankedDatasets,
-        recommended_datasets: [],
-        fatal_error: {
-          code: "no_compatible_candidates",
-          message:
-            "No ranked dataset candidates could be normalized into a backend-supported training shape during recommendation.",
-        },
-      };
-      if (!options.skipDebugWrite) {
-        await writeRankedDatasetsDebugFile(recommendation, options.debugOutputPath);
+    for (let attemptIndex = 0; attemptIndex <= maxSmallerTimeBudgetRetries; attemptIndex += 1) {
+      if (!normalizedPlan.task_spec.supported) {
+        const recommendation = {
+          analysis: normalizedPlan.analysis,
+          task_spec: normalizedPlan.task_spec,
+          search_queries: normalizedPlan.search_queries,
+          ranking_criteria: normalizedPlan.ranking_criteria,
+          recommendation_guidance: {
+            ...normalizedPlan.recommendation_guidance,
+            warnings: uniqueStrings([
+              ...(retryWarnings ?? []),
+              ...(normalizedPlan.recommendation_guidance?.warnings ?? []),
+            ]),
+          },
+          compatibility_summary: {
+            total_candidates: 0,
+            compatible_candidates: 0,
+            incompatible_candidates: 0,
+          },
+          ranked_datasets: [],
+          recommended_datasets: [],
+          fatal_error: {
+            code: "unsupported_task",
+            message:
+              normalizedPlan.task_spec.unsupported_reason ||
+              "Only single-target classification SFT jobs are supported right now.",
+          },
+        };
+        if (!options.skipDebugWrite) {
+          await writeRankedDatasetsDebugFile(recommendation, options.debugOutputPath);
+        }
+        throw new RecommendationFailure(recommendation.fatal_error.message, recommendation);
       }
-      throw new RecommendationFailure(recommendation.fatal_error.message, recommendation);
-    }
 
-    const recommendedDatasets = dedupeRankedDatasets(
-      await (
-        typeof options.rankCandidates === "function"
-          ? options.rankCandidates(compatibleCandidates, context)
-          : rankCandidatesWithOpenAI(compatibleCandidates, context)
-      ),
-    );
-    logInfo(`returning ${recommendedDatasets.length} recommended datasets`);
+      logJson("normalized plan", normalizedPlan);
+      const attempt = await executeRecommendationAttempt(normalizedPlan, options);
 
-    const result = {
-      analysis: normalizedPlan.analysis,
-      task_spec: normalizedPlan.task_spec,
-      search_queries: normalizedPlan.search_queries,
-      ranking_criteria: normalizedPlan.ranking_criteria,
-      recommendation_guidance: buildRecommendationGuidance(recommendedDatasets, normalizedPlan),
-      compatibility_summary: buildCompatibilitySummary(publicCandidates),
-      ranked_datasets: rankedDatasets,
-      recommended_datasets: recommendedDatasets,
-    };
-    if (!options.skipDebugWrite) {
-      await writeRankedDatasetsDebugFile(result, options.debugOutputPath);
+      if (attempt.compatibleCandidates.length > 0) {
+        const recommendedDatasets = dedupeRankedDatasets(
+          await (
+            typeof options.rankCandidates === "function"
+              ? options.rankCandidates(attempt.compatibleCandidates, attempt.context)
+              : rankCandidatesWithOpenAI(attempt.compatibleCandidates, attempt.context)
+          ),
+        );
+        logInfo(`returning ${recommendedDatasets.length} recommended datasets`);
+
+        const recommendationGuidance = buildRecommendationGuidance(recommendedDatasets, normalizedPlan);
+        const result = {
+          analysis: normalizedPlan.analysis,
+          task_spec: normalizedPlan.task_spec,
+          search_queries: normalizedPlan.search_queries,
+          ranking_criteria: normalizedPlan.ranking_criteria,
+          recommendation_guidance:
+            retryWarnings.length > 0
+              ? {
+                ...recommendationGuidance,
+                warnings: uniqueStrings([...(retryWarnings ?? []), ...(recommendationGuidance.warnings ?? [])]),
+              }
+              : recommendationGuidance,
+          compatibility_summary: buildCompatibilitySummary(attempt.publicCandidates),
+          ranked_datasets: attempt.rankedDatasets,
+          recommended_datasets: recommendedDatasets,
+        };
+        if (!options.skipDebugWrite) {
+          await writeRankedDatasetsDebugFile(result, options.debugOutputPath);
+        }
+        return result;
+      }
+
+      if (attemptIndex === maxSmallerTimeBudgetRetries) {
+        const emptyGuidance = buildRecommendationGuidance([], normalizedPlan);
+        const recommendation = {
+          analysis: normalizedPlan.analysis,
+          task_spec: normalizedPlan.task_spec,
+          search_queries: normalizedPlan.search_queries,
+          ranking_criteria: normalizedPlan.ranking_criteria,
+          recommendation_guidance: {
+            ...emptyGuidance,
+            warnings: uniqueStrings([
+              ...(retryWarnings ?? []),
+              ...(emptyGuidance.warnings ?? []),
+            ]),
+          },
+          compatibility_summary: buildCompatibilitySummary(attempt.publicCandidates),
+          ranked_datasets: attempt.rankedDatasets,
+          recommended_datasets: [],
+          fatal_error: {
+            code: "no_compatible_candidates",
+            message:
+              attemptIndex > 0
+                ? "No ranked dataset candidates could be normalized into a backend-supported training shape during recommendation, even after retrying with a smaller inferred run-time budget."
+                : "No ranked dataset candidates could be normalized into a backend-supported training shape during recommendation.",
+          },
+        };
+        if (!options.skipDebugWrite) {
+          await writeRankedDatasetsDebugFile(recommendation, options.debugOutputPath);
+        }
+        throw new RecommendationFailure(recommendation.fatal_error.message, recommendation);
+      }
+
+      const previousTimeBudget = normalizeOptionalString(normalizedPlan.analysis?.quality_tier_strategy);
+      const retryWarning = buildSmallerTimeBudgetRetryWarning(previousTimeBudget);
+      retryWarnings.push(retryWarning);
+      logInfo("no compatible candidates found; retrying planning with a smaller inferred run-time budget");
+      normalizedPlan = await createPlanFromUserInputs(input, options, {
+        retry_reason: "no_compatible_candidates",
+        smaller_time_budget: true,
+        previous_plan: normalizedPlan,
+        previous_time_budget: previousTimeBudget,
+      });
     }
-    return result;
   });
 }
 
@@ -348,10 +403,10 @@ function validatePlan(plan) {
   };
 }
 
-async function createPlanFromUserInputs(input, options = {}) {
+async function createPlanFromUserInputs(input, options = {}, planningHints = {}) {
   const normalizedInput = validateUserInputs(input);
   if (typeof options.planGenerator === "function") {
-    const generatedPlan = await options.planGenerator(normalizedInput);
+    const generatedPlan = await options.planGenerator(normalizedInput, planningHints);
     return coerceTaskSpecForRawInput(validatePlan(generatedPlan), normalizedInput);
   }
 
@@ -366,7 +421,7 @@ async function createPlanFromUserInputs(input, options = {}) {
   }
 
   const model = normalizeOptionalString(process.env.OPENAI_MODEL) ?? DEFAULT_OPENAI_MODEL;
-  const prompt = buildOpenAIPlanningPrompt(normalizedInput);
+  const prompt = buildOpenAIPlanningPrompt(normalizedInput, planningHints);
   const openAIRequestBody = {
     model,
     store: false,
@@ -438,6 +493,42 @@ async function createPlanFromUserInputs(input, options = {}) {
   logJson("openai parsed plan", plan);
 
   return coerceTaskSpecForRawInput(validatePlan(plan), normalizedInput);
+}
+
+async function executeRecommendationAttempt(plan, options = {}) {
+  const context = buildContext(plan);
+  logInfo(
+    `running ${context.search_queries.length} HF searches with min row floor ${context.min_rows_floor || 0}`,
+  );
+  const discoveredCandidates = await (
+    typeof options.discoverCandidates === "function"
+      ? options.discoverCandidates(context)
+      : discoverCandidates(context)
+  );
+  logInfo(`discovered ${discoveredCandidates.length} candidate datasets before enrichment`);
+  const enrichedCandidates = await (
+    typeof options.enrichCandidates === "function"
+      ? options.enrichCandidates(discoveredCandidates, context, options)
+      : enrichCandidates(discoveredCandidates, context, options)
+  );
+  logInfo(`enriched ${enrichedCandidates.length} candidate datasets`);
+  const publicCandidates = enrichedCandidates.filter((candidate) => !candidate.private && !candidate.gated);
+  const rankedDatasets = sortCandidatesForDiagnostics(publicCandidates);
+  const compatibleCandidates = publicCandidates.filter((candidate) => candidate.compatibility_status === "compatible");
+
+  return {
+    context,
+    publicCandidates,
+    rankedDatasets,
+    compatibleCandidates,
+  };
+}
+
+function buildSmallerTimeBudgetRetryWarning(previousTimeBudget) {
+  if (previousTimeBudget) {
+    return `Initial time-budget estimate (${previousTimeBudget}) did not yield compatible public datasets; retried with a smaller inferred run-time budget.`;
+  }
+  return "Initial time-budget estimate did not yield compatible public datasets; retried with a smaller inferred run-time budget.";
 }
 
 function extractRequestedTargetsFromText(inputText) {
@@ -583,11 +674,24 @@ function buildLegacyDescription(input) {
   return [`Domain: ${input.domain}`, `Use case: ${input.useCase}`].join("\n");
 }
 
-function buildOpenAIPlanningPrompt(input) {
+function buildOpenAIPlanningPrompt(input, planningHints = {}) {
+  const retryLines = planningHints.smaller_time_budget
+    ? [
+      "Retry context: the previous inferred time budget did not yield compatible public datasets.",
+      planningHints.previous_time_budget
+        ? `Previous time-budget summary: ${planningHints.previous_time_budget}`
+        : null,
+      "Retry with a smaller inferred run-time budget than before.",
+      "Reduce the required data volume and simplify the plan enough to improve the odds of finding compatible datasets.",
+      "Prefer more common, public, clearly classifiable datasets if needed.",
+    ]
+    : [];
+
   const promptLines = [
     "Create a Hugging Face dataset search plan for post-training a language model.",
     "This backend v1 supports only single-target classification SFT jobs.",
     `User request: ${input.description}`,
+    ...retryLines,
     "Infer a reasonable end-to-end run-time budget directly from the user's request.",
     "If the user states a time preference or deadline, honor it when possible.",
     "If the user does not specify a time, default to an 8-hour run budget.",

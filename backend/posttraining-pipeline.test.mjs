@@ -520,6 +520,186 @@ test("recommendDatasets defaults dataset ranking to gpt-5.4", async () => {
   }
 });
 
+test("recommendDatasets retries planning with a smaller time budget after no compatible candidates", async () => {
+  const previousApiKey = process.env.OPENAI_API_KEY;
+  const previousGlobalModel = process.env.OPENAI_MODEL;
+  const originalFetch = globalThis.fetch;
+  const compatibleCandidate = buildDirectCompatibleCandidate();
+  const incompatibleCandidate = {
+    ...compatibleCandidate,
+    id: "acme/incompatible-priority-classification",
+    source_url: "https://huggingface.co/datasets/acme/incompatible-priority-classification",
+    compatibility_status: "incompatible",
+    compatibility_reason: "No supported normalization proposal could be inferred.",
+    normalization_source: null,
+    normalization_proposal: null,
+    compatible_methods: [],
+    selected_target_column: null,
+    target_selection_reason: null,
+    target_selection_confidence: null,
+    target_candidates: ["priority"],
+  };
+  const firstPlan = {
+    ...buildPlan(),
+    analysis: {
+      ...buildPlan().analysis,
+      quality_tier_strategy: "About 8 hours.",
+    },
+    search_queries: [
+      {
+        ...buildPlan().search_queries[0],
+        search: "broad support ticket classification",
+        min_rows: 10000,
+      },
+    ],
+    recommendation_guidance: {
+      ...buildPlan().recommendation_guidance,
+      target_total_rows: "100K-300K",
+    },
+  };
+  const retryPlan = {
+    ...buildPlan(),
+    analysis: {
+      ...buildPlan().analysis,
+      quality_tier_strategy: "About 2-4 hours.",
+    },
+    search_queries: [
+      {
+        ...buildPlan().search_queries[0],
+        search: "small support ticket classification",
+        min_rows: 1000,
+      },
+    ],
+    recommendation_guidance: {
+      ...buildPlan().recommendation_guidance,
+      target_total_rows: "10K-50K",
+      warnings: [],
+    },
+  };
+  const planningPrompts = [];
+  let planningCallCount = 0;
+
+  try {
+    process.env.OPENAI_API_KEY = "test-openai-key";
+    delete process.env.OPENAI_MODEL;
+
+    globalThis.fetch = async (_url, options = {}) => {
+      const requestBody = JSON.parse(String(options.body ?? "{}"));
+      planningPrompts.push(String(requestBody.input?.[1]?.content ?? ""));
+      planningCallCount += 1;
+
+      return {
+        ok: true,
+        json: async () => ({
+          id: `resp_test_retry_${planningCallCount}`,
+          status: "completed",
+          model: "gpt-5-mini",
+          output_text: JSON.stringify(planningCallCount === 1 ? firstPlan : retryPlan),
+        }),
+      };
+    };
+
+    const recommendation = await recommendDatasets(
+      {
+        description: "Classify customer support tickets by priority.",
+      },
+      {
+        discoverCandidates: async (context) =>
+          context.analysis.quality_tier_strategy === retryPlan.analysis.quality_tier_strategy
+            ? [compatibleCandidate]
+            : [incompatibleCandidate],
+        enrichCandidates: async (candidates) => candidates,
+        rankCandidates: async () => [toRecommendedCandidate(compatibleCandidate)],
+        skipDebugWrite: true,
+      },
+    );
+
+    assert.equal(planningCallCount, 2);
+    assert.equal(recommendation.search_queries[0].search, retryPlan.search_queries[0].search);
+    assert.equal(recommendation.recommended_datasets[0].dataset, compatibleCandidate.id);
+    assert.match(planningPrompts[1], /Retry context: the previous inferred time budget did not yield compatible public datasets\./);
+    assert.match(planningPrompts[1], /Previous time-budget summary: About 8 hours\./);
+    assert.match(planningPrompts[1], /Retry with a smaller inferred run-time budget than before\./);
+    assert.match(
+      recommendation.recommendation_guidance.warnings.join(" "),
+      /smaller inferred run-time budget/i,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+
+    if (previousApiKey === undefined) {
+      delete process.env.OPENAI_API_KEY;
+    } else {
+      process.env.OPENAI_API_KEY = previousApiKey;
+    }
+
+    if (previousGlobalModel === undefined) {
+      delete process.env.OPENAI_MODEL;
+    } else {
+      process.env.OPENAI_MODEL = previousGlobalModel;
+    }
+  }
+});
+
+test("recommendDatasets uses the expanded default smaller-time-budget retry budget for text input", async () => {
+  const incompatibleCandidate = {
+    ...buildDirectCompatibleCandidate(),
+    id: "acme/never-compatible",
+    source_url: "https://huggingface.co/datasets/acme/never-compatible",
+    compatibility_status: "incompatible",
+    compatibility_reason: "No supported normalization proposal could be inferred.",
+    normalization_source: null,
+    normalization_proposal: null,
+    compatible_methods: [],
+    selected_target_column: null,
+    target_selection_reason: null,
+    target_selection_confidence: null,
+    target_candidates: ["priority"],
+  };
+  const planningHints = [];
+  let planningCallCount = 0;
+
+  await assert.rejects(
+    recommendDatasets(
+      {
+        description: "Classify customer support tickets by priority.",
+      },
+      {
+        planGenerator: async (_input, planningHintsForCall = {}) => {
+          planningHints.push(planningHintsForCall);
+          planningCallCount += 1;
+          return {
+            ...buildPlan(),
+            analysis: {
+              ...buildPlan().analysis,
+              quality_tier_strategy: `Attempt ${planningCallCount}`,
+            },
+            search_queries: [
+              {
+                ...buildPlan().search_queries[0],
+                search: `customer support tickets retry ${planningCallCount}`,
+              },
+            ],
+          };
+        },
+        discoverCandidates: async () => [incompatibleCandidate],
+        enrichCandidates: async (candidates) => candidates,
+        rankCandidates: async () => [],
+        skipDebugWrite: true,
+      },
+    ),
+    (error) => {
+      assert.ok(error instanceof RecommendationFailure);
+      assert.equal(error.recommendation.fatal_error.code, "no_compatible_candidates");
+      assert.equal(planningCallCount, 4);
+      assert.equal(planningHints.length, 4);
+      assert.equal(Boolean(planningHints[0]?.smaller_time_budget), false);
+      assert.ok(planningHints.slice(1).every((hints) => hints?.smaller_time_budget === true));
+      return true;
+    },
+  );
+});
+
 test("recommendDatasets planning prompt asks for time-based quality tier strategy", async () => {
   const previousApiKey = process.env.OPENAI_API_KEY;
   const previousGlobalModel = process.env.OPENAI_MODEL;
