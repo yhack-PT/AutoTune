@@ -1188,10 +1188,11 @@ test("recommendDatasets emits ui-progress lines for query search and candidate r
 
     assert.equal(recommendation.recommended_datasets.length, 1);
     assert.equal(recommendation.recommended_datasets[0].dataset, candidate.dataset);
-    assert.ok(
-      progressMessages.some((message) =>
-        message.startsWith("I'm searching through different datasets that could fit this request ("),
-      ),
+    assert.equal(
+      progressMessages.filter(
+        (message) => message === "I'm searching through different datasets that could fit this request",
+      ).length,
+      1,
     );
     assert.ok(progressMessages.includes("I'm reviewing the most promising dataset options"));
   } finally {

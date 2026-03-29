@@ -3,7 +3,7 @@
 import { useState, useCallback, useRef, useEffect } from "react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
-import { ArrowUp, Sparkles, Plus, Play, Rewind, ChevronDown } from "lucide-react";
+import { ArrowUp, Download, Sparkles, Plus, Play, Rewind, ChevronDown } from "lucide-react";
 import { cn } from "@/lib/utils";
 import ReactMarkdown from "react-markdown";
 import { getSidebarStageProgress, mergeStageProgressById } from "@/lib/posttraining-progress.mjs";
@@ -41,6 +41,19 @@ interface StageProgressItem {
   text: string;
   tone: "normal" | "error";
 }
+
+const getSidebarStageProgressTyped = getSidebarStageProgress as unknown as (input: {
+  logs: unknown[];
+  activeStageId: string | null;
+  completedStageIds: string[];
+  failedStageId: string | null;
+  jobStatus: string;
+}) => Record<string, StageProgressItem[]>;
+
+const mergeStageProgressByIdTyped = mergeStageProgressById as unknown as (
+  previousProgress: Record<string, StageProgressItem[]>,
+  nextProgress: Record<string, StageProgressItem[]>,
+) => Record<string, StageProgressItem[]>;
 
 // =============================================================================
 // Pipeline stages (mapped to real backend stages)
@@ -216,8 +229,10 @@ function MessageBubble({ message }: { message: ChatMessage }) {
 
   return (
     <div className="flex justify-start">
-      <div className="max-w-[80%] px-1 prose prose-sm prose-neutral dark:prose-invert prose-p:leading-relaxed prose-p:my-1 prose-headings:my-2 prose-ul:my-1 prose-ol:my-1 prose-li:my-0.5 max-w-none">
-        <ReactMarkdown>{message.content}</ReactMarkdown>
+      <div className="min-w-0 max-w-[80%] px-1">
+        <div className="prose prose-sm prose-neutral break-words dark:prose-invert prose-p:my-1 prose-p:leading-relaxed prose-headings:my-2 prose-ul:my-1 prose-ol:my-1 prose-li:my-0.5 max-w-none">
+          <ReactMarkdown>{message.content}</ReactMarkdown>
+        </div>
       </div>
     </div>
   );
@@ -373,13 +388,16 @@ export default function ChatPage() {
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
   const [fineTunedEndpoint, setFineTunedEndpoint] = useState<string | null>(null);
   const [fineTunedModel, setFineTunedModel] = useState<string | null>(null);
+  const [fineTunedJobId, setFineTunedJobId] = useState<string | null>(null);
   const [activeModel, setActiveModel] = useState<"openai" | "finetuned">("openai");
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const activeJobIdRef = useRef<string | null>(null);
   const lastStageRef = useRef<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const [showIndicator, setShowIndicator] = useState(false);
   const indicatorTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const evalShownRef = useRef(false);
+  const terminalStatusByJobRef = useRef<Record<string, "ready" | "failed">>({});
 
   // Scroll to bottom when new messages appear
   useEffect(() => {
@@ -413,6 +431,7 @@ export default function ChatPage() {
       clearInterval(pollingRef.current);
       pollingRef.current = null;
     }
+    activeJobIdRef.current = null;
     lastStageRef.current = null;
     setActiveJobId(null);
     setIsResponding(false);
@@ -424,11 +443,16 @@ export default function ChatPage() {
   useEffect(() => {
     if (!activeJobId) return;
 
+    const jobId = activeJobId;
+
     const poll = async () => {
       try {
-        const res = await fetch(`/api/posttraining/jobs/${activeJobId}`);
+        const res = await fetch(`/api/posttraining/jobs/${jobId}`);
         if (!res.ok) return;
         const job = await res.json();
+        if (activeJobIdRef.current !== jobId) {
+          return;
+        }
 
         const currentStageId: string = String(job.currentStage ?? "");
         const nextActiveStageId =
@@ -439,13 +463,13 @@ export default function ChatPage() {
         const nextVisibleStageIds = getVisiblePipelineStageIds(job);
         const nextCompletedStageIds = getCompletedPipelineStageIds(job);
         const nextFailedStageId = getFailedPipelineStageId(job);
-        const nextStageProgressById = getSidebarStageProgress({
+        const nextStageProgressById = getSidebarStageProgressTyped({
           logs: Array.isArray(job.logs) ? job.logs : [],
           activeStageId: nextActiveStageId,
           completedStageIds: nextCompletedStageIds,
           failedStageId: nextFailedStageId,
           jobStatus: String(job.status ?? ""),
-        }) as Record<string, StageProgressItem[]>;
+        });
 
         // Update sidebar
         if (idx >= 0) {
@@ -457,7 +481,10 @@ export default function ChatPage() {
         setCompletedStageIds(nextCompletedStageIds);
         setFailedStageId(nextFailedStageId);
         setStageProgressById((previousStageProgressById) =>
-          mergeStageProgressById(previousStageProgressById, nextStageProgressById),
+          mergeStageProgressByIdTyped(
+            previousStageProgressById,
+            nextStageProgressById,
+          ),
         );
 
         // Track stage changes (no chat bubbles — ProcessingIndicator handles it)
@@ -501,40 +528,53 @@ export default function ChatPage() {
             setFineTunedEndpoint(deploymentUrl);
             setFineTunedModel(deploymentModel);
           }
+          setFineTunedJobId(jobId);
           setCompletedStageIds(nextVisibleStageIds);
           setActiveStageIndex(null);
           setFailedStageId(null);
           setStageProgressById((previousStageProgressById) =>
-            mergeStageProgressById(previousStageProgressById, nextStageProgressById),
+            mergeStageProgressByIdTyped(
+              previousStageProgressById,
+              nextStageProgressById,
+            ),
           );
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: crypto.randomUUID(),
-              role: "assistant",
-              content: "Your model is ready!",
-              ...(deploymentUrl
-                ? {
-                  deploymentUrl,
-                  ...(deploymentModel ? { deploymentModel } : {}),
-                }
-                : {}),
-            },
-          ]);
+          if (terminalStatusByJobRef.current[jobId] !== "ready") {
+            terminalStatusByJobRef.current[jobId] = "ready";
+            setMessages((prev) => [
+              ...prev,
+              {
+                id: crypto.randomUUID(),
+                role: "assistant",
+                content: "Your model is ready!",
+                ...(deploymentUrl
+                  ? {
+                    deploymentUrl,
+                    ...(deploymentModel ? { deploymentModel } : {}),
+                  }
+                  : {}),
+              },
+            ]);
+          }
           stopPolling();
         } else if (job.status === "failed") {
           setActiveStageIndex(null);
           setStageProgressById((previousStageProgressById) =>
-            mergeStageProgressById(previousStageProgressById, nextStageProgressById),
+            mergeStageProgressByIdTyped(
+              previousStageProgressById,
+              nextStageProgressById,
+            ),
           );
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: crypto.randomUUID(),
-              role: "assistant",
-              content: `The training job failed: ${job.errorSummary || "Unknown error."}`,
-            },
-          ]);
+          if (terminalStatusByJobRef.current[jobId] !== "failed") {
+            terminalStatusByJobRef.current[jobId] = "failed";
+            setMessages((prev) => [
+              ...prev,
+              {
+                id: crypto.randomUUID(),
+                role: "assistant",
+                content: `The training job failed: ${job.errorSummary || "Unknown error."}`,
+              },
+            ]);
+          }
           stopPolling();
         }
       } catch {
@@ -646,6 +686,7 @@ export default function ChatPage() {
               } else if (event.type === "job_started" && event.jobId) {
                 jobStarted = true;
                 setShowIndicator(false);
+                activeJobIdRef.current = event.jobId;
                 setActiveJobId(event.jobId);
                 setActiveStageIndex(0);
                 setVisibleStageIds(["recommending"]);
@@ -749,11 +790,15 @@ export default function ChatPage() {
     setFailedStageId(null);
     setStageProgressById({});
     setIsProcessSidebarOpen(false);
+    activeJobIdRef.current = null;
     setActiveJobId(null);
     setActiveModel("openai");
     setFineTunedEndpoint(null);
+    setFineTunedModel(null);
+    setFineTunedJobId(null);
     lastStageRef.current = null;
     evalShownRef.current = false;
+    terminalStatusByJobRef.current = {};
     inputRef.current?.focus();
   }, []);
 
@@ -767,24 +812,24 @@ export default function ChatPage() {
         {/* Top bar */}
         <header className="shrink-0 flex items-center justify-between px-5 py-3 border-b border-border/50">
           <div className="flex items-center gap-3">
-            <Button
+            {/* <Button
               variant="ghost"
               size="icon-sm"
               onClick={handleNewChat}
               title="New chat"
             >
               <Plus className="h-4 w-4" />
-            </Button>
+            </Button> */}
             {fineTunedEndpoint ? (
               <DropdownMenu>
                 <DropdownMenuTrigger className="flex items-center gap-1 text-sm font-medium text-foreground/80 hover:text-foreground outline-hidden">
-                  {activeModel === "finetuned" ? "Fine-tuned Model" : "ChatGPT"}
+                  {activeModel === "finetuned" ? "Fine-tuned Model" : "AutoTune"}
                   <ChevronDown className="h-4 w-4 text-muted-foreground" />
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="center" style={{ borderRadius: '16px', padding: '6px' }} className="bg-white border border-border/50 text-foreground shadow-lg min-w-[13rem] z-50">
                   {activeModel !== "openai" && (
                     <DropdownMenuItem onClick={() => setActiveModel("openai")} style={{ borderRadius: '10px', padding: '8px 10px' }} className="flex justify-between items-center w-full cursor-pointer hover:bg-black/5 transition-colors text-sm font-medium">
-                      ChatGPT
+                      AutoTune
                     </DropdownMenuItem>
                   )}
                   {activeModel !== "finetuned" && (
@@ -798,7 +843,19 @@ export default function ChatPage() {
               <span className="text-sm font-medium text-foreground/80">AutoTune</span>
             )}
           </div>
-          <div className="flex items-center gap-2" />
+          <div className="flex items-center gap-2">
+            {activeModel === "finetuned" && fineTunedJobId && (
+              <Button asChild variant="outline" size="sm" className="gap-2">
+                <a
+                  href={`/api/posttraining/jobs/${fineTunedJobId}/weights`}
+                  download
+                >
+                  <Download className="h-3.5 w-3.5" />
+                  Download weights
+                </a>
+              </Button>
+            )}
+          </div>
         </header>
 
         {/* Messages area */}
@@ -870,7 +927,7 @@ export default function ChatPage() {
                         {activeModel === "finetuned" ? (
                           <>
                             <Rewind className="h-3 w-3" />
-                            Switch to ChatGPT
+                            Switch to AutoTune
                           </>
                         ) : (
                           <>

@@ -1,7 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { resolveVLLMModel, streamVLLM } from "./vllm-chat.ts";
+const { resolveVLLMModel, streamVLLM } = await import(
+  new URL("./vllm-chat.ts", import.meta.url).href,
+);
 
 function jsonResponse(body: unknown, init: ResponseInit = {}): Response {
   return new Response(JSON.stringify(body), {

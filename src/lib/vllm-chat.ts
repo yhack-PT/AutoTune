@@ -37,14 +37,14 @@ export async function resolveVLLMModel(
   await ensureOk(response);
 
   const payload = await response.json().catch(() => ({}));
-  const modelIds = Array.isArray(payload?.data)
+  const modelIds: string[] = Array.isArray(payload?.data)
     ? payload.data
       .map((entry: unknown) =>
         typeof entry === "object" && entry !== null && "id" in entry
           ? String((entry as { id?: unknown }).id ?? "").trim()
           : "",
       )
-      .filter(Boolean)
+      .filter((entry: string): entry is string => Boolean(entry))
     : [];
 
   const resolvedModel = [...new Set(modelIds)][0] ?? "";
