@@ -592,7 +592,7 @@ export default function ChatPage() {
                 </DropdownMenuContent>
               </DropdownMenu>
             ) : (
-              <span className="text-sm font-medium text-foreground/80">ChatGPT</span>
+              <span className="text-sm font-medium text-foreground/80">AutoTune</span>
             )}
           </div>
           <div className="flex items-center gap-2" />
