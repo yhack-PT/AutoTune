@@ -452,6 +452,138 @@ test("recommendDatasets accepts a single-text payload when a plan generator is p
   assert.equal(recommendation.search_queries.length, 1);
 });
 
+test("recommendDatasets defaults dataset ranking to gpt-5.4", async () => {
+  const previousApiKey = process.env.OPENAI_API_KEY;
+  const previousGlobalModel = process.env.OPENAI_MODEL;
+  const previousSelectionModel = process.env.OPENAI_DATASET_SELECTION_MODEL;
+  const originalFetch = globalThis.fetch;
+  const candidate = buildDirectCompatibleCandidate();
+  let capturedModel = null;
+
+  try {
+    process.env.OPENAI_API_KEY = "test-openai-key";
+    delete process.env.OPENAI_MODEL;
+    delete process.env.OPENAI_DATASET_SELECTION_MODEL;
+
+    globalThis.fetch = async (_url, options = {}) => {
+      const requestBody = JSON.parse(String(options.body ?? "{}"));
+      capturedModel = requestBody.model ?? null;
+
+      return {
+        ok: true,
+        json: async () => ({
+          id: "resp_test_dataset_selection",
+          status: "completed",
+          model: "gpt-5.4",
+          output_text: JSON.stringify({
+            recommended_datasets: [
+              {
+                dataset: candidate.id,
+                score: 95,
+                why: "Best fit for this classification task.",
+                warnings: [],
+              },
+            ],
+          }),
+        }),
+      };
+    };
+
+    const recommendation = await recommendDatasets(buildPlan(), {
+      discoverCandidates: async () => [candidate],
+      enrichCandidates: async () => [candidate],
+      skipDebugWrite: true,
+    });
+
+    assert.equal(capturedModel, "gpt-5.4");
+    assert.equal(recommendation.recommended_datasets.length, 1);
+    assert.equal(recommendation.recommended_datasets[0].dataset, candidate.id);
+  } finally {
+    globalThis.fetch = originalFetch;
+
+    if (previousApiKey === undefined) {
+      delete process.env.OPENAI_API_KEY;
+    } else {
+      process.env.OPENAI_API_KEY = previousApiKey;
+    }
+
+    if (previousGlobalModel === undefined) {
+      delete process.env.OPENAI_MODEL;
+    } else {
+      process.env.OPENAI_MODEL = previousGlobalModel;
+    }
+
+    if (previousSelectionModel === undefined) {
+      delete process.env.OPENAI_DATASET_SELECTION_MODEL;
+    } else {
+      process.env.OPENAI_DATASET_SELECTION_MODEL = previousSelectionModel;
+    }
+  }
+});
+
+test("recommendDatasets planning prompt asks for time-based quality tier strategy", async () => {
+  const previousApiKey = process.env.OPENAI_API_KEY;
+  const previousGlobalModel = process.env.OPENAI_MODEL;
+  const originalFetch = globalThis.fetch;
+  const candidate = buildDirectCompatibleCandidate();
+  let capturedPrompt = "";
+
+  try {
+    process.env.OPENAI_API_KEY = "test-openai-key";
+    delete process.env.OPENAI_MODEL;
+
+    globalThis.fetch = async (_url, options = {}) => {
+      const requestBody = JSON.parse(String(options.body ?? "{}"));
+      capturedPrompt = String(requestBody.input?.[1]?.content ?? "");
+
+      return {
+        ok: true,
+        json: async () => ({
+          id: "resp_test_plan_prompt",
+          status: "completed",
+          model: "gpt-5-mini",
+          output_text: JSON.stringify(buildPlan()),
+        }),
+      };
+    };
+
+    await recommendDatasets(
+      {
+        description: "Classify customer support tickets by priority.",
+        qualityTier: 3,
+      },
+      {
+        discoverCandidates: async () => [candidate],
+        enrichCandidates: async () => [candidate],
+        rankCandidates: async () => [toRecommendedCandidate(candidate)],
+        skipDebugWrite: true,
+      },
+    );
+
+    assert.match(capturedPrompt, /1 = Fastest: target about 30-60 minutes\./);
+    assert.match(capturedPrompt, /3 = Balanced: target about 3-8 hours\./);
+    assert.match(capturedPrompt, /5 = Maximum Quality: target about 16-24 hours\./);
+    assert.match(capturedPrompt, /quality_tier_strategy.*wall-clock time-budget summary/i);
+    assert.ok(!capturedPrompt.includes("under 10K rows"));
+    assert.ok(!capturedPrompt.includes("4-6+ datasets"));
+    assert.ok(!capturedPrompt.includes("1-3 days"));
+  } finally {
+    globalThis.fetch = originalFetch;
+
+    if (previousApiKey === undefined) {
+      delete process.env.OPENAI_API_KEY;
+    } else {
+      process.env.OPENAI_API_KEY = previousApiKey;
+    }
+
+    if (previousGlobalModel === undefined) {
+      delete process.env.OPENAI_MODEL;
+    } else {
+      process.env.OPENAI_MODEL = previousGlobalModel;
+    }
+  }
+});
+
 test("spec planner prompt hardcodes one training epoch for backend SFT jobs", () => {
   const prompt = buildSpecPrompt({
     objectiveSummary: "Classify support tickets.",

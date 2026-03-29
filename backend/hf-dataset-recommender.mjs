@@ -25,6 +25,7 @@ const SHORTLIST_LIMIT = 20;
 const REQUEST_TIMEOUT_MS = 8000;
 const ENRICHMENT_CONCURRENCY = 5;
 const DEFAULT_OPENAI_MODEL = "gpt-5-mini";
+const DEFAULT_DATASET_SELECTION_MODEL = "gpt-5.4";
 const LOG_PREFIX = "[hf-dataset-recommender]";
 const TRANSIENT_STATUS_CODES = new Set([408, 409, 429, 500, 502, 503, 504]);
 
@@ -608,21 +609,23 @@ function buildOpenAIPlanningPrompt(input) {
     "Create a Hugging Face dataset search plan for post-training a language model.",
     "This backend v1 supports only single-target classification SFT jobs.",
     `User request: ${input.description}`,
-    "Quality tier definitions:",
-    "1 = Fastest: under 10K rows, one tightly matched dataset, optimize for minutes to a few hours.",
-    "2 = Fast: 10K-50K rows, 1-2 complementary datasets, moderate filtering.",
-    "3 = Balanced: 50K-500K rows, 2-3 datasets, core use case plus edge cases.",
-    "4 = Quality: 500K-2M rows, 3-5 diverse high-quality datasets.",
-    "5 = Maximum Quality: 2M+ rows, 4-6+ datasets, broad foundational and domain-specialized coverage.",
+    "Quality tier definitions for the eventual end-to-end post-training run:",
+    "1 = Fastest: target about 30-60 minutes.",
+    "2 = Fast: target about 1-3 hours.",
+    "3 = Balanced: target about 3-8 hours.",
+    "4 = Quality: target about 8-16 hours.",
+    "5 = Maximum Quality: target about 16-24 hours.",
     input.qualityTier == null
-      ? "If the request does not specify a desired data volume or quality tier, default to a balanced tier-3 plan."
-      : `The user explicitly requested quality tier ${input.qualityTier}; set min_rows and guidance accordingly.`,
+      ? "If the request does not specify a desired data volume or quality tier, default to a balanced tier-3 time budget."
+      : `The user explicitly requested quality tier ${input.qualityTier}; shape the time budget and guidance accordingly.`,
     "Return task_spec, analysis, search_queries, ranking_criteria, and recommendation_guidance.",
     "search_queries must contain concise Hugging Face search strings, usually 2-6 words, like something typed directly into the Hugging Face search bar.",
     "Use task_filter values only from: text-classification, question-answering, summarization, text-generation, translation, conversational, token-classification, or null.",
     "Use sort values only from: downloads, likes, trending, created.",
     "Set min_rows based on the explicit or inferred quality tier.",
     "Set data_format_needed to exactly one of: instruction, completion, preference, raw_text, mixed.",
+    "Set analysis.quality_tier_strategy to a concise wall-clock time-budget summary for the recommended run.",
+    "Do not describe analysis.quality_tier_strategy in terms of row counts, corpus size, or number of datasets.",
     "Keep mapped_task_types narrowly focused on the main fine-tuning objective, usually 1-2 task types.",
     "Keep warnings focused on practical dataset-selection risks.",
     "If the request mentions multiple classification targets, choose one primary target to optimize for, keep task_spec.supported=true, and record a warning plus the selected_target_focus.",
@@ -1393,7 +1396,9 @@ async function rankCandidatesWithOpenAI(candidates, context) {
     throw new Error("OPENAI_API_KEY is required to rank fetched Hugging Face datasets.");
   }
 
-  const model = normalizeOptionalString(process.env.OPENAI_MODEL) ?? DEFAULT_OPENAI_MODEL;
+  const model =
+    normalizeOptionalString(process.env.OPENAI_DATASET_SELECTION_MODEL) ??
+    DEFAULT_DATASET_SELECTION_MODEL;
   const rankingInput = buildOpenAIRankingInput(candidates, context);
   const prompt = buildOpenAIRankingPrompt(context, rankingInput);
   logInfo(`selecting recommended datasets from ${candidates.length} candidates with OpenAI model ${model}`);

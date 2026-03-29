@@ -97,6 +97,8 @@ function buildPrompt(description) {
     "Create a Hugging Face dataset search plan for post-training a language model.",
     `Description: ${description}`,
     "Return analysis, search_queries, ranking_criteria, and recommendation_guidance.",
+    "Set analysis.quality_tier_strategy to a concise wall-clock time-budget summary for the recommended run.",
+    "Do not describe analysis.quality_tier_strategy in terms of row counts, corpus size, or number of datasets.",
     "search_queries must contain concise Hugging Face search strings, usually 2-6 words, like something typed directly into the Hugging Face search bar.",
     "Use task_filter values only from: text-classification, question-answering, summarization, text-generation, translation, conversational, token-classification, or null.",
     "Use sort values only from: downloads, likes, trending, created.",
