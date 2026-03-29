@@ -442,6 +442,9 @@ async function runSmokeTest({ jobId, deploymentUrl, model, logger }) {
               content: "Reply with the single word READY.",
             },
           ],
+          chat_template_kwargs: {
+            enable_thinking: false,
+          },
           max_tokens: 16,
         }),
       });

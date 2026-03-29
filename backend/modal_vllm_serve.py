@@ -10,11 +10,11 @@ Configure via environment variables:
 
 ```bash
 # Serve a LoRA adapter on top of the base model
-ADAPTER_PATH=experiments/qwen3-8b-sft/final_adapter \
+ADAPTER_PATH=experiments/qwen3.5-9b-sft/final_adapter \
   modal serve backend/modal_vllm_serve.py
 
 # Serve a merged model directly (no LoRA)
-MERGED=1 ADAPTER_PATH=experiments/qwen3-8b-sft/merged \
+MERGED=1 ADAPTER_PATH=experiments/qwen3.5-9b-sft/merged \
   modal serve backend/modal_vllm_serve.py
 
 # Override base model, GPU, and context length
@@ -37,8 +37,11 @@ Notes:
 - Reuses the same volumes and secrets as modal_trl_posttrain.py.
 - Create a Modal secret named `huggingface-secret` before running.
 - The ADAPTER_PATH is relative to the checkpoints volume root (/checkpoints).
+- Thinking is disabled by default for chat-template-based models like Qwen 3.5.
+  Set ENABLE_THINKING=1 to opt back in.
 """
 
+import json
 import os
 import subprocess
 import sys
@@ -49,12 +52,13 @@ import modal
 # ---------------------------------------------------------------------------
 # Config via environment variables (works with `modal serve` and `modal deploy`)
 # ---------------------------------------------------------------------------
-BASE_MODEL = os.environ.get("BASE_MODEL", "Qwen/Qwen3-8B-Base")
+BASE_MODEL = os.environ.get("BASE_MODEL", "Qwen/Qwen3.5-9B-Base")
 ADAPTER_PATH = os.environ.get("ADAPTER_PATH", "")
 ADAPTER_NAME = os.environ.get("ADAPTER_NAME", "")
 GPU_TYPE = os.environ.get("GPU_TYPE", "A10G")
 MAX_MODEL_LEN = int(os.environ.get("MAX_MODEL_LEN", "2048"))
 MERGED = os.environ.get("MERGED", "").lower() in ("1", "true", "yes")
+ENABLE_THINKING = os.environ.get("ENABLE_THINKING", "").lower() in ("1", "true", "yes")
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -81,6 +85,7 @@ serve_image = (
             "ADAPTER_NAME": ADAPTER_NAME,
             "MAX_MODEL_LEN": str(MAX_MODEL_LEN),
             "MERGED": "1" if MERGED else "0",
+            "ENABLE_THINKING": "1" if ENABLE_THINKING else "0",
         }
     )
 )
@@ -93,7 +98,7 @@ app = modal.App(APP_NAME)
 # ---------------------------------------------------------------------------
 
 def _derive_adapter_name(adapter_path: str) -> str:
-    """Derive a short adapter name from the path, e.g. 'experiments/qwen3-8b-sft/final_adapter' -> 'qwen3-8b-sft'."""
+    """Derive a short adapter name from the path, e.g. 'experiments/qwen3.5-9b-sft/final_adapter' -> 'qwen3.5-9b-sft'."""
     parts = Path(adapter_path).parts
     # If the path looks like experiments/<name>/final_adapter, use <name>
     if len(parts) >= 2 and parts[-1] in ("final_adapter", "merged"):
@@ -110,6 +115,8 @@ def _get_runtime_config() -> dict[str, str | int | bool]:
         "adapter_name": os.environ.get("ADAPTER_NAME", ADAPTER_NAME),
         "max_model_len": int(os.environ.get("MAX_MODEL_LEN", str(MAX_MODEL_LEN))),
         "merged": os.environ.get("MERGED", "1" if MERGED else "0").lower() in ("1", "true", "yes"),
+        "enable_thinking": os.environ.get("ENABLE_THINKING", "1" if ENABLE_THINKING else "0").lower()
+        in ("1", "true", "yes"),
     }
 
 
@@ -121,6 +128,7 @@ def _build_vllm_cmd() -> list[str]:
     base_model = str(config["base_model"])
     max_model_len = int(config["max_model_len"])
     merged = bool(config["merged"])
+    enable_thinking = bool(config["enable_thinking"])
 
     if merged:
         if not adapter_path:
@@ -140,6 +148,7 @@ def _build_vllm_cmd() -> list[str]:
         "--max-model-len", str(max_model_len),
         "--dtype", "auto",
         "--trust-remote-code",
+        "--default-chat-template-kwargs", json.dumps({"enable_thinking": enable_thinking}),
     ]
 
     # Add LoRA flags for non-merged adapter serving

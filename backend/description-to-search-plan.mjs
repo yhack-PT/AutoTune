@@ -99,6 +99,7 @@ function buildPrompt(description) {
     "Return analysis, search_queries, ranking_criteria, and recommendation_guidance.",
     "Infer a reasonable end-to-end run-time budget directly from the user's request.",
     "If the user states a time preference or deadline, honor it when possible.",
+    "If the user does not specify a time, default to an 8-hour run budget.",
     "Set analysis.quality_tier_strategy to a concise wall-clock time-budget summary for the recommended run.",
     "Do not describe analysis.quality_tier_strategy in terms of row counts, corpus size, or number of datasets.",
     "search_queries must contain concise Hugging Face search strings, usually 2-6 words, like something typed directly into the Hugging Face search bar.",

@@ -590,7 +590,7 @@ function buildOpenAIPlanningPrompt(input) {
     `User request: ${input.description}`,
     "Infer a reasonable end-to-end run-time budget directly from the user's request.",
     "If the user states a time preference or deadline, honor it when possible.",
-    "If the user does not specify a time, infer one from task complexity, data needs, and the likely scope of a useful run.",
+    "If the user does not specify a time, default to an 8-hour run budget.",
     "Return task_spec, analysis, search_queries, ranking_criteria, and recommendation_guidance.",
     "search_queries must contain concise Hugging Face search strings, usually 2-6 words, like something typed directly into the Hugging Face search bar.",
     "Use task_filter values only from: text-classification, question-answering, summarization, text-generation, translation, conversational, token-classification, or null.",

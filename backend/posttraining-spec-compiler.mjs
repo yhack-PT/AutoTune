@@ -20,8 +20,8 @@ const LOG_PREFIX = "[posttraining-spec-compiler]";
 const TRANSIENT_STATUS_CODES = new Set([408, 409, 429, 500, 502, 503, 504]);
 
 const DEFAULT_BASE_MODEL = {
-  model_id: "Qwen/Qwen3-8B-Base",
-  revision: "7b8a267e13df1a9427e7dfa2691f69a417c58d94",
+  model_id: "Qwen/Qwen3.5-9B-Base",
+  revision: "2d021f1887f1fe402bf2c53ed69d7f0fc4709ec9",
 };
 
 const DEFAULT_TRAINING_PARAMS = {

@@ -20,7 +20,7 @@ modal run backend/modal_trl_posttrain.py --config backend/modal_trl_posttrain.ex
 vLLM handoff example:
 
 ```bash
-vllm serve Qwen/Qwen3-8B-Base --enable-lora --lora-modules run=/checkpoints/experiments/qwen3-8b-dpo/final_adapter
+vllm serve Qwen/Qwen3.5-9B-Base --enable-lora --lora-modules run=/checkpoints/experiments/qwen3.5-9b-dpo/final_adapter
 ```
 
 Notes:
@@ -50,7 +50,8 @@ TrainerType = Literal["sft", "dpo", "kto", "orpo", "cpo", "bco"]
 
 APP_NAME = "trl-posttraining"
 DEFAULT_GPU_TYPE = "A10"
-DEFAULT_BASE_MODEL = "Qwen/Qwen3-8B-Base"
+DEFAULT_BASE_MODEL = "Qwen/Qwen3.5-9B-Base"
+DEFAULT_CHAT_TEMPLATE_KWARGS = {"enable_thinking": False}
 DEFAULT_TARGET_MODULES = [
     "q_proj",
     "k_proj",
@@ -1183,7 +1184,11 @@ def _normalize_sft_dataset(dataset: Any, tokenizer: Any, apply_chat_template: An
         def normalize_messages(example: dict[str, Any]) -> dict[str, str]:
             messages = example["messages"]
             if _is_conversational_value(messages):
-                rendered = apply_chat_template({"messages": messages}, tokenizer=tokenizer)
+                rendered = _render_chat_template(
+                    apply_chat_template,
+                    {"messages": messages},
+                    tokenizer,
+                )
                 return {"text": rendered["text"]}
             return {"text": _normalize_text_value(messages, "messages")}
 
@@ -1204,9 +1209,10 @@ def _normalize_sft_dataset(dataset: Any, tokenizer: Any, apply_chat_template: An
             prompt = example["prompt"]
             completion = example["completion"]
             if _is_conversational_value(prompt) or _is_conversational_value(completion):
-                rendered = apply_chat_template(
+                rendered = _render_chat_template(
+                    apply_chat_template,
                     {"prompt": prompt, "completion": completion},
-                    tokenizer=tokenizer,
+                    tokenizer,
                 )
                 return {"prompt": rendered["prompt"], "completion": rendered["completion"]}
             return {
@@ -1256,9 +1262,10 @@ def _normalize_paired_preference_dataset(
             or _is_conversational_value(chosen)
             or _is_conversational_value(rejected)
         ):
-            rendered = apply_chat_template(
+            rendered = _render_chat_template(
+                apply_chat_template,
                 {"prompt": prompt, "chosen": chosen, "rejected": rejected},
-                tokenizer=tokenizer,
+                tokenizer,
             )
             return {
                 "prompt": rendered["prompt"],
@@ -1296,9 +1303,10 @@ def _normalize_unpaired_preference_dataset(
                     f"{trainer_name} requires an explicit prompt column. Implicit unpaired preference datasets are not supported in this example."
                 )
             if _is_conversational_value(prompt) or _is_conversational_value(completion):
-                rendered = apply_chat_template(
+                rendered = _render_chat_template(
+                    apply_chat_template,
                     {"prompt": prompt, "completion": completion},
-                    tokenizer=tokenizer,
+                    tokenizer,
                 )
                 return {
                     "prompt": rendered["prompt"],
@@ -1338,9 +1346,10 @@ def _normalize_unpaired_preference_dataset(
                     or _is_conversational_value(chosen)
                     or _is_conversational_value(rejected)
                 ):
-                    rendered = apply_chat_template(
+                    rendered = _render_chat_template(
+                        apply_chat_template,
                         {"prompt": prompt, "chosen": chosen, "rejected": rejected},
-                        tokenizer=tokenizer,
+                        tokenizer,
                     )
                     prompt_text = rendered["prompt"]
                     chosen_text = rendered["chosen"]
@@ -1390,6 +1399,15 @@ def _build_quantization_config(config: TrainConfig, torch: Any, BitsAndBytesConf
         bnb_4bit_compute_dtype=torch.bfloat16,
         bnb_4bit_quant_type="nf4",
         bnb_4bit_use_double_quant=True,
+    )
+
+
+def _render_chat_template(apply_chat_template: Any, example: dict[str, Any], tokenizer: Any) -> dict[str, Any]:
+    # Qwen 3.5 chat templates emit <think> blocks by default unless explicitly disabled.
+    return apply_chat_template(
+        example,
+        tokenizer=tokenizer,
+        **DEFAULT_CHAT_TEMPLATE_KWARGS,
     )
 
 

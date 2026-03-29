@@ -273,7 +273,7 @@ function buildSpec(datasetId) {
     adaptation_strategy: "lora",
     artifact_strategy: "adapter",
     base_model: {
-      model_id: "Qwen/Qwen3-8B-Base",
+      model_id: "Qwen/Qwen3.5-9B-Base",
       revision: null,
     },
     selected_datasets: [
@@ -560,6 +560,7 @@ test("recommendDatasets planning prompt asks for time-based quality tier strateg
 
     assert.match(capturedPrompt, /Infer a reasonable end-to-end run-time budget directly from the user's request\./);
     assert.match(capturedPrompt, /If the user states a time preference or deadline, honor it when possible\./);
+    assert.match(capturedPrompt, /If the user does not specify a time, default to an 8-hour run budget\./);
     assert.match(capturedPrompt, /quality_tier_strategy.*wall-clock time-budget summary/i);
     assert.match(capturedPrompt, /Do not use a numeric 1-5 tier or score\./);
     assert.ok(!capturedPrompt.includes("under 10K rows"));
@@ -597,7 +598,7 @@ test("spec planner prompt hardcodes one training epoch for backend SFT jobs", ()
       supported_methods: ["sft"],
       supported_task_families: ["classification"],
       supported_target_policies: ["single_target"],
-      allowed_base_models: [{ model_id: "Qwen/Qwen3-8B-Base", revision: null }],
+      allowed_base_models: [{ model_id: "Qwen/Qwen3.5-9B-Base", revision: null }],
       allowed_compute_gpus: ["A10", "L40S", "H100"],
     },
     jobId: "prompt-test-job",
