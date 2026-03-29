@@ -386,8 +386,12 @@ export default function ChatPage() {
         const reader = res.body.getReader();
         const decoder = new TextDecoder();
         let buffer = "";
-        let assistantContent = "";
         let jobStarted = false;
+
+        // Create a streaming assistant message that we'll update in place
+        const streamingMsgId = crypto.randomUUID();
+        let streamingContent = "";
+        let messageAdded = false;
 
         while (true) {
           const { done, value } = await reader.read();
@@ -407,7 +411,30 @@ export default function ChatPage() {
               const event = JSON.parse(json);
 
               if (event.type === "text_delta" && event.content) {
-                assistantContent += event.content;
+                streamingContent += event.content;
+
+                if (!messageAdded) {
+                  // Add the message for the first token
+                  messageAdded = true;
+                  setMessages((prev) => [
+                    ...prev,
+                    {
+                      id: streamingMsgId,
+                      role: "assistant",
+                      content: streamingContent,
+                    },
+                  ]);
+                } else {
+                  // Update the existing message in place
+                  const snapshot = streamingContent;
+                  setMessages((prev) =>
+                    prev.map((m) =>
+                      m.id === streamingMsgId
+                        ? { ...m, content: snapshot }
+                        : m,
+                    ),
+                  );
+                }
               } else if (event.type === "job_started" && event.jobId) {
                 jobStarted = true;
                 setActiveJobId(event.jobId);
@@ -416,23 +443,32 @@ export default function ChatPage() {
                 setIsProcessSidebarOpen(true);
                 lastStageRef.current = null;
               } else if (event.type === "error") {
-                assistantContent += event.message || "An error occurred.";
+                streamingContent += event.message || "An error occurred.";
+                if (!messageAdded) {
+                  messageAdded = true;
+                  setMessages((prev) => [
+                    ...prev,
+                    {
+                      id: streamingMsgId,
+                      role: "assistant",
+                      content: streamingContent,
+                    },
+                  ]);
+                } else {
+                  const snapshot = streamingContent;
+                  setMessages((prev) =>
+                    prev.map((m) =>
+                      m.id === streamingMsgId
+                        ? { ...m, content: snapshot }
+                        : m,
+                    ),
+                  );
+                }
               }
             } catch {
               // Skip malformed SSE events
             }
           }
-        }
-
-        if (assistantContent) {
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: crypto.randomUUID(),
-              role: "assistant",
-              content: assistantContent,
-            },
-          ]);
         }
 
         // If no job was started, we're done responding

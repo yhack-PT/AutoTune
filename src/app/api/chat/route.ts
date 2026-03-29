@@ -83,45 +83,37 @@ export async function POST(request: Request) {
           ...body.messages.map((m) => ({ role: m.role, content: m.content })),
         ];
 
-        // First call — may produce text or a tool call
-        const firstResponse = await callOpenAI(apiKey, model, inputMessages);
-        const toolCall = extractToolCall(firstResponse);
+        // First call (streamed) — may produce text or a tool call
+        const firstResult = await streamOpenAI(apiKey, model, { input: inputMessages }, send);
 
-        if (toolCall && toolCall.name === "train_model") {
-          // Execute the tool
-          const args = JSON.parse(toolCall.arguments);
+        if (firstResult.toolCall && firstResult.toolCall.name === "train_model") {
+          const args = JSON.parse(firstResult.toolCall.arguments);
           const input = validateCreateJobInput({ description: args.description });
           const job = await createPostTrainingJob(input);
           spawnPostTrainingOrchestrator(job.jobId);
 
           send({ type: "job_started", jobId: job.jobId });
 
-          // Feed tool result back to OpenAI using Responses API format
-          const toolResultMessages = [
-            ...inputMessages,
-            ...extractAssistantOutput(firstResponse),
+          // Chain via previous_response_id and send only the tool output
+          await streamOpenAI(
+            apiKey,
+            model,
             {
-              type: "function_call_output",
-              call_id: toolCall.id,
-              output: JSON.stringify({
-                jobId: job.jobId,
-                status: "queued",
-                message: "Post-training job created and queued.",
-              }),
+              input: [
+                {
+                  type: "function_call_output",
+                  call_id: firstResult.toolCall.id,
+                  output: JSON.stringify({
+                    jobId: job.jobId,
+                    status: "queued",
+                    message: "Post-training job created and queued.",
+                  }),
+                },
+              ],
+              previousResponseId: firstResult.responseId,
             },
-          ];
-
-          const secondResponse = await callOpenAI(apiKey, model, toolResultMessages);
-          const text = extractTextContent(secondResponse);
-          if (text) {
-            send({ type: "text_delta", content: text });
-          }
-        } else {
-          // Plain text response
-          const text = extractTextContent(firstResponse);
-          if (text) {
-            send({ type: "text_delta", content: text });
-          }
+            send,
+          );
         }
 
         send({ type: "done" });
@@ -143,22 +135,51 @@ export async function POST(request: Request) {
   });
 }
 
-async function callOpenAI(
+type ToolCallResult = {
+  id: string;
+  name: string;
+  arguments: string;
+};
+
+type StreamResult = {
+  responseId: string | null;
+  toolCall: ToolCallResult | null;
+};
+
+type StreamOpenAIOptions = {
+  input: Array<Record<string, unknown>>;
+  previousResponseId?: string | null;
+};
+
+/**
+ * Streams an OpenAI Responses API call. Text deltas are forwarded to the
+ * client via `send()` as they arrive. Tool calls are buffered and returned
+ * so the caller can execute them. Uses `previous_response_id` for chaining.
+ */
+async function streamOpenAI(
   apiKey: string,
   model: string,
-  messages: Array<Record<string, unknown>>,
-) {
+  options: StreamOpenAIOptions,
+  send: (event: Record<string, unknown>) => void,
+): Promise<StreamResult> {
+  const requestBody: Record<string, unknown> = {
+    model,
+    input: options.input,
+    tools: TOOLS,
+    stream: true,
+  };
+
+  if (options.previousResponseId) {
+    requestBody.previous_response_id = options.previousResponseId;
+  }
+
   const response = await fetch(OPENAI_RESPONSES_API_URL, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${apiKey}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({
-      model,
-      input: messages,
-      tools: TOOLS,
-    }),
+    body: JSON.stringify(requestBody),
   });
 
   if (!response.ok) {
@@ -166,45 +187,73 @@ async function callOpenAI(
     throw new Error(`OpenAI API error ${response.status}: ${text.slice(0, 500)}`);
   }
 
-  return response.json();
-}
-
-function extractToolCall(
-  response: Record<string, unknown>,
-): { id: string; name: string; arguments: string } | null {
-  const output = Array.isArray(response.output) ? response.output : [];
-  for (const item of output) {
-    if (item?.type === "function_call") {
-      return {
-        id: item.call_id ?? item.id ?? "",
-        name: item.name ?? "",
-        arguments: item.arguments ?? "{}",
-      };
-    }
-  }
-  return null;
-}
-
-function extractAssistantOutput(response: Record<string, unknown>): Array<Record<string, unknown>> {
-  // Return the output items as-is for feeding back into the conversation
-  const output = Array.isArray(response.output) ? response.output : [];
-  return output;
-}
-
-function extractTextContent(response: Record<string, unknown>): string | null {
-  // Try top-level output_text first
-  if (typeof response.output_text === "string" && response.output_text.trim()) {
-    return response.output_text.trim();
+  if (!response.body) {
+    throw new Error("OpenAI returned no response body.");
   }
 
-  const output = Array.isArray(response.output) ? response.output : [];
-  for (const item of output) {
-    const content = Array.isArray(item?.content) ? item.content : [];
-    for (const part of content) {
-      if (part?.type === "output_text" && typeof part.text === "string" && part.text.trim()) {
-        return part.text.trim();
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  // Tool call state — capture name from output_item.added, args from .done
+  let toolCallId = "";
+  let toolCallName = "";
+  let toolCallArgs = "";
+  let hasToolCall = false;
+
+  // Response ID from the completed event for chaining
+  let responseId: string | null = null;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("data: ")) continue;
+      const data = trimmed.slice(6);
+      if (!data || data === "[DONE]") continue;
+
+      try {
+        const event = JSON.parse(data);
+        const eventType: string = event.type ?? "";
+
+        if (eventType === "response.output_text.delta") {
+          const delta: string = event.delta ?? "";
+          if (delta) {
+            send({ type: "text_delta", content: delta });
+          }
+        } else if (eventType === "response.output_item.added") {
+          const item = event.item;
+          if (item?.type === "function_call") {
+            hasToolCall = true;
+            toolCallId = item.call_id ?? item.id ?? toolCallId;
+            toolCallName = item.name ?? toolCallName;
+          }
+        } else if (eventType === "response.function_call_arguments.done") {
+          // Use the authoritative done event for the complete arguments
+          toolCallArgs = event.arguments ?? toolCallArgs;
+        } else if (eventType === "response.function_call_arguments.delta") {
+          // Fallback: accumulate deltas in case .done doesn't fire
+          if (!toolCallArgs) {
+            toolCallArgs += event.delta ?? "";
+          }
+        } else if (eventType === "response.completed") {
+          responseId = event.response?.id ?? null;
+        }
+      } catch {
+        // Skip malformed SSE lines
       }
     }
   }
-  return null;
+
+  const toolCall: ToolCallResult | null = hasToolCall
+    ? { id: toolCallId, name: toolCallName, arguments: toolCallArgs }
+    : null;
+
+  return { responseId, toolCall };
 }
