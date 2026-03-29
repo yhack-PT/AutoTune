@@ -2,14 +2,17 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  buildCommandFailureMessage,
   buildDeploymentEnvironment,
   buildDeploymentRecord,
   buildGenerationSmokeTestProbes,
+  handleProcessOutputLine,
   extractModalRunUrl,
   parseStructuredLifecycleEventLine,
   resolveDeploymentRuntimePolicy,
   resolveDeploymentArtifact,
   runSmokeTest,
+  shouldSuppressProcessOutputLine,
   waitForDeploymentReady,
 } from "./posttraining-orchestrator.mjs";
 
@@ -67,10 +70,87 @@ test("parseStructuredLifecycleEventLine parses training lifecycle events", () =>
   assert.equal(parseStructuredLifecycleEventLine("PT_METRIC_EVENT::{}"), null);
 });
 
-test("resolveDeploymentArtifact selects merged deployment for Qwen-family models", () => {
+test("shouldSuppressProcessOutputLine matches the tokenizer mismatch warning family", () => {
+  const warning =
+    "[RANK 0] Mismatch between tokenized prompt and the start of tokenized prompt+completion. This may be due to unexpected tokenizer behavior, whitespace issues, or special token handling. Verify that the tokenizer is processing text consistently.";
+  const ansiPrefixedWarning =
+    "\u001b[1ATokenizing train dataset:   0%|          | 0/29970 [00:00<?, ? examples/s]" +
+    warning;
+
+  assert.equal(shouldSuppressProcessOutputLine(warning), true);
+  assert.equal(shouldSuppressProcessOutputLine(ansiPrefixedWarning), true);
+  assert.equal(shouldSuppressProcessOutputLine("Downloading model files"), false);
+});
+
+test("handleProcessOutputLine suppresses tokenizer mismatch warnings while preserving unrelated stdout and ui-progress", async () => {
+  const warning =
+    "[RANK 0] Mismatch between tokenized prompt and the start of tokenized prompt+completion. This may be due to unexpected tokenizer behavior, whitespace issues, or special token handling. Verify that the tokenizer is processing text consistently.";
+  const ansiPrefixedWarning =
+    "\u001b[1ATokenizing train dataset:   0%|          | 0/29970 [00:00<?, ? examples/s]" +
+    warning;
+  const emittedEvents = [];
+  const logger = {
+    emit(event) {
+      emittedEvents.push(event);
+    },
+  };
+  const onOutputLine = async ({ line, logger: activeLogger }) => {
+    if (line !== "STRUCTURED_UI_PROGRESS") {
+      return false;
+    }
+
+    activeLogger.emit({
+      stage: "training",
+      source: "ui-progress",
+      level: "info",
+      message: "I'm training the model",
+    });
+    return true;
+  };
+
+  await handleProcessOutputLine({ source: "stdout", line: warning, logger, onOutputLine });
+  await handleProcessOutputLine({ source: "stdout", line: ansiPrefixedWarning, logger, onOutputLine });
+  await handleProcessOutputLine({ source: "stdout", line: "normal stdout line", logger, onOutputLine });
+  await handleProcessOutputLine({ source: "stdout", line: "STRUCTURED_UI_PROGRESS", logger, onOutputLine });
+
+  const emittedMessages = emittedEvents.map((event) => String(event?.message ?? ""));
+  assert.equal(
+    emittedMessages.some((message) => message.includes("normal stdout line")),
+    true,
+  );
+  assert.ok(emittedMessages.includes("I'm training the model"));
+  assert.equal(
+    emittedMessages.some((message) => message.includes("Mismatch between tokenized prompt")),
+    false,
+  );
+});
+
+test("buildCommandFailureMessage includes the actionable subprocess tail", () => {
+  const message = buildCommandFailureMessage({
+    label: "Modal deployment",
+    code: 1,
+    stdout: `
+Building image
+No solution found when resolving dependencies:
+Because vllm==0.18.0 depends on transformers>=4.56.0,<5 and you
+require transformers==5.2.0, we can conclude that your requirements and
+vllm==0.18.0 are incompatible.
+`,
+    stderr: `
+Image build failed.
+`,
+  });
+
+  assert.match(message, /^Modal deployment failed with exit code 1\./);
+  assert.match(message, /No solution found when resolving dependencies/);
+  assert.match(message, /transformers>=4\.56\.0,<5/);
+  assert.match(message, /Image build failed/);
+});
+
+test("resolveDeploymentArtifact uses merged_dir only when training produced one", () => {
   assert.deepEqual(
     resolveDeploymentArtifact({
-      base_model: "Qwen/Qwen3.5-9B-Base",
+      base_model: "Qwen/Qwen3-8B-Base",
       final_adapter_dir: "/checkpoints/experiments/demo/final_adapter",
       merged_dir: "/checkpoints/experiments/demo/merged",
     }),
@@ -82,9 +162,9 @@ test("resolveDeploymentArtifact selects merged deployment for Qwen-family models
   );
   assert.deepEqual(
     resolveDeploymentArtifact({
-      base_model: "meta-llama/Llama-3-8B",
+      base_model: "Qwen/Qwen3-8B-Base",
       final_adapter_dir: "/checkpoints/experiments/demo/final_adapter",
-      merged_dir: "/checkpoints/experiments/demo/merged",
+      merged_dir: null,
     }),
     {
       merged: false,
@@ -94,38 +174,37 @@ test("resolveDeploymentArtifact selects merged deployment for Qwen-family models
   );
 });
 
-test("resolveDeploymentRuntimePolicy enables Qwen compatibility mode", () => {
+test("resolveDeploymentRuntimePolicy keeps Qwen 3 on the standard serving path", () => {
   const policy = resolveDeploymentRuntimePolicy(
     {
-      base_model: "Qwen/Qwen3.5-9B-Base",
-      merged_dir: "/checkpoints/experiments/demo/merged",
+      base_model: "Qwen/Qwen3-8B-Base",
+      final_adapter_dir: "/checkpoints/experiments/demo/final_adapter",
     },
     {
-      merged: true,
-      path: "/checkpoints/experiments/demo/merged",
-      relativePath: "experiments/demo/merged",
+      merged: false,
+      path: "/checkpoints/experiments/demo/final_adapter",
+      relativePath: "experiments/demo/final_adapter",
     },
   );
 
-  assert.equal(policy.merged, true);
-  assert.equal(policy.compatMode, true);
+  assert.equal(policy.merged, false);
   assert.equal(policy.vllmPackageSpec, "vllm==0.18.0");
-  assert.equal(policy.transformersSpec, "transformers==5.2.0");
-  assert.equal(policy.vllmUseV1, "0");
-  assert.equal(policy.modelImpl, "transformers");
-  assert.equal(policy.languageModelOnly, true);
+  assert.equal(policy.transformersSpec, "transformers>=4.56.0,<5");
+  assert.equal(policy.vllmUseV1, "default");
+  assert.equal(policy.modelImpl, "auto");
+  assert.equal(policy.languageModelOnly, false);
 });
 
-test("buildDeploymentEnvironment passes explicit package specs and Qwen compat flags", () => {
+test("buildDeploymentEnvironment keeps Qwen 3 on the standard LoRA serving env", () => {
   const deploymentArtifact = {
-    merged: true,
-    path: "/checkpoints/experiments/demo/merged",
-    relativePath: "experiments/demo/merged",
+    merged: false,
+    path: "/checkpoints/experiments/demo/final_adapter",
+    relativePath: "experiments/demo/final_adapter",
   };
   const runtimePolicy = resolveDeploymentRuntimePolicy(
     {
-      base_model: "Qwen/Qwen3.5-9B-Base",
-      merged_dir: "/checkpoints/experiments/demo/merged",
+      base_model: "Qwen/Qwen3-8B-Base",
+      final_adapter_dir: "/checkpoints/experiments/demo/final_adapter",
     },
     deploymentArtifact,
   );
@@ -135,7 +214,7 @@ test("buildDeploymentEnvironment passes explicit package specs and Qwen compat f
     deploymentArtifact,
     adapterName: "demo-job",
     trainingResult: {
-      base_model: "Qwen/Qwen3.5-9B-Base",
+      base_model: "Qwen/Qwen3-8B-Base",
     },
     compiledConfig: {
       max_length: 1024,
@@ -147,29 +226,28 @@ test("buildDeploymentEnvironment passes explicit package specs and Qwen compat f
 
   assert.deepEqual(env, {
     APP_NAME: "vllm-lora-demo",
-    ADAPTER_PATH: "experiments/demo/merged",
+    ADAPTER_PATH: "experiments/demo/final_adapter",
     ADAPTER_NAME: "demo-job",
-    BASE_MODEL: "Qwen/Qwen3.5-9B-Base",
-    MERGED: "1",
+    BASE_MODEL: "Qwen/Qwen3-8B-Base",
+    MERGED: "0",
     MAX_MODEL_LEN: "1024",
     GPU_TYPE: "H100",
     SERVE_STARTUP_TIMEOUT_SECONDS: "1800",
     VLLM_PACKAGE_SPEC: "vllm==0.18.0",
-    SERVE_TRANSFORMERS_SPEC: "transformers==5.2.0",
-    QWEN_COMPAT_MODE: "1",
+    SERVE_TRANSFORMERS_SPEC: "transformers>=4.56.0,<5",
   });
 });
 
-test("buildDeploymentRecord captures runtime policy for Qwen and non-Qwen deployments", () => {
+test("buildDeploymentRecord captures the standard runtime policy for Qwen 3 and non-Qwen deployments", () => {
   const qwenPolicy = resolveDeploymentRuntimePolicy(
     {
-      base_model: "Qwen/Qwen3.5-9B-Base",
-      merged_dir: "/checkpoints/experiments/demo/merged",
+      base_model: "Qwen/Qwen3-8B-Base",
+      final_adapter_dir: "/checkpoints/experiments/demo/final_adapter",
     },
     {
-      merged: true,
-      path: "/checkpoints/experiments/demo/merged",
-      relativePath: "experiments/demo/merged",
+      merged: false,
+      path: "/checkpoints/experiments/demo/final_adapter",
+      relativePath: "experiments/demo/final_adapter",
     },
   );
   const qwenRecord = buildDeploymentRecord({
@@ -177,21 +255,23 @@ test("buildDeploymentRecord captures runtime policy for Qwen and non-Qwen deploy
     deploymentAppName: "vllm-lora-demo",
     adapterName: "demo-job",
     deploymentArtifact: {
-      merged: true,
-      path: "/checkpoints/experiments/demo/merged",
-      relativePath: "experiments/demo/merged",
+      merged: false,
+      path: "/checkpoints/experiments/demo/final_adapter",
+      relativePath: "experiments/demo/final_adapter",
     },
     trainingResult: {
-      base_model: "Qwen/Qwen3.5-9B-Base",
+      base_model: "Qwen/Qwen3-8B-Base",
     },
     serveGpuType: "H100",
     serveStartupTimeoutSeconds: 1800,
     runtimePolicy: qwenPolicy,
   });
-  assert.equal(qwenRecord.merged, true);
-  assert.equal(qwenRecord.runtimePolicy.compatMode, true);
-  assert.equal(qwenRecord.runtimePolicy.modelImpl, "transformers");
-  assert.equal(qwenRecord.runtimePolicy.languageModelOnly, true);
+  assert.equal(qwenRecord.merged, false);
+  assert.equal(qwenRecord.runtimePolicy.merged, false);
+  assert.equal(qwenRecord.runtimePolicy.vllmPackageSpec, "vllm==0.18.0");
+  assert.equal(qwenRecord.runtimePolicy.transformersSpec, "transformers>=4.56.0,<5");
+  assert.equal(qwenRecord.runtimePolicy.modelImpl, "auto");
+  assert.equal(qwenRecord.runtimePolicy.languageModelOnly, false);
 
   const llamaPolicy = resolveDeploymentRuntimePolicy(
     {
@@ -221,7 +301,9 @@ test("buildDeploymentRecord captures runtime policy for Qwen and non-Qwen deploy
     runtimePolicy: llamaPolicy,
   });
   assert.equal(llamaRecord.merged, false);
-  assert.equal(llamaRecord.runtimePolicy.compatMode, false);
+  assert.equal(llamaRecord.runtimePolicy.merged, false);
+  assert.equal(llamaRecord.runtimePolicy.vllmPackageSpec, "vllm==0.18.0");
+  assert.equal(llamaRecord.runtimePolicy.transformersSpec, "transformers>=4.56.0,<5");
   assert.equal(llamaRecord.runtimePolicy.modelImpl, "auto");
   assert.equal(llamaRecord.runtimePolicy.languageModelOnly, false);
 });

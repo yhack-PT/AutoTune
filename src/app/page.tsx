@@ -287,7 +287,6 @@ function ProcessingSidebar({
             <h2 className="text-base font-semibold text-foreground">
               What&apos;s Happening
             </h2>
-
           </div>
 
           <Button variant="ghost" size="sm" onClick={onClose}>
@@ -516,9 +515,9 @@ export default function ChatPage() {
               content: "Your model is ready!",
               ...(deploymentUrl
                 ? {
-                    deploymentUrl,
-                    ...(deploymentModel ? { deploymentModel } : {}),
-                  }
+                  deploymentUrl,
+                  ...(deploymentModel ? { deploymentModel } : {}),
+                }
                 : {}),
             },
           ]);
@@ -570,9 +569,9 @@ export default function ChatPage() {
             })),
             ...(activeModel === "finetuned" && fineTunedEndpoint
               ? {
-                  customEndpoint: fineTunedEndpoint,
-                  ...(fineTunedModel ? { customModel: fineTunedModel } : {}),
-                }
+                customEndpoint: fineTunedEndpoint,
+                ...(fineTunedModel ? { customModel: fineTunedModel } : {}),
+              }
               : {}),
           }),
           signal: controller.signal,

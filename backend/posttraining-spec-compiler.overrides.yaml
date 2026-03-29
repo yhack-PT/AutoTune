@@ -1,6 +1,6 @@
 # Compiler-owned local overrides for posttraining-spec-compiler.mjs.
 # Set to `null` to fall back to the planner prompt default of 1.0 epochs.
-sft_num_train_epochs: 0.01
+sft_num_train_epochs: 0.001
 # Set to `null` to keep the planner-selected GPU.
 sft_gpu_type: H100
 # Set to `null` to keep the planner-selected max_length.

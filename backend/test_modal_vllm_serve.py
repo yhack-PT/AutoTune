@@ -12,6 +12,9 @@ class _DummyImageChain:
     def uv_pip_install(self, *args, **kwargs):
         return self
 
+    def run_commands(self, *args, **kwargs):
+        return self
+
     def env(self, *args, **kwargs):
         return self
 
@@ -92,9 +95,10 @@ MODULE_SPEC.loader.exec_module(MODULE)
 
 
 class ModalVllmServeTests(unittest.TestCase):
-    def test_default_package_specs_are_pinned(self):
+    def test_default_package_specs_are_vllm_compatible(self):
         self.assertEqual(MODULE.VLLM_PACKAGE_SPEC, "vllm==0.18.0")
-        self.assertEqual(MODULE.SERVE_TRANSFORMERS_SPEC, "transformers==5.2.0")
+        self.assertEqual(MODULE.SERVE_TRANSFORMERS_SPEC, "transformers>=4.56.0,<5")
+        self.assertEqual(MODULE.BASE_MODEL, "Qwen/Qwen3-8B-Base")
 
     def test_build_vllm_cmd_for_merged_model_uses_merged_checkpoint_dir(self):
         with tempfile.TemporaryDirectory() as tempdir:
@@ -103,7 +107,7 @@ class ModalVllmServeTests(unittest.TestCase):
             merged_dir.mkdir(parents=True)
 
             env = {
-                "BASE_MODEL": "Qwen/Qwen3.5-9B-Base",
+                "BASE_MODEL": "Qwen/Qwen3-8B-Base",
                 "ADAPTER_PATH": "experiments/demo-run/merged",
                 "ADAPTER_NAME": "",
                 "MAX_MODEL_LEN": "1024",
@@ -122,20 +126,17 @@ class ModalVllmServeTests(unittest.TestCase):
         self.assertIn(str(merged_dir), cmd)
         self.assertIn("--served-model-name", cmd)
         self.assertIn("demo-run", cmd)
-        self.assertIn("--language-model-only", cmd)
-        self.assertIn("--model-impl", cmd)
-        self.assertIn("transformers", cmd)
         self.assertNotIn("--enable-lora", cmd)
-        self.assertEqual(env["VLLM_USE_V1"], "0")
+        self.assertNotIn("VLLM_PACKAGE_SPEC", env)
 
-    def test_build_vllm_cmd_for_adapter_model_enables_lora(self):
+    def test_build_vllm_cmd_for_qwen3_adapter_model_enables_standard_lora_serving(self):
         with tempfile.TemporaryDirectory() as tempdir:
             checkpoints_dir = Path(tempdir)
             adapter_dir = checkpoints_dir / "experiments" / "demo-run" / "final_adapter"
             adapter_dir.mkdir(parents=True)
 
             env = {
-                "BASE_MODEL": "meta-llama/Llama-3-8B",
+                "BASE_MODEL": "Qwen/Qwen3-8B-Base",
                 "ADAPTER_PATH": "experiments/demo-run/final_adapter",
                 "ADAPTER_NAME": "",
                 "MAX_MODEL_LEN": "2048",
@@ -151,13 +152,12 @@ class ModalVllmServeTests(unittest.TestCase):
                 env = MODULE._build_vllm_env()
 
         self.assertIn("--model", cmd)
-        self.assertIn("meta-llama/Llama-3-8B", cmd)
+        self.assertIn("Qwen/Qwen3-8B-Base", cmd)
         self.assertIn("--enable-lora", cmd)
         self.assertIn("--lora-modules", cmd)
         self.assertIn(f"demo-run={adapter_dir}", cmd)
         self.assertNotIn("--language-model-only", cmd)
-        self.assertNotIn("--model-impl", cmd)
-        self.assertNotIn("VLLM_USE_V1", env)
+        self.assertNotIn("VLLM_PACKAGE_SPEC", env)
 
 
 if __name__ == "__main__":

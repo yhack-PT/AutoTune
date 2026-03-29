@@ -20,7 +20,7 @@ modal run backend/modal_trl_posttrain.py --config backend/modal_trl_posttrain.ex
 vLLM handoff example:
 
 ```bash
-vllm serve Qwen/Qwen3.5-9B-Base --enable-lora --lora-modules run=/checkpoints/experiments/qwen3.5-9b-dpo/final_adapter
+vllm serve Qwen/Qwen3-8B-Base --enable-lora --lora-modules run=/checkpoints/experiments/qwen3-8b-dpo/final_adapter
 ```
 
 Notes:
@@ -54,7 +54,7 @@ TrainerType = Literal["sft", "dpo", "kto", "orpo", "cpo", "bco"]
 
 APP_NAME = "trl-posttraining"
 DEFAULT_GPU_TYPE = "A10"
-DEFAULT_BASE_MODEL = "Qwen/Qwen3.5-9B-Base"
+DEFAULT_BASE_MODEL = "Qwen/Qwen3-8B-Base"
 DEFAULT_CHAT_TEMPLATE_KWARGS = {"enable_thinking": False}
 DEFAULT_TARGET_MODULES = [
     "q_proj",
@@ -1550,7 +1550,7 @@ def _selected_dataset_ids(config: TrainConfig) -> list[str]:
 
 
 def _should_build_merged_artifact(config: TrainConfig) -> bool:
-    return bool(config.merge_after_train or _is_qwen_family_base_model(config.base_model))
+    return bool(config.merge_after_train)
 
 
 def _emit_structured_lifecycle_event(event_type: str, **data: Any) -> None:
@@ -1604,7 +1604,7 @@ def _build_training_result(
         "holdout": holdout_metadata,
         "notes": [
             "Use final_adapter_dir for vLLM LoRA serving with --enable-lora.",
-            "Use merged_dir for direct vLLM base-model serving when merge_after_train=True or for Qwen-family deployments.",
+            "Use merged_dir for direct vLLM base-model serving when merge_after_train=True.",
         ],
     }
 

@@ -2,13 +2,13 @@
 # modal run backend/modal_trl_posttrain.py --config backend/modal_trl_posttrain.example.yaml
 
 trainer_type: sft
-base_model: Qwen/Qwen3.5-9B-Base
-base_model_revision: 2d021f1887f1fe402bf2c53ed69d7f0fc4709ec9
+base_model: Qwen/Qwen3-8B-Base
+base_model_revision: 7b8a267e13df1a9427e7dfa2691f69a417c58d94
 dataset_name: trl-lib/Capybara
 dataset_config:
 train_split: train
 eval_split:
-output_name: qwen3.5-9b-sft
+output_name: qwen3-8b-sft
 seed_artifact:
 
 gpu_type: A10
@@ -44,4 +44,4 @@ enable_wandb: false
 # Preference-tuning note:
 # For dpo / kto / orpo / cpo / bco, set trainer_type accordingly and point
 # seed_artifact at a prior SFT adapter, for example:
-# seed_artifact: /checkpoints/experiments/qwen3.5-9b-sft/final_adapter
+# seed_artifact: /checkpoints/experiments/qwen3-8b-sft/final_adapter

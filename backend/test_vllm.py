@@ -17,7 +17,7 @@ print("\n=== Chat Completion ===")
 r = requests.post(
     f"{BASE_URL}/v1/chat/completions",
     json={
-        "model": "qwen3.5-9b-sft",
+        "model": "qwen3-8b-sft",
         "messages": [
             {
                 "role": "user",

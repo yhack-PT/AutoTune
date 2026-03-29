@@ -23,8 +23,16 @@ const trainerScriptPath = path.join(backendDir, "modal_trl_posttrain.py");
 const serveScriptPath = path.join(backendDir, "modal_vllm_serve.py");
 const STRUCTURED_LIFECYCLE_EVENT_PREFIX = "PT_LIFECYCLE_EVENT::";
 const DEFAULT_VLLM_PACKAGE_SPEC = "vllm==0.18.0";
-const DEFAULT_SERVE_TRANSFORMERS_SPEC = "transformers==5.2.0";
+const DEFAULT_SERVE_TRANSFORMERS_SPEC = "transformers>=4.56.0,<5";
 const STRUCTURED_PROGRESS_PREFIX = "PT_PROGRESS::";
+const ANSI_ESCAPE_SEQUENCE_RE = /\u001B\[[0-9;?]*[ -/]*[@-~]/g;
+const TOKENIZER_MISMATCH_WARNING_CORE =
+  "mismatch between tokenized prompt and the start of tokenized prompt+completion";
+const TOKENIZER_MISMATCH_WARNING_CONTEXT = [
+  "unexpected tokenizer behavior",
+  "whitespace issues",
+  "special token handling",
+];
 
 function nowIso() {
   return new Date().toISOString();
@@ -219,10 +227,6 @@ function isGenerationTaskSpec(taskSpec) {
   return String(taskSpec?.task_family ?? "").trim().toLowerCase() === "generation";
 }
 
-function isQwenFamilyBaseModel(modelId) {
-  return String(modelId ?? "").startsWith("Qwen/");
-}
-
 export function parseStructuredLifecycleEventLine(line) {
   const text = String(line ?? "");
   if (!text.startsWith(STRUCTURED_LIFECYCLE_EVENT_PREFIX)) {
@@ -238,14 +242,10 @@ export function parseStructuredLifecycleEventLine(line) {
 }
 
 export function resolveDeploymentArtifact(trainingResult) {
-  const merged = isQwenFamilyBaseModel(trainingResult?.base_model);
+  const merged = Boolean(trainingResult?.merged_dir);
   const artifactPath = merged ? trainingResult?.merged_dir : trainingResult?.final_adapter_dir;
   if (!artifactPath) {
-    throw new Error(
-      merged
-        ? "Merged deployment requested but merged_dir was not produced by training."
-        : "Training did not produce final_adapter_dir for deployment.",
-    );
+    throw new Error("Training did not produce a deployable artifact.");
   }
   return {
     merged,
@@ -269,16 +269,14 @@ function getServePackageSpecs() {
 
 export function resolveDeploymentRuntimePolicy(trainingResult, deploymentArtifact = null) {
   const artifact = deploymentArtifact ?? resolveDeploymentArtifact(trainingResult);
-  const compatMode = isQwenFamilyBaseModel(trainingResult?.base_model);
   const packageSpecs = getServePackageSpecs();
   return {
     merged: artifact.merged,
-    compatMode,
     vllmPackageSpec: packageSpecs.vllmPackageSpec,
     transformersSpec: packageSpecs.transformersSpec,
-    vllmUseV1: compatMode ? "0" : "default",
-    modelImpl: compatMode ? "transformers" : "auto",
-    languageModelOnly: compatMode,
+    vllmUseV1: "default",
+    modelImpl: "auto",
+    languageModelOnly: false,
   };
 }
 
@@ -303,7 +301,6 @@ export function buildDeploymentEnvironment({
     SERVE_STARTUP_TIMEOUT_SECONDS: String(serveStartupTimeoutSeconds),
     VLLM_PACKAGE_SPEC: runtimePolicy.vllmPackageSpec,
     SERVE_TRANSFORMERS_SPEC: runtimePolicy.transformersSpec,
-    QWEN_COMPAT_MODE: runtimePolicy.compatMode ? "1" : "0",
   };
 }
 
@@ -691,6 +688,37 @@ function emitProcessLine(logger, source, line) {
   });
 }
 
+function normalizeProcessOutputLineForFiltering(line) {
+  return String(line ?? "").replace(ANSI_ESCAPE_SEQUENCE_RE, "").replace(/\r/g, "").trim();
+}
+
+export function buildCommandFailureMessage({ label, code, stdout = "", stderr = "" }) {
+  const lines = [...String(stdout).split(/\r?\n/), ...String(stderr).split(/\r?\n/)]
+    .map((line) => normalizeProcessOutputLineForFiltering(line))
+    .filter(Boolean);
+  const details = lines.length > 0 ? truncateText(lines.slice(-8).join(" | "), 1000) : null;
+  return details
+    ? `${label} failed with exit code ${code}. ${details}`
+    : `${label} failed with exit code ${code}.`;
+}
+
+export function shouldSuppressProcessOutputLine(line) {
+  const normalizedLine = normalizeProcessOutputLineForFiltering(line).toLowerCase();
+  if (!normalizedLine.includes(TOKENIZER_MISMATCH_WARNING_CORE)) {
+    return false;
+  }
+
+  return TOKENIZER_MISMATCH_WARNING_CONTEXT.some((fragment) => normalizedLine.includes(fragment));
+}
+
+export async function handleProcessOutputLine({ source, line, logger, onOutputLine = null }) {
+  const handled = typeof onOutputLine === "function" ? await onOutputLine({ source, line, logger }) : false;
+  if (!handled && !shouldSuppressProcessOutputLine(line)) {
+    emitProcessLine(logger, source, line);
+  }
+  return handled;
+}
+
 async function runCommand({ command, args, env, cwd, logger, label, onOutputLine = null }) {
   logger.emit({
     source: "orchestrator",
@@ -736,10 +764,7 @@ async function runCommand({ command, args, env, cwd, logger, label, onOutputLine
       }
 
       pendingOutputWork = pendingOutputWork.then(async () => {
-        const handled = typeof onOutputLine === "function" ? await onOutputLine({ source, line, logger }) : false;
-        if (!handled) {
-          emitProcessLine(logger, source, line);
-        }
+        await handleProcessOutputLine({ source, line, logger, onOutputLine });
       });
 
       pendingOutputWork.catch((error) => {
@@ -799,7 +824,7 @@ async function runCommand({ command, args, env, cwd, logger, label, onOutputLine
             settleResolve({ stdout, stderr, combined: `${stdout}\n${stderr}` });
             return;
           }
-          settleReject(new Error(`${label} failed with exit code ${code}.`));
+          settleReject(new Error(buildCommandFailureMessage({ label, code, stdout, stderr })));
         },
         (error) => {
           settleReject(error);

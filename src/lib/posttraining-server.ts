@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { selectJobEventsForApi } from "./posttraining-log-selection.mjs";
 
 export type JobStage =
   | "queued"
@@ -112,11 +113,12 @@ async function readJsonFile<T>(filePath: string): Promise<T | null> {
 async function readEvents(jobId: string, limit = 200): Promise<JobEvent[]> {
   try {
     const raw = await readFile(getEventsFilePath(jobId), "utf8");
-    const lines = raw
+    const events = raw
       .split(/\r?\n/)
       .map((line) => line.trim())
-      .filter(Boolean);
-    return lines.slice(-limit).map((line) => JSON.parse(line) as JobEvent);
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as JobEvent);
+    return selectJobEventsForApi(events, { rawTailLimit: limit }) as JobEvent[];
   } catch (error) {
     if (
       typeof error === "object" &&

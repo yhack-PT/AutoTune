@@ -318,11 +318,33 @@ class ModalTrlNormalizationTests(unittest.TestCase):
         self.assertEqual(training_result["training_loss"], 0.125)
         self.assertEqual(result["evaluation"]["metrics"]["accuracy"], 1.0)
 
-    def test_train_then_evaluate_impl_reuses_candidate_model_and_builds_qwen_merged_dir(self):
+    def test_should_build_merged_artifact_only_when_requested(self):
+        standard_config = MODULE._config_from_mapping(
+            {
+                "trainer_type": "sft",
+                "base_model": "Qwen/Qwen3-8B-Base",
+                "dataset_name": "trl-lib/Capybara",
+                "output_name": "qwen3-standard-demo",
+            }
+        )
+        merged_config = MODULE._config_from_mapping(
+            {
+                "trainer_type": "sft",
+                "base_model": "Qwen/Qwen3-8B-Base",
+                "dataset_name": "trl-lib/Capybara",
+                "output_name": "qwen3-merged-demo",
+                "merge_after_train": True,
+            }
+        )
+
+        self.assertFalse(MODULE._should_build_merged_artifact(standard_config))
+        self.assertTrue(MODULE._should_build_merged_artifact(merged_config))
+
+    def test_train_then_evaluate_impl_reuses_candidate_model_and_builds_merged_dir_when_requested(self):
         config = MODULE._config_from_mapping(
             {
                 "trainer_type": "sft",
-                "base_model": "Qwen/Qwen3.5-9B-Base",
+                "base_model": "Qwen/Qwen3-8B-Base",
                 "dataset_name": "prepared_manifest",
                 "dataset_source_type": "prepared_manifest",
                 "prepared_dataset_manifest": {"selected_datasets": []},
@@ -335,6 +357,7 @@ class ModalTrlNormalizationTests(unittest.TestCase):
                     "unsupported_reason": None,
                 },
                 "output_name": "qwen-merged-demo",
+                "merge_after_train": True,
             }
         )
 

@@ -10,11 +10,11 @@ Configure via environment variables:
 
 ```bash
 # Serve a LoRA adapter on top of the base model
-ADAPTER_PATH=experiments/qwen3.5-9b-sft/final_adapter \
+ADAPTER_PATH=experiments/qwen3-8b-sft/final_adapter \
   modal serve backend/modal_vllm_serve.py
 
 # Serve a merged model directly (no LoRA)
-MERGED=1 ADAPTER_PATH=experiments/qwen3.5-9b-sft/merged \
+MERGED=1 ADAPTER_PATH=experiments/qwen3-8b-sft/merged \
   modal serve backend/modal_vllm_serve.py
 
 # Override base model, GPU, and context length
@@ -37,7 +37,7 @@ Notes:
 - Reuses the same volumes and secrets as modal_trl_posttrain.py.
 - Create a Modal secret named `huggingface-secret` before running.
 - The ADAPTER_PATH is relative to the checkpoints volume root (/checkpoints).
-- Thinking is disabled by default for chat-template-based models like Qwen 3.5.
+- Thinking is disabled by default for chat-template-based models like Qwen 3.
   Set ENABLE_THINKING=1 to opt back in.
 """
 
@@ -54,20 +54,10 @@ def _is_truthy_env(value: str | None) -> bool:
     return str(value or "").lower() in ("1", "true", "yes")
 
 
-def _is_qwen_family_base_model(base_model: str) -> bool:
-    return str(base_model or "").strip().startswith("Qwen/")
-
-
-def _should_enable_qwen_compat_mode(base_model: str, explicit_flag: str | None = None) -> bool:
-    if explicit_flag is not None and explicit_flag != "":
-        return _is_truthy_env(explicit_flag)
-    return _is_qwen_family_base_model(base_model)
-
-
 # ---------------------------------------------------------------------------
 # Config via environment variables (works with `modal serve` and `modal deploy`)
 # ---------------------------------------------------------------------------
-BASE_MODEL = os.environ.get("BASE_MODEL", "Qwen/Qwen3.5-9B-Base")
+BASE_MODEL = os.environ.get("BASE_MODEL", "Qwen/Qwen3-8B-Base")
 ADAPTER_PATH = os.environ.get("ADAPTER_PATH", "")
 ADAPTER_NAME = os.environ.get("ADAPTER_NAME", "")
 GPU_TYPE = os.environ.get("GPU_TYPE", "A10G")
@@ -76,8 +66,8 @@ MERGED = _is_truthy_env(os.environ.get("MERGED"))
 ENABLE_THINKING = _is_truthy_env(os.environ.get("ENABLE_THINKING"))
 SERVE_STARTUP_TIMEOUT_SECONDS = int(os.environ.get("SERVE_STARTUP_TIMEOUT_SECONDS", "1800"))
 VLLM_PACKAGE_SPEC = os.environ.get("VLLM_PACKAGE_SPEC", "vllm==0.18.0")
-SERVE_TRANSFORMERS_SPEC = os.environ.get("SERVE_TRANSFORMERS_SPEC", "transformers==5.2.0")
-QWEN_COMPAT_MODE = _should_enable_qwen_compat_mode(BASE_MODEL, os.environ.get("QWEN_COMPAT_MODE"))
+SERVE_TRANSFORMERS_SPEC = os.environ.get("SERVE_TRANSFORMERS_SPEC", "transformers>=4.56.0,<5")
+SERVE_FORCE_BUILD = _is_truthy_env(os.environ.get("SERVE_FORCE_BUILD"))
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -92,10 +82,13 @@ HF_SECRET = modal.Secret.from_name("huggingface-secret")
 MODEL_CACHE_VOLUME = modal.Volume.from_name("trl-model-cache", create_if_missing=True)
 CHECKPOINTS_VOLUME = modal.Volume.from_name("trl-checkpoints", create_if_missing=True)
 
-serve_image = (
-    modal.Image.debian_slim(python_version="3.11")
-    .uv_pip_install(VLLM_PACKAGE_SPEC, SERVE_TRANSFORMERS_SPEC, "huggingface_hub")
-    .env(
+def _build_serve_image():
+    return modal.Image.debian_slim(python_version="3.11").uv_pip_install(
+        VLLM_PACKAGE_SPEC,
+        SERVE_TRANSFORMERS_SPEC,
+        "huggingface_hub",
+        force_build=SERVE_FORCE_BUILD,
+    ).env(
         {
             "HF_HOME": str(MODEL_CACHE_DIR / "huggingface"),
             "TRANSFORMERS_CACHE": str(MODEL_CACHE_DIR / "transformers"),
@@ -108,10 +101,11 @@ serve_image = (
             "SERVE_STARTUP_TIMEOUT_SECONDS": str(SERVE_STARTUP_TIMEOUT_SECONDS),
             "VLLM_PACKAGE_SPEC": VLLM_PACKAGE_SPEC,
             "SERVE_TRANSFORMERS_SPEC": SERVE_TRANSFORMERS_SPEC,
-            "QWEN_COMPAT_MODE": "1" if QWEN_COMPAT_MODE else "0",
         }
     )
-)
+
+
+serve_image = _build_serve_image()
 
 app = modal.App(APP_NAME)
 
@@ -121,7 +115,7 @@ app = modal.App(APP_NAME)
 # ---------------------------------------------------------------------------
 
 def _derive_adapter_name(adapter_path: str) -> str:
-    """Derive a short adapter name from the path, e.g. 'experiments/qwen3.5-9b-sft/final_adapter' -> 'qwen3.5-9b-sft'."""
+    """Derive a short adapter name from the path, e.g. 'experiments/qwen3-8b-sft/final_adapter' -> 'qwen3-8b-sft'."""
     parts = Path(adapter_path).parts
     # If the path looks like experiments/<name>/final_adapter, use <name>
     if len(parts) >= 2 and parts[-1] in ("final_adapter", "merged"):
@@ -131,13 +125,8 @@ def _derive_adapter_name(adapter_path: str) -> str:
 
 def _get_runtime_config() -> dict[str, str | int | bool]:
     """Read serving config from the container environment."""
-    base_model = os.environ.get("BASE_MODEL", BASE_MODEL)
-    qwen_compat_mode = _should_enable_qwen_compat_mode(
-        base_model,
-        os.environ.get("QWEN_COMPAT_MODE"),
-    )
     return {
-        "base_model": base_model,
+        "base_model": os.environ.get("BASE_MODEL", BASE_MODEL),
         "adapter_path": os.environ.get("ADAPTER_PATH", ADAPTER_PATH),
         "adapter_name": os.environ.get("ADAPTER_NAME", ADAPTER_NAME),
         "max_model_len": int(os.environ.get("MAX_MODEL_LEN", str(MAX_MODEL_LEN))),
@@ -149,10 +138,9 @@ def _get_runtime_config() -> dict[str, str | int | bool]:
         ),
         "vllm_package_spec": os.environ.get("VLLM_PACKAGE_SPEC", VLLM_PACKAGE_SPEC),
         "transformers_spec": os.environ.get("SERVE_TRANSFORMERS_SPEC", SERVE_TRANSFORMERS_SPEC),
-        "qwen_compat_mode": qwen_compat_mode,
-        "language_model_only": qwen_compat_mode,
-        "model_impl": "transformers" if qwen_compat_mode else "auto",
-        "vllm_use_v1": "0" if qwen_compat_mode else "default",
+        "model_impl": "auto",
+        "vllm_use_v1": "default",
+        "language_model_only": False,
     }
 
 
@@ -165,7 +153,6 @@ def _build_vllm_cmd() -> list[str]:
     max_model_len = int(config["max_model_len"])
     merged = bool(config["merged"])
     enable_thinking = bool(config["enable_thinking"])
-    qwen_compat_mode = bool(config["qwen_compat_mode"])
     served_model_name = (adapter_name or _derive_adapter_name(adapter_path)) if adapter_path else base_model
 
     if merged:
@@ -178,9 +165,6 @@ def _build_vllm_cmd() -> list[str]:
     else:
         model = base_model
 
-    if qwen_compat_mode and not merged:
-        raise ValueError("Qwen compatibility mode requires MERGED=1 so serving uses the merged model directory.")
-
     cmd = [
         "python", "-m", "vllm.entrypoints.openai.api_server",
         "--model", model,
@@ -192,8 +176,6 @@ def _build_vllm_cmd() -> list[str]:
         "--trust-remote-code",
         "--default-chat-template-kwargs", json.dumps({"enable_thinking": enable_thinking}),
     ]
-    if qwen_compat_mode:
-        cmd += ["--language-model-only", "--model-impl", "transformers"]
 
     # Add LoRA flags for non-merged adapter serving
     if not merged and adapter_path:
@@ -211,9 +193,9 @@ def _build_vllm_cmd() -> list[str]:
 
 def _build_vllm_env() -> dict[str, str]:
     env = dict(os.environ)
-    config = _get_runtime_config()
-    if bool(config["qwen_compat_mode"]):
-        env["VLLM_USE_V1"] = "0"
+    # These are build/runtime policy markers for our wrapper, not vLLM env vars.
+    env.pop("VLLM_PACKAGE_SPEC", None)
+    env.pop("SERVE_TRANSFORMERS_SPEC", None)
     return env
 
 
@@ -248,6 +230,12 @@ def serve():
     except Exception as exc:
         print(f"Unable to import transformers for version logging: {exc}", flush=True)
     try:
+        import huggingface_hub
+
+        print(f"huggingface_hub version: {huggingface_hub.__version__}", flush=True)
+    except Exception as exc:
+        print(f"Unable to import huggingface_hub for version logging: {exc}", flush=True)
+    try:
         import vllm
 
         print(f"vLLM version: {vllm.__version__}", flush=True)
@@ -258,7 +246,7 @@ def serve():
     print(
         "Resolved serving runtime policy: "
         f"vllm={config['vllm_package_spec']}, transformers={config['transformers_spec']}, "
-        f"compat={config['qwen_compat_mode']}, model_impl={config['model_impl']}, "
+        f"model_impl={config['model_impl']}, "
         f"language_model_only={config['language_model_only']}, VLLM_USE_V1={child_env.get('VLLM_USE_V1', 'default')}",
         flush=True,
     )
@@ -282,7 +270,6 @@ def main():
     print(f"  MERGED:        {MERGED}")
     print(f"  VLLM_PACKAGE_SPEC: {VLLM_PACKAGE_SPEC}")
     print(f"  SERVE_TRANSFORMERS_SPEC: {SERVE_TRANSFORMERS_SPEC}")
-    print(f"  QWEN_COMPAT_MODE: {QWEN_COMPAT_MODE}")
     print(f"  STARTUP_TIMEOUT_SECONDS: {SERVE_STARTUP_TIMEOUT_SECONDS}")
     print()
     print("Use `modal serve` to start the vLLM server:")

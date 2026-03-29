@@ -22,8 +22,8 @@ const LOG_PREFIX = "[posttraining-spec-compiler]";
 const TRANSIENT_STATUS_CODES = new Set([408, 409, 429, 500, 502, 503, 504]);
 
 const DEFAULT_BASE_MODEL = {
-  model_id: "Qwen/Qwen3.5-9B-Base",
-  revision: "2d021f1887f1fe402bf2c53ed69d7f0fc4709ec9",
+  model_id: "Qwen/Qwen3-8B-Base",
+  revision: "7b8a267e13df1a9427e7dfa2691f69a417c58d94",
 };
 
 const DEFAULT_TRAINING_PARAMS = {
@@ -101,10 +101,10 @@ function normalizeOptionalString(value) {
 function normalizeSourceSplitList(value, fallbackSplit = null) {
   const normalized = Array.isArray(value)
     ? uniqueStrings(
-        value
-          .map((split) => normalizeOptionalString(split))
-          .filter(Boolean),
-      )
+      value
+        .map((split) => normalizeOptionalString(split))
+        .filter(Boolean),
+    )
     : [];
 
   if (normalized.length > 0) {
@@ -118,7 +118,7 @@ function normalizeSourceSplitList(value, fallbackSplit = null) {
 export function getCompilerOverridesConfigPath() {
   return path.resolve(
     normalizeOptionalString(process.env.POSTTRAINING_COMPILER_OVERRIDES_PATH) ??
-      "backend/posttraining-spec-compiler.overrides.yaml",
+    "backend/posttraining-spec-compiler.overrides.yaml",
   );
 }
 
@@ -304,7 +304,7 @@ function buildEvaluationPlan(taskRequirements, numTrainEpochs = 1.0) {
     strategy: "merged_sft_holdout",
     holdout_fraction: resolveMergedSftHoldoutFraction(numTrainEpochs),
     deterministic_seed: 42,
-    comparison_max_examples: DEFAULT_COMPARISON_MAX_EXAMPLES,
+    comparison_max_examples: 15,
     include_test_split_in_source_pool: true,
     split_style:
       taskRequirements.task_family === "classification"
@@ -418,8 +418,8 @@ function buildTrainingEstimate(spec) {
   );
   const holdoutFraction =
     typeof spec.evaluation_plan?.holdout_fraction === "number" &&
-    spec.evaluation_plan.holdout_fraction > 0 &&
-    spec.evaluation_plan.holdout_fraction < 1
+      spec.evaluation_plan.holdout_fraction > 0 &&
+      spec.evaluation_plan.holdout_fraction < 1
       ? spec.evaluation_plan.holdout_fraction
       : DEFAULT_MERGED_SFT_HOLDOUT_FRACTION;
   const estimatedEvalExamples = usesHoldout
@@ -704,13 +704,13 @@ function normalizeCandidate(candidate) {
     source_schema:
       candidate.source_schema && typeof candidate.source_schema === "object"
         ? {
-            available_columns: Array.isArray(candidate.source_schema.available_columns)
-              ? uniqueStrings(candidate.source_schema.available_columns.map((value) => String(value).trim()))
-              : [],
-            sample_rows: Array.isArray(candidate.source_schema.sample_rows)
-              ? candidate.source_schema.sample_rows
-              : [],
-          }
+          available_columns: Array.isArray(candidate.source_schema.available_columns)
+            ? uniqueStrings(candidate.source_schema.available_columns.map((value) => String(value).trim()))
+            : [],
+          sample_rows: Array.isArray(candidate.source_schema.sample_rows)
+            ? candidate.source_schema.sample_rows
+            : [],
+        }
         : { available_columns: [], sample_rows: [] },
     preferred_dataset_config: normalizeOptionalString(candidate.preferred_dataset_config),
     preferred_train_split: normalizeOptionalString(candidate.preferred_train_split) ?? "train",
@@ -749,24 +749,24 @@ function normalizeCompilerInput(rawInput, contextOverride = null) {
   const baseContext =
     rawInput && typeof rawInput === "object" && !Array.isArray(rawInput)
       ? {
-          analysis:
-            rawInput.analysis && typeof rawInput.analysis === "object" ? rawInput.analysis : {},
-          recommendation_guidance:
-            rawInput.recommendation_guidance && typeof rawInput.recommendation_guidance === "object"
-              ? rawInput.recommendation_guidance
-              : {},
-          task_spec:
-            rawInput.task_spec && typeof rawInput.task_spec === "object" ? rawInput.task_spec : null,
-          search_queries: Array.isArray(rawInput.search_queries) ? rawInput.search_queries : [],
-          ranking_criteria: Array.isArray(rawInput.ranking_criteria) ? rawInput.ranking_criteria : [],
-        }
+        analysis:
+          rawInput.analysis && typeof rawInput.analysis === "object" ? rawInput.analysis : {},
+        recommendation_guidance:
+          rawInput.recommendation_guidance && typeof rawInput.recommendation_guidance === "object"
+            ? rawInput.recommendation_guidance
+            : {},
+        task_spec:
+          rawInput.task_spec && typeof rawInput.task_spec === "object" ? rawInput.task_spec : null,
+        search_queries: Array.isArray(rawInput.search_queries) ? rawInput.search_queries : [],
+        ranking_criteria: Array.isArray(rawInput.ranking_criteria) ? rawInput.ranking_criteria : [],
+      }
       : {
-          analysis: {},
-          recommendation_guidance: {},
-          task_spec: null,
-          search_queries: [],
-          ranking_criteria: [],
-        };
+        analysis: {},
+        recommendation_guidance: {},
+        task_spec: null,
+        search_queries: [],
+        ranking_criteria: [],
+      };
 
   const candidates = Array.isArray(rawInput)
     ? rawInput
@@ -1170,8 +1170,7 @@ async function callOpenAISpecPlanner(prompt, specSchema) {
     };
   } catch (error) {
     throw new Error(
-      `OpenAI returned invalid JSON for PostTrainingJobSpec: ${
-        error instanceof Error ? error.message : "unknown parse error"
+      `OpenAI returned invalid JSON for PostTrainingJobSpec: ${error instanceof Error ? error.message : "unknown parse error"
       }`,
     );
   }
@@ -1893,19 +1892,19 @@ export async function runCompiler(args, options = {}) {
     const rawInput = await loadJsonFile(args.inputPath);
     const contextOverride = args.contextPath ? await loadJsonFile(args.contextPath) : null;
     const normalizedInput = normalizeCompilerInput(rawInput, contextOverride);
-  const normalizedTaskSpec = normalizeTaskSpec(normalizedInput.context.task_spec);
-  const sortedCandidates = [...normalizedInput.candidates].sort((left, right) => right.score - left.score);
-  const candidateProfiles = sortedCandidates.slice(0, 8);
+    const normalizedTaskSpec = normalizeTaskSpec(normalizedInput.context.task_spec);
+    const sortedCandidates = [...normalizedInput.candidates].sort((left, right) => right.score - left.score);
+    const candidateProfiles = sortedCandidates.slice(0, 8);
 
-  logUiProgress("I'm loading the training data");
-  logInfo(`loaded ${candidateProfiles.length} ranked dataset candidates from recommendation output`);
-  logUiProgress("I'm checking that the data is ready for training");
-  const candidateDiagnostics = candidateProfiles.map((candidate) => {
+    logUiProgress("I'm loading the training data");
+    logInfo(`loaded ${candidateProfiles.length} ranked dataset candidates from recommendation output`);
+    logUiProgress("I'm checking that the data is ready for training");
+    const candidateDiagnostics = candidateProfiles.map((candidate) => {
       const validationErrors = candidate.normalization_proposal
         ? validateNormalizationProposalShared(
-            candidate.normalization_proposal,
-            candidate.source_schema?.available_columns ?? [],
-          )
+          candidate.normalization_proposal,
+          candidate.source_schema?.available_columns ?? [],
+        )
         : ["candidate is missing a normalization proposal."];
       return {
         candidate,
@@ -1921,9 +1920,8 @@ export async function runCompiler(args, options = {}) {
     if (!usableCandidates.length) {
       const diagnosticMessage = candidateDiagnostics
         .map(({ candidate, validationErrors }) =>
-          `${candidate.dataset}: ${
-            validationErrors.join(" ") ||
-            `not compatible with ${normalizedTaskSpec?.task_family ?? "the requested"} SFT requirements.`
+          `${candidate.dataset}: ${validationErrors.join(" ") ||
+          `not compatible with ${normalizedTaskSpec?.task_family ?? "the requested"} SFT requirements.`
           }`,
         )
         .join(" ; ");
@@ -1938,13 +1936,13 @@ export async function runCompiler(args, options = {}) {
     const generatedJobId = explicitJobId
       ? explicitJobId
       : `${slugify(objectiveSummary || usableCandidates[0].dataset || "job")}-${timestamp}`;
-  const platformConstraints = buildPlatformConstraints(normalizedTaskSpec, args.seedArtifact);
+    const platformConstraints = buildPlatformConstraints(normalizedTaskSpec, args.seedArtifact);
 
-  logUiProgress("I'm putting together the training plan");
-  const { spec, attempts } = await generateValidatedSpec({
-    objectiveSummary,
-    context: normalizedInput.context,
-    candidateProfiles: usableCandidates,
+    logUiProgress("I'm putting together the training plan");
+    const { spec, attempts } = await generateValidatedSpec({
+      objectiveSummary,
+      context: normalizedInput.context,
+      candidateProfiles: usableCandidates,
       platformConstraints,
       seedArtifact: args.seedArtifact,
       jobId: generatedJobId,

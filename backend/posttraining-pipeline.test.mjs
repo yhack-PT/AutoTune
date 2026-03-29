@@ -430,7 +430,7 @@ function buildSpec(datasetId) {
     adaptation_strategy: "lora",
     artifact_strategy: "adapter",
     base_model: {
-      model_id: "Qwen/Qwen3.5-9B-Base",
+      model_id: "Qwen/Qwen3-8B-Base",
       revision: null,
     },
     selected_datasets: [
@@ -475,7 +475,7 @@ function buildGenerationSpec(datasetId) {
     adaptation_strategy: "lora",
     artifact_strategy: "adapter",
     base_model: {
-      model_id: "Qwen/Qwen3.5-9B-Base",
+      model_id: "Qwen/Qwen3-8B-Base",
       revision: null,
     },
     selected_datasets: [
@@ -1274,7 +1274,7 @@ test("spec planner prompt hardcodes one training epoch and sane learning-rate gu
       supported_methods: ["sft"],
       supported_task_families: ["classification"],
       supported_target_policies: ["single_target"],
-      allowed_base_models: [{ model_id: "Qwen/Qwen3.5-9B-Base", revision: null }],
+      allowed_base_models: [{ model_id: "Qwen/Qwen3-8B-Base", revision: null }],
       allowed_compute_gpus: ["A10", "L40S", "H100"],
     },
     jobId: "prompt-test-job",
