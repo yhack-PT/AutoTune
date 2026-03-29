@@ -3,6 +3,7 @@ import {
   spawnPostTrainingOrchestrator,
   validateCreateJobInput,
 } from "@/lib/posttraining-server";
+import { streamVLLM } from "@/lib/vllm-chat";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -47,6 +48,7 @@ type ChatMessage = {
 type RequestBody = {
   messages: ChatMessage[];
   customEndpoint?: string;
+  customModel?: string;
 };
 
 export async function POST(request: Request) {
@@ -88,6 +90,7 @@ export async function POST(request: Request) {
     }
 
     const endpoint = body.customEndpoint;
+    const customModel = typeof body.customModel === "string" ? body.customModel.trim() : "";
     const stream = new ReadableStream({
       async start(controller) {
         const encoder = new TextEncoder();
@@ -95,11 +98,12 @@ export async function POST(request: Request) {
           controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
         }
         try {
-          await streamVLLM(
-            endpoint,
-            body.messages.map((m) => ({ role: m.role, content: m.content })),
+          await streamVLLM({
+            endpointUrl: endpoint,
+            model: customModel || null,
+            messages: body.messages.map((m) => ({ role: m.role, content: m.content })),
             send,
-          );
+          });
           send({ type: "done" });
         } catch (error) {
           const message = error instanceof Error ? error.message : "Unknown error";
@@ -307,65 +311,4 @@ async function streamOpenAI(
     : null;
 
   return { responseId, toolCall };
-}
-
-/**
- * Streams a vLLM Chat Completions API call. The Modal-deployed vLLM endpoint
- * is OpenAI-compatible, so we use the standard chat completions streaming format.
- */
-async function streamVLLM(
-  endpointUrl: string,
-  messages: Array<{ role: string; content: string }>,
-  send: (event: Record<string, unknown>) => void,
-): Promise<void> {
-  const url = `${endpointUrl.replace(/\/+$/, "")}/v1/chat/completions`;
-
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "default",
-      messages,
-      stream: true,
-    }),
-  });
-
-  if (!response.ok) {
-    const text = await response.text().catch(() => "");
-    throw new Error(`vLLM API error ${response.status}: ${text.slice(0, 500)}`);
-  }
-
-  if (!response.body) {
-    throw new Error("vLLM returned no response body.");
-  }
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() || "";
-
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed.startsWith("data: ")) continue;
-      const data = trimmed.slice(6);
-      if (!data || data === "[DONE]") continue;
-
-      try {
-        const chunk = JSON.parse(data);
-        const delta = chunk.choices?.[0]?.delta?.content;
-        if (delta) {
-          send({ type: "text_delta", content: delta });
-        }
-      } catch {
-        // Skip malformed SSE lines
-      }
-    }
-  }
 }

@@ -27,6 +27,7 @@ interface ChatMessage {
   role: "user" | "assistant";
   content: string;
   deploymentUrl?: string;
+  deploymentModel?: string;
   comparisonEvaluation?: ComparisonEvaluationSummary;
 }
 
@@ -153,6 +154,23 @@ function getFailedPipelineStageId(job: {
   }
 
   return String(failedStage.stage);
+}
+
+function getDeploymentLinkInfo(job: {
+  deployment?: Record<string, unknown> | null;
+}): {
+  deploymentUrl: string | null;
+  deploymentModel: string | null;
+} {
+  const deployment =
+    typeof job.deployment === "object" && job.deployment !== null
+      ? job.deployment
+      : null;
+
+  return {
+    deploymentUrl: typeof deployment?.url === "string" ? deployment.url : null,
+    deploymentModel: typeof deployment?.adapterName === "string" ? deployment.adapterName : null,
+  };
 }
 
 // =============================================================================
@@ -357,6 +375,7 @@ export default function ChatPage() {
   const [isProcessSidebarOpen, setIsProcessSidebarOpen] = useState(false);
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
   const [fineTunedEndpoint, setFineTunedEndpoint] = useState<string | null>(null);
+  const [fineTunedModel, setFineTunedModel] = useState<string | null>(null);
   const [activeModel, setActiveModel] = useState<"openai" | "finetuned">("openai");
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const lastStageRef = useRef<string | null>(null);
@@ -478,12 +497,10 @@ export default function ChatPage() {
 
         // Terminal states
         if (job.status === "ready") {
-          const deploymentUrl =
-            job.deployment && typeof job.deployment.url === "string"
-              ? job.deployment.url
-              : null;
+          const { deploymentUrl, deploymentModel } = getDeploymentLinkInfo(job);
           if (deploymentUrl) {
             setFineTunedEndpoint(deploymentUrl);
+            setFineTunedModel(deploymentModel);
           }
           setCompletedStageIds(nextVisibleStageIds);
           setActiveStageIndex(null);
@@ -495,7 +512,12 @@ export default function ChatPage() {
               id: crypto.randomUUID(),
               role: "assistant",
               content: "Your model is ready!",
-              ...(deploymentUrl ? { deploymentUrl } : {}),
+              ...(deploymentUrl
+                ? {
+                    deploymentUrl,
+                    ...(deploymentModel ? { deploymentModel } : {}),
+                  }
+                : {}),
             },
           ]);
           stopPolling();
@@ -543,7 +565,10 @@ export default function ChatPage() {
               content: m.content,
             })),
             ...(activeModel === "finetuned" && fineTunedEndpoint
-              ? { customEndpoint: fineTunedEndpoint }
+              ? {
+                  customEndpoint: fineTunedEndpoint,
+                  ...(fineTunedModel ? { customModel: fineTunedModel } : {}),
+                }
               : {}),
           }),
           signal: controller.signal,
@@ -673,7 +698,7 @@ export default function ChatPage() {
         setIsResponding(false);
       }
     },
-    [activeModel, fineTunedEndpoint],
+    [activeModel, fineTunedEndpoint, fineTunedModel],
   );
 
   const handleSubmit = useCallback(
@@ -784,10 +809,10 @@ export default function ChatPage() {
               <div className="max-w-2xl w-full space-y-5">
                 <div className="text-center space-y-1">
                   <h2 className="text-2xl font-semibold tracking-tight">
-                    What should your AI be an expert at?
+                    What should your model be an expert at?
                   </h2>
                   <p className="text-sm text-muted-foreground max-w-md mx-auto">
-                    Create a custom AI using your documents or example data.
+                    Create a custom model using public datasets.
                   </p>
                 </div>
 
@@ -834,6 +859,7 @@ export default function ChatPage() {
                             setActiveModel("openai");
                           } else {
                             setFineTunedEndpoint(msg.deploymentUrl!);
+                            setFineTunedModel(msg.deploymentModel ?? null);
                             setActiveModel("finetuned");
                           }
                         }}

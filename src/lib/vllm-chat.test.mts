@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 
 import { resolveVLLMModel, streamVLLM } from "./vllm-chat.ts";
 
-function jsonResponse(body, init = {}) {
+function jsonResponse(body: unknown, init: ResponseInit = {}): Response {
   return new Response(JSON.stringify(body), {
     status: 200,
     headers: { "Content-Type": "application/json" },
@@ -11,7 +11,7 @@ function jsonResponse(body, init = {}) {
   });
 }
 
-function sseResponse(chunks) {
+function sseResponse(chunks: unknown[]): Response {
   return new Response(
     chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join(""),
     {
@@ -37,11 +37,14 @@ test("resolveVLLMModel returns the preferred model without querying /v1/models",
 });
 
 test("streamVLLM resolves the served model from /v1/models before calling chat completions", async () => {
-  const seenUrls = [];
-  const seenBodies = [];
-  const streamedEvents = [];
+  const seenUrls: string[] = [];
+  const seenBodies: unknown[] = [];
+  const streamedEvents: Array<Record<string, unknown>> = [];
 
-  const fetchImpl = async (input, init) => {
+  const fetchImpl = async (
+    input: Parameters<typeof fetch>[0],
+    init?: Parameters<typeof fetch>[1],
+  ): Promise<Response> => {
     const url = String(input);
     seenUrls.push(url);
 
@@ -68,7 +71,7 @@ test("streamVLLM resolves the served model from /v1/models before calling chat c
   await streamVLLM({
     endpointUrl: "https://demo.modal.run/",
     messages: [{ role: "user", content: "What is hair loss caused by?" }],
-    send: (event) => {
+    send: (event: Record<string, unknown>) => {
       streamedEvents.push(event);
     },
     fetchImpl,
