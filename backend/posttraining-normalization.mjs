@@ -64,6 +64,13 @@ const COMPLETION_COLUMN_CANDIDATES = [
   "response",
   "output",
   "answer",
+  "summary",
+  "soap",
+  "soap_summary",
+  "clinical_note",
+  "note",
+  "notes",
+  "target",
 ];
 
 const QUESTION_COLUMN_CANDIDATES = [

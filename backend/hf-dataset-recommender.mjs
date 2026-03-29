@@ -15,6 +15,7 @@ import {
   uniqueStrings,
   validateNormalizationProposal,
 } from "./posttraining-normalization.mjs";
+import { emitUiProgress } from "../src/lib/posttraining-progress.mjs";
 
 const HUB_API_URL = "https://huggingface.co/api/datasets";
 const DATASET_VIEWER_URL = "https://datasets-server.huggingface.co";
@@ -59,6 +60,9 @@ const DEFAULT_GUIDANCE = {
   mixing_strategy: "",
   warnings: [],
 };
+
+const SUPPORTED_TASKS_ERROR_MESSAGE =
+  "Only single-target classification and generation SFT jobs are supported right now.";
 
 const DEFAULT_RANKING_CRITERIA = [
   {
@@ -152,11 +156,11 @@ export async function recommendDatasets(input, options = {}) {
         },
         ranked_datasets: [],
         recommended_datasets: [],
-        fatal_error: {
+          fatal_error: {
           code: "unsupported_task",
           message:
             normalizedPlan.task_spec.unsupported_reason ||
-            "Only single-target classification SFT jobs are supported right now.",
+            SUPPORTED_TASKS_ERROR_MESSAGE,
         },
       };
       if (!options.skipDebugWrite) {
@@ -197,7 +201,7 @@ export async function recommendDatasets(input, options = {}) {
             code: "unsupported_task",
             message:
               normalizedPlan.task_spec.unsupported_reason ||
-              "Only single-target classification SFT jobs are supported right now.",
+              SUPPORTED_TASKS_ERROR_MESSAGE,
           },
         };
         if (!options.skipDebugWrite) {
@@ -276,6 +280,7 @@ export async function recommendDatasets(input, options = {}) {
       const previousTimeBudget = normalizeOptionalString(normalizedPlan.analysis?.quality_tier_strategy);
       const retryWarning = buildSmallerTimeBudgetRetryWarning(previousTimeBudget);
       retryWarnings.push(retryWarning);
+      logUiProgress("I'm narrowing the search to find a better match");
       logInfo("no compatible candidates found; retrying planning with a smaller inferred run-time budget");
       normalizedPlan = await createPlanFromUserInputs(input, options, {
         retry_reason: "no_compatible_candidates",
@@ -412,6 +417,7 @@ async function createPlanFromUserInputs(input, options = {}, planningHints = {})
 
   await ensureDotEnvLoaded();
   logJson("validated text input", normalizedInput);
+  logUiProgress("I'm figuring out what kind of data this model needs");
 
   const apiKey = normalizeOptionalString(process.env.OPENAI_API_KEY);
   if (!apiKey) {
@@ -445,6 +451,7 @@ async function createPlanFromUserInputs(input, options = {}, planningHints = {})
       },
     },
   };
+  logUiProgress("I'm planning where to search for training data");
   logInfo(`creating search plan with OpenAI model ${model}`);
   logMultiline("openai prompt", prompt);
 
@@ -506,6 +513,7 @@ async function executeRecommendationAttempt(plan, options = {}) {
       : discoverCandidates(context)
   );
   logInfo(`discovered ${discoveredCandidates.length} candidate datasets before enrichment`);
+  logUiProgress("I'm reviewing the most promising dataset options");
   const enrichedCandidates = await (
     typeof options.enrichCandidates === "function"
       ? options.enrichCandidates(discoveredCandidates, context, options)
@@ -553,12 +561,78 @@ function looksLikeClassificationRequest(inputText) {
   return /\bclassif(?:y|ication|ies|ied)\b/i.test(String(inputText ?? ""));
 }
 
-function buildObjectiveSummary(rawInput, selectedTargetFocus) {
+function isClassificationTaskSpec(taskSpec) {
+  return normalizeOptionalString(taskSpec?.task_family) === "classification";
+}
+
+function isGenerationTaskSpec(taskSpec) {
+  return normalizeOptionalString(taskSpec?.task_family) === "generation";
+}
+
+function buildClassificationObjectiveSummary(rawInput, selectedTargetFocus) {
   const domain = normalizeOptionalString(rawInput?.domain);
   if (domain) {
     return `Classify ${domain} examples by ${selectedTargetFocus}.`;
   }
   return `Classify examples by ${selectedTargetFocus}.`;
+}
+
+function inferCompatibilityForTask(taskSpec, normalizationProposal, selectedTargetColumn, fallbackReason) {
+  const shape = normalizeOptionalString(normalizationProposal?.shape);
+  const normalizedTargetColumn = normalizeOptionalString(selectedTargetColumn);
+
+  if (isClassificationTaskSpec(taskSpec)) {
+    if (shape === "prompt_completion" && normalizedTargetColumn) {
+      return {
+        compatible: true,
+        reason: fallbackReason || "Candidate is compatible with classification SFT requirements.",
+      };
+    }
+    if (!shape) {
+      return {
+        compatible: false,
+        reason: fallbackReason || "No supported normalization proposal could be inferred for this dataset.",
+      };
+    }
+    if (shape !== "prompt_completion") {
+      return {
+        compatible: false,
+        reason: `Candidate normalizes to '${shape}', but classification SFT requires prompt_completion examples.`,
+      };
+    }
+    return {
+      compatible: false,
+      reason: "Candidate is missing a selected target column for classification SFT.",
+    };
+  }
+
+  if (isGenerationTaskSpec(taskSpec)) {
+    if (shape === "text") {
+      return {
+        compatible: true,
+        reason: fallbackReason || "Candidate is compatible with raw-text generation SFT requirements.",
+      };
+    }
+    if (shape === "prompt_completion") {
+      return {
+        compatible: true,
+        reason:
+          fallbackReason ||
+          "Candidate is compatible with paired prompt/completion generation SFT requirements.",
+      };
+    }
+    return {
+      compatible: false,
+      reason:
+        fallbackReason ||
+        "No supported raw-text normalization proposal could be inferred for this dataset.",
+    };
+  }
+
+  return {
+    compatible: false,
+    reason: fallbackReason || "Task family is not supported by the current backend.",
+  };
 }
 
 export function coerceTaskSpecForRawInput(plan, rawInput) {
@@ -584,7 +658,7 @@ export function coerceTaskSpecForRawInput(plan, rawInput) {
       task_family: "classification",
       target_policy: "single_target",
       output_shape_preference: "prompt_completion",
-      objective_summary: buildObjectiveSummary(normalizedInput, selectedTargetFocus),
+      objective_summary: buildClassificationObjectiveSummary(normalizedInput, selectedTargetFocus),
       selected_target_focus: selectedTargetFocus,
       requested_targets: requestedTargets,
       task_warnings: uniqueStrings([...(plan.task_spec.task_warnings ?? []), warning]),
@@ -683,13 +757,15 @@ function buildOpenAIPlanningPrompt(input, planningHints = {}) {
         : null,
       "Retry with a smaller inferred run-time budget than before.",
       "Reduce the required data volume and simplify the plan enough to improve the odds of finding compatible datasets.",
-      "Prefer more common, public, clearly classifiable datasets if needed.",
+      "Prefer more common, public, clearly structured text datasets if needed.",
     ]
     : [];
 
   const promptLines = [
     "Create a Hugging Face dataset search plan for post-training a language model.",
-    "This backend v1 supports only single-target classification SFT jobs.",
+    "This backend v1 supports two SFT task families.",
+    "classification = finite-label prediction with prompt/completion examples and one selected target column.",
+    "generation = open-ended behavior, source-to-target generation, summarization, or domain adaptation using either raw text datasets or prompt/completion pairs.",
     `User request: ${input.description}`,
     ...retryLines,
     "Infer a reasonable end-to-end run-time budget directly from the user's request.",
@@ -706,8 +782,13 @@ function buildOpenAIPlanningPrompt(input, planningHints = {}) {
     "Do not describe analysis.quality_tier_strategy in terms of row counts, corpus size, or number of datasets.",
     "Keep mapped_task_types narrowly focused on the main fine-tuning objective, usually 1-2 task types.",
     "Keep warnings focused on practical dataset-selection risks.",
+    "Use classification only when the user wants explicit label prediction or category assignment.",
+    "Use generation for tutor, expert, writer, assistant, style, tone, behavior, summarization, translation, or other open-ended response tasks.",
+    "For classification, set task_spec.target_policy to 'single_target' and output_shape_preference to 'prompt_completion'.",
+    "For generation, set task_spec.target_policy to 'none'. Use output_shape_preference 'prompt_completion' for source-to-target, instruction-following, or summarization tasks, and 'text' for open-ended style, tone, role, or domain adaptation tasks.",
     "If the request mentions multiple classification targets, choose one primary target to optimize for, keep task_spec.supported=true, and record a warning plus the selected_target_focus.",
-    "Set task_spec.supported=false only when the request is non-classification or otherwise cannot be reduced to a single-target classification SFT job.",
+    "Do not force open-ended behavior requests into classification.",
+    "Set task_spec.supported=false only when the request cannot reasonably be handled as either single-target classification or generation SFT.",
   ];
 
   return promptLines.filter(Boolean).join("\n");
@@ -725,15 +806,15 @@ function getOpenAIPlanSchema() {
           supported: { type: "boolean" },
           task_family: {
             type: "string",
-            enum: ["classification", "unsupported"],
+            enum: ["classification", "generation", "unsupported"],
           },
           target_policy: {
             type: "string",
-            enum: ["single_target", "unsupported"],
+            enum: ["single_target", "none", "unsupported"],
           },
           output_shape_preference: {
             type: "string",
-            enum: ["prompt_completion", "unsupported"],
+            enum: ["prompt_completion", "text", "unsupported"],
           },
           objective_summary: { type: "string" },
           selected_target_focus: { type: ["string", "null"] },
@@ -912,6 +993,7 @@ async function discoverCandidates(context) {
 
   await Promise.all(
     context.search_queries.map(async (query) => {
+      logUiProgress("I'm searching through different datasets that could fit this request");
       logJson("searching HF datasets for query", query);
       const datasets = await searchHubDatasets(query);
       logInfo(`HF search "${query.search}" returned ${datasets.length} unique candidates`);
@@ -1022,6 +1104,7 @@ function buildSearchVariants(searchText) {
 async function enrichCandidates(candidates, context, options = {}) {
   logInfo(`starting enrichment for ${candidates.length} candidates`);
   return mapWithConcurrency(candidates, ENRICHMENT_CONCURRENCY, async (candidate) => {
+    logUiProgress("I'm checking sample records from a few promising datasets");
     logInfo(`enriching dataset ${candidate.id}`);
     const warnings = [];
 
@@ -1040,8 +1123,18 @@ async function enrichCandidates(candidates, context, options = {}) {
     const viewerAccessible =
       validity && !validity.error && (validity.viewer === true || validity.preview === true);
 
-    const sizePayload = await fetchViewerEndpoint("/size", { dataset: candidate.id }).catch(() => null);
-    const sizeInfo = parseSizeInfo(sizePayload);
+    let sizeRequestFailed = false;
+    const sizePayload = await fetchViewerEndpoint("/size", { dataset: candidate.id }).catch(() => {
+      sizeRequestFailed = true;
+      return null;
+    });
+    const fallbackNumRows = inferNumRowsFromHubCardData(candidate.cardData);
+    const sizeInfo = parseSizeInfo(sizePayload, fallbackNumRows);
+    if (sizeRequestFailed && fallbackNumRows > 0) {
+      logInfo(
+        `HF viewer /size unavailable for ${candidate.id}; using Hub card metadata row count (${fallbackNumRows}).`,
+      );
+    }
     if (sizeInfo.partial) {
       warnings.push("Dataset size is partial or approximate in the dataset viewer.");
     }
@@ -1051,6 +1144,7 @@ async function enrichCandidates(candidates, context, options = {}) {
     const previewTarget = choosePreviewTarget(splitsInfo.rawSplits);
     const preferredTrainSplit = selectPreferredTrainSplit(splitsInfo.rawSplits);
     const preferredEvalSplit = selectPreferredEvalSplit(splitsInfo.rawSplits);
+    const sourceSplits = resolveSourceSplits(splitsInfo.rawSplits, preferredTrainSplit);
 
     let schemaPreview = null;
     if (viewerAccessible && previewTarget) {
@@ -1087,7 +1181,6 @@ async function enrichCandidates(candidates, context, options = {}) {
       textOnlySourceSchema.sample_rows,
     );
 
-    let compatibilityStatus = directCompatibility.compatibility_status;
     let compatibilityReason = directCompatibility.compatibility_reason;
     let normalizationProposal = directCompatibility.normalization_proposal;
     let normalizationSource = normalizationProposal ? "deterministic" : null;
@@ -1123,7 +1216,6 @@ async function enrichCandidates(candidates, context, options = {}) {
       );
       if (gptNormalization?.normalization_proposal && proposalErrors.length === 0) {
         normalizationProposal = gptNormalization.normalization_proposal;
-        compatibilityStatus = "compatible";
         compatibilityReason = gptNormalization.compatibility_reason;
         normalizationSource = "openai";
         selectedTargetColumn = normalizeOptionalString(gptNormalization.selected_target_column);
@@ -1148,10 +1240,12 @@ async function enrichCandidates(candidates, context, options = {}) {
     }
 
     const compatibleMethods = inferCompatibleMethodsFromNormalization(normalizationProposal);
-    const classificationCompatible =
-      context.task_spec?.task_family === "classification" &&
-      normalizationProposal?.shape === "prompt_completion" &&
-      normalizeOptionalString(selectedTargetColumn);
+    const taskCompatibility = inferCompatibilityForTask(
+      context.task_spec,
+      normalizationProposal,
+      selectedTargetColumn,
+      compatibilityReason,
+    );
     const license = extractLicense(candidate);
 
     if (!license) {
@@ -1178,18 +1272,13 @@ async function enrichCandidates(candidates, context, options = {}) {
       preferred_dataset_config: normalizeOptionalString(preferredTrainSplit?.config) ?? null,
       preferred_train_split: normalizeOptionalString(preferredTrainSplit?.split) ?? "train",
       preferred_eval_split: normalizeOptionalString(preferredEvalSplit?.split),
+      source_splits: sourceSplits,
       compatibility_status:
-        compatibleMethods.length > 0 && classificationCompatible ? "compatible" : "incompatible",
-      compatibility_reason:
-        compatibleMethods.length > 0 && classificationCompatible
-          ? compatibilityReason
-          : context.task_spec?.task_family === "classification"
-            ? "Candidate is not compatible with single-target classification SFT requirements."
-            : compatibilityReason ||
-            "No supported normalization proposal could be inferred for this dataset.",
+        compatibleMethods.length > 0 && taskCompatibility.compatible ? "compatible" : "incompatible",
+      compatibility_reason: taskCompatibility.reason,
       normalization_source: normalizationSource,
       normalization_proposal: normalizationProposal,
-      compatible_methods: classificationCompatible ? compatibleMethods : [],
+      compatible_methods: taskCompatibility.compatible ? compatibleMethods : [],
       license,
       warnings,
     };
@@ -1213,15 +1302,46 @@ async function fetchViewerEndpoint(path, params) {
   return fetchJson(url.toString(), {
     timeoutMs: REQUEST_TIMEOUT_MS,
     maxRetries: 2,
-    requestLabel: `HF viewer ${path}`,
+    requestLabel: buildViewerRequestLabel(path, params),
   });
 }
 
-function parseSizeInfo(payload) {
+function buildViewerRequestLabel(path, params) {
+  const label = [`HF viewer ${path}`];
+  const dataset = normalizeOptionalString(params?.dataset);
+  const config = normalizeOptionalString(params?.config);
+  const split = normalizeOptionalString(params?.split);
+
+  if (dataset) {
+    label.push(`for ${dataset}`);
+  }
+  if (config && split) {
+    label.push(`(${config}/${split})`);
+  } else if (split) {
+    label.push(`(split ${split})`);
+  } else if (config) {
+    label.push(`(config ${config})`);
+  }
+
+  return label.join(" ");
+}
+
+function parseSizeInfo(payload, fallbackNumRows = 0) {
+  const viewerNumRows = toNumber(payload?.size?.dataset?.num_rows);
   return {
-    numRows: toNumber(payload?.size?.dataset?.num_rows),
+    numRows: viewerNumRows > 0 ? viewerNumRows : toNumber(fallbackNumRows),
     partial: Boolean(payload?.partial),
   };
+}
+
+function inferNumRowsFromHubCardData(cardData) {
+  const splits = Array.isArray(cardData?.dataset_info?.splits) ? cardData.dataset_info.splits : [];
+  const totalExamples = splits.reduce((sum, split) => {
+    const numExamples = normalizeNonNegativeInt(split?.num_examples);
+    return numExamples === null ? sum : sum + numExamples;
+  }, 0);
+
+  return totalExamples > 0 ? totalExamples : 0;
 }
 
 function parseSplitsInfo(payload) {
@@ -1232,6 +1352,20 @@ function parseSplitsInfo(payload) {
       rawSplits.map((split) => String(split.split ?? "").toLowerCase().trim()).filter(Boolean),
     ),
   };
+}
+
+function resolveSourceSplits(rawSplits, preferredTrainSplit) {
+  const discoveredSplits = uniqueStrings(
+    (Array.isArray(rawSplits) ? rawSplits : [])
+      .map((split) => normalizeOptionalString(split?.split))
+      .filter(Boolean),
+  );
+  if (discoveredSplits.length > 0) {
+    return discoveredSplits;
+  }
+
+  const fallbackSplit = normalizeOptionalString(preferredTrainSplit?.split) ?? "train";
+  return [fallbackSplit];
 }
 
 function choosePreviewTarget(splits) {
@@ -1380,16 +1514,31 @@ function getNormalizationProposalSchema() {
 }
 
 function buildOpenAINormalizationPrompt(candidate, context, sourceSchema) {
+  const taskSpecificLines = isGenerationTaskSpec(context.task_spec)
+    ? [
+      "This request is for generation SFT.",
+      "Return usable=true only when the schema supports a meaningful deterministic generation normalization.",
+      "Prefer direct prompt/completion normalization for source-to-target, instruction-following, summarization, or transformation datasets.",
+      "Prefer direct text normalization for open-ended style, tone, role, or domain adaptation datasets.",
+      "Do not convert prompt/completion pairs into raw text when direct prompt/completion normalization is available.",
+      "Do not convert conversational `messages` arrays into text for generation SFT v1.",
+      "selected_target_column must be null for generation tasks.",
+    ]
+    : [
+      "This request is for classification SFT.",
+      "When multiple plausible label columns exist, choose one target column and record ambiguity_warnings instead of failing.",
+    ];
+
   return [
-    "Infer a deterministic normalization recipe for a single Hugging Face dataset so a text-only SFT backend can train on it.",
-    "This backend v1 supports only single-target classification SFT jobs.",
+    "Infer a deterministic normalization recipe for a single Hugging Face dataset so the SFT backend can train on it.",
+    "This backend supports both single-target classification SFT and generation SFT with raw-text or prompt/completion normalization.",
     "Do not invent columns.",
     "Use the native dataset field names exactly as provided.",
     "Return usable=false when the schema cannot support a meaningful deterministic text or prompt/completion normalization.",
     "Use template_synthesis only when direct column mapping is impossible.",
     "Do not use image, pixel, scan, DICOM, or other binary/media columns in prompt or completion text.",
     "Avoid likely identifier columns such as ticket ids, customer ids, phone numbers, and other obvious PII unless they are essential.",
-    "When multiple plausible label columns exist, choose one target column and record ambiguity_warnings instead of failing.",
+    ...taskSpecificLines,
     `Objective: ${context.analysis?.domain_summary || ""}`,
     `Task spec: ${JSON.stringify(context.task_spec ?? {})}`,
     `Mapped task types: ${JSON.stringify(context.analysis?.mapped_task_types ?? [])}`,
@@ -1477,8 +1626,9 @@ async function rankCandidatesWithOpenAI(candidates, context) {
   const model =
     normalizeOptionalString(process.env.OPENAI_DATASET_SELECTION_MODEL) ??
     DEFAULT_DATASET_SELECTION_MODEL;
-  const rankingInput = buildOpenAIRankingInput(candidates, context);
+  const rankingInput = buildOpenAIRankingInput(candidates);
   const prompt = buildOpenAIRankingPrompt(context, rankingInput);
+  logUiProgress("I'm narrowing it down to the best training data");
   logInfo(`selecting recommended datasets from ${candidates.length} candidates with OpenAI model ${model}`);
   logMultiline("openai dataset-selection prompt", prompt);
 
@@ -1555,7 +1705,7 @@ async function rankCandidatesWithOpenAI(candidates, context) {
   return ranked;
 }
 
-function buildOpenAIRankingInput(candidates, context) {
+function buildOpenAIRankingInput(candidates) {
   return candidates.map((candidate) => ({
     dataset: candidate.id,
     source_url: candidate.source_url,
@@ -1590,6 +1740,18 @@ function buildOpenAIRankingInput(candidates, context) {
 }
 
 function buildOpenAIRankingPrompt(context, rankingInput) {
+  const taskSpecificLines = isGenerationTaskSpec(context.task_spec)
+    ? [
+      "Prefer prompt/completion datasets when the task is a source-to-target transformation, instruction-following task, or summarization task.",
+      "Prefer raw-text datasets when the task is primarily style adaptation, role adaptation, or open-ended domain adaptation without explicit targets.",
+      "Prefer datasets whose normalized inputs and targets closely match the requested behavior and output format.",
+      "selected_target_column is not relevant for generation tasks.",
+    ]
+    : [
+      "Prefer candidates with an explicit selected_target_column and lower ambiguity.",
+      "Prefer deterministic direct normalization over template_synthesis when task fit is otherwise similar.",
+    ];
+
   return [
     "Choose the smallest useful set of already-fetched Hugging Face datasets for the user's post-training use case.",
     "Use only the provided candidates. Do not invent new dataset ids.",
@@ -1598,8 +1760,7 @@ function buildOpenAIRankingPrompt(context, rankingInput) {
     "Do not return more than 3 datasets.",
     "Prefer domain relevance, task/schema fit, target row-band fit, public usability, license clarity, and overall data usefulness.",
     "Only choose candidates whose compatibility_status is compatible.",
-    "Prefer candidates with an explicit selected_target_column and lower ambiguity.",
-    "Prefer deterministic direct normalization over template_synthesis when task fit is otherwise similar.",
+    ...taskSpecificLines,
     "The candidates have already been fetched from Hugging Face; you are only choosing the recommended set.",
     `Task spec: ${JSON.stringify(context.task_spec)}`,
     `Analysis: ${JSON.stringify(context.analysis)}`,
@@ -1679,6 +1840,7 @@ function mergeOpenAIRanking(candidates, ranking, context) {
       preferred_dataset_config: candidate.preferred_dataset_config ?? null,
       preferred_train_split: candidate.preferred_train_split ?? "train",
       preferred_eval_split: candidate.preferred_eval_split ?? null,
+      source_splits: Array.isArray(candidate.source_splits) ? candidate.source_splits : candidate.splits,
       warnings: uniqueStrings([...(candidate.warnings ?? []), ...(rankedCandidate.warnings ?? [])]),
     });
     seen.add(rankedCandidate.dataset);
@@ -1706,8 +1868,8 @@ function buildRecommendationGuidance(rankedDatasets, plan) {
     target_total_rows: plan.recommendation_guidance.target_total_rows,
     mixing_strategy:
       selectedCount > 0
-        ? inferMixingStrategy(rankedDatasets, plan)
-        : plan.recommendation_guidance.mixing_strategy || inferMixingStrategy(rankedDatasets, plan),
+        ? inferMixingStrategy(rankedDatasets)
+        : plan.recommendation_guidance.mixing_strategy || inferMixingStrategy(rankedDatasets),
     warnings: mergedWarnings,
   };
 }
@@ -1717,7 +1879,7 @@ function inferIdealDatasetCount(rankedDatasets) {
   return Math.min(3, rankedDatasets.length);
 }
 
-function inferMixingStrategy(rankedDatasets, plan) {
+function inferMixingStrategy(rankedDatasets) {
   if (rankedDatasets.length === 0) {
     return "No strong public candidates were found, so start with the top GPT-generated search query and refine the prompt or filters.";
   }
@@ -1826,18 +1988,6 @@ function datasetIdentityTokens(repo) {
 
 function normalizeRepoIdentity(repo) {
   return normalizeText(repo).replace(/[\s_-]+/g, "");
-}
-
-function matchesTask(tags, task) {
-  return (tags ?? []).some((tag) => {
-    const lowerTag = String(tag).toLowerCase();
-    return (
-      lowerTag === task ||
-      lowerTag.includes(task) ||
-      lowerTag === `task_categories:${task}` ||
-      lowerTag.includes(`task_categories:${task}`)
-    );
-  });
 }
 
 function isTransientStatusError(error) {
@@ -1993,19 +2143,6 @@ function tokenize(value) {
   );
 }
 
-function overlapScore(tokens, haystack) {
-  if (!tokens.length || !haystack) return 0;
-
-  let matched = 0;
-  for (const token of tokens) {
-    if (haystack.includes(token)) {
-      matched += 1;
-    }
-  }
-
-  return matched / tokens.length;
-}
-
 function normalizePositiveInt(value) {
   const number = Number(value);
   return Number.isInteger(number) && number > 0 ? number : null;
@@ -2027,6 +2164,14 @@ function logInfo(message) {
     return;
   }
   console.log(`${LOG_PREFIX} ${message}`);
+}
+
+function logUiProgress(message, tone = "normal") {
+  emitUiProgress(activeLogger, {
+    stageId: "recommending",
+    text: message,
+    tone,
+  });
 }
 
 function logJson(label, value) {
@@ -2075,7 +2220,7 @@ function taskSearchLabel(task) {
     case "token-classification":
       return "token classification";
     case "text-generation":
-      return "instruction";
+      return "text generation";
     default:
       return String(task ?? "").replace(/-/g, " ");
   }

@@ -49,6 +49,21 @@ from pathlib import Path
 
 import modal
 
+
+def _is_truthy_env(value: str | None) -> bool:
+    return str(value or "").lower() in ("1", "true", "yes")
+
+
+def _is_qwen_family_base_model(base_model: str) -> bool:
+    return str(base_model or "").strip().startswith("Qwen/")
+
+
+def _should_enable_qwen_compat_mode(base_model: str, explicit_flag: str | None = None) -> bool:
+    if explicit_flag is not None and explicit_flag != "":
+        return _is_truthy_env(explicit_flag)
+    return _is_qwen_family_base_model(base_model)
+
+
 # ---------------------------------------------------------------------------
 # Config via environment variables (works with `modal serve` and `modal deploy`)
 # ---------------------------------------------------------------------------
@@ -57,8 +72,12 @@ ADAPTER_PATH = os.environ.get("ADAPTER_PATH", "")
 ADAPTER_NAME = os.environ.get("ADAPTER_NAME", "")
 GPU_TYPE = os.environ.get("GPU_TYPE", "A10G")
 MAX_MODEL_LEN = int(os.environ.get("MAX_MODEL_LEN", "2048"))
-MERGED = os.environ.get("MERGED", "").lower() in ("1", "true", "yes")
-ENABLE_THINKING = os.environ.get("ENABLE_THINKING", "").lower() in ("1", "true", "yes")
+MERGED = _is_truthy_env(os.environ.get("MERGED"))
+ENABLE_THINKING = _is_truthy_env(os.environ.get("ENABLE_THINKING"))
+SERVE_STARTUP_TIMEOUT_SECONDS = int(os.environ.get("SERVE_STARTUP_TIMEOUT_SECONDS", "1800"))
+VLLM_PACKAGE_SPEC = os.environ.get("VLLM_PACKAGE_SPEC", "vllm==0.18.0")
+SERVE_TRANSFORMERS_SPEC = os.environ.get("SERVE_TRANSFORMERS_SPEC", "transformers==5.2.0")
+QWEN_COMPAT_MODE = _should_enable_qwen_compat_mode(BASE_MODEL, os.environ.get("QWEN_COMPAT_MODE"))
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -75,7 +94,7 @@ CHECKPOINTS_VOLUME = modal.Volume.from_name("trl-checkpoints", create_if_missing
 
 serve_image = (
     modal.Image.debian_slim(python_version="3.11")
-    .uv_pip_install("vllm>=0.11.1", "huggingface_hub")
+    .uv_pip_install(VLLM_PACKAGE_SPEC, SERVE_TRANSFORMERS_SPEC, "huggingface_hub")
     .env(
         {
             "HF_HOME": str(MODEL_CACHE_DIR / "huggingface"),
@@ -86,6 +105,10 @@ serve_image = (
             "MAX_MODEL_LEN": str(MAX_MODEL_LEN),
             "MERGED": "1" if MERGED else "0",
             "ENABLE_THINKING": "1" if ENABLE_THINKING else "0",
+            "SERVE_STARTUP_TIMEOUT_SECONDS": str(SERVE_STARTUP_TIMEOUT_SECONDS),
+            "VLLM_PACKAGE_SPEC": VLLM_PACKAGE_SPEC,
+            "SERVE_TRANSFORMERS_SPEC": SERVE_TRANSFORMERS_SPEC,
+            "QWEN_COMPAT_MODE": "1" if QWEN_COMPAT_MODE else "0",
         }
     )
 )
@@ -106,17 +129,30 @@ def _derive_adapter_name(adapter_path: str) -> str:
     # Otherwise use the last path component
     return parts[-1] if parts else "adapter"
 
-
 def _get_runtime_config() -> dict[str, str | int | bool]:
     """Read serving config from the container environment."""
+    base_model = os.environ.get("BASE_MODEL", BASE_MODEL)
+    qwen_compat_mode = _should_enable_qwen_compat_mode(
+        base_model,
+        os.environ.get("QWEN_COMPAT_MODE"),
+    )
     return {
-        "base_model": os.environ.get("BASE_MODEL", BASE_MODEL),
+        "base_model": base_model,
         "adapter_path": os.environ.get("ADAPTER_PATH", ADAPTER_PATH),
         "adapter_name": os.environ.get("ADAPTER_NAME", ADAPTER_NAME),
         "max_model_len": int(os.environ.get("MAX_MODEL_LEN", str(MAX_MODEL_LEN))),
         "merged": os.environ.get("MERGED", "1" if MERGED else "0").lower() in ("1", "true", "yes"),
         "enable_thinking": os.environ.get("ENABLE_THINKING", "1" if ENABLE_THINKING else "0").lower()
         in ("1", "true", "yes"),
+        "serve_startup_timeout_seconds": int(
+            os.environ.get("SERVE_STARTUP_TIMEOUT_SECONDS", str(SERVE_STARTUP_TIMEOUT_SECONDS))
+        ),
+        "vllm_package_spec": os.environ.get("VLLM_PACKAGE_SPEC", VLLM_PACKAGE_SPEC),
+        "transformers_spec": os.environ.get("SERVE_TRANSFORMERS_SPEC", SERVE_TRANSFORMERS_SPEC),
+        "qwen_compat_mode": qwen_compat_mode,
+        "language_model_only": qwen_compat_mode,
+        "model_impl": "transformers" if qwen_compat_mode else "auto",
+        "vllm_use_v1": "0" if qwen_compat_mode else "default",
     }
 
 
@@ -129,6 +165,8 @@ def _build_vllm_cmd() -> list[str]:
     max_model_len = int(config["max_model_len"])
     merged = bool(config["merged"])
     enable_thinking = bool(config["enable_thinking"])
+    qwen_compat_mode = bool(config["qwen_compat_mode"])
+    served_model_name = (adapter_name or _derive_adapter_name(adapter_path)) if adapter_path else base_model
 
     if merged:
         if not adapter_path:
@@ -140,9 +178,13 @@ def _build_vllm_cmd() -> list[str]:
     else:
         model = base_model
 
+    if qwen_compat_mode and not merged:
+        raise ValueError("Qwen compatibility mode requires MERGED=1 so serving uses the merged model directory.")
+
     cmd = [
         "python", "-m", "vllm.entrypoints.openai.api_server",
         "--model", model,
+        "--served-model-name", served_model_name,
         "--host", "0.0.0.0",
         "--port", str(VLLM_PORT),
         "--max-model-len", str(max_model_len),
@@ -150,6 +192,8 @@ def _build_vllm_cmd() -> list[str]:
         "--trust-remote-code",
         "--default-chat-template-kwargs", json.dumps({"enable_thinking": enable_thinking}),
     ]
+    if qwen_compat_mode:
+        cmd += ["--language-model-only", "--model-impl", "transformers"]
 
     # Add LoRA flags for non-merged adapter serving
     if not merged and adapter_path:
@@ -163,6 +207,14 @@ def _build_vllm_cmd() -> list[str]:
         cmd += ["--enable-lora", "--lora-modules", f"{name}={resolved}"]
 
     return cmd
+
+
+def _build_vllm_env() -> dict[str, str]:
+    env = dict(os.environ)
+    config = _get_runtime_config()
+    if bool(config["qwen_compat_mode"]):
+        env["VLLM_USE_V1"] = "0"
+    return env
 
 
 # ---------------------------------------------------------------------------
@@ -182,16 +234,36 @@ def _build_vllm_cmd() -> list[str]:
     secrets=[HF_SECRET],
 )
 @modal.concurrent(max_inputs=100)
-@modal.web_server(port=VLLM_PORT, startup_timeout=600)
+@modal.web_server(port=VLLM_PORT, startup_timeout=SERVE_STARTUP_TIMEOUT_SECONDS)
 def serve():
     MODEL_CACHE_VOLUME.reload()
     CHECKPOINTS_VOLUME.reload()
 
     config = _get_runtime_config()
     print(f"Serving config: {config}", flush=True)
+    try:
+        import transformers
+
+        print(f"Transformers version: {transformers.__version__}", flush=True)
+    except Exception as exc:
+        print(f"Unable to import transformers for version logging: {exc}", flush=True)
+    try:
+        import vllm
+
+        print(f"vLLM version: {vllm.__version__}", flush=True)
+    except Exception as exc:
+        print(f"Unable to import vllm for version logging: {exc}", flush=True)
     cmd = _build_vllm_cmd()
+    child_env = _build_vllm_env()
+    print(
+        "Resolved serving runtime policy: "
+        f"vllm={config['vllm_package_spec']}, transformers={config['transformers_spec']}, "
+        f"compat={config['qwen_compat_mode']}, model_impl={config['model_impl']}, "
+        f"language_model_only={config['language_model_only']}, VLLM_USE_V1={child_env.get('VLLM_USE_V1', 'default')}",
+        flush=True,
+    )
     print(f"Starting vLLM: {' '.join(cmd)}", flush=True)
-    subprocess.Popen(cmd, stdout=sys.stdout, stderr=sys.stderr)
+    subprocess.Popen(cmd, stdout=sys.stdout, stderr=sys.stderr, env=child_env)
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +280,10 @@ def main():
     print(f"  GPU_TYPE:      {GPU_TYPE}")
     print(f"  MAX_MODEL_LEN: {MAX_MODEL_LEN}")
     print(f"  MERGED:        {MERGED}")
+    print(f"  VLLM_PACKAGE_SPEC: {VLLM_PACKAGE_SPEC}")
+    print(f"  SERVE_TRANSFORMERS_SPEC: {SERVE_TRANSFORMERS_SPEC}")
+    print(f"  QWEN_COMPAT_MODE: {QWEN_COMPAT_MODE}")
+    print(f"  STARTUP_TIMEOUT_SECONDS: {SERVE_STARTUP_TIMEOUT_SECONDS}")
     print()
     print("Use `modal serve` to start the vLLM server:")
     print(f"  ADAPTER_PATH=experiments/your-run/final_adapter modal serve backend/modal_vllm_serve.py")

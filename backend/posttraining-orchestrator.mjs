@@ -7,12 +7,24 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { recommendDatasets } from "./hf-dataset-recommender.mjs";
 import { runCompiler } from "./posttraining-spec-compiler.mjs";
+import {
+  buildTrainingMetricGraphArtifacts,
+  parseStructuredTrainingMetricLine,
+} from "./training-metrics.mjs";
+import {
+  buildUiProgressEvent,
+  emitUiProgress,
+} from "../src/lib/posttraining-progress.mjs";
 
 const backendDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(backendDir, "..");
 const jobsRoot = path.join(backendDir, "generated-posttraining-jobs");
 const trainerScriptPath = path.join(backendDir, "modal_trl_posttrain.py");
 const serveScriptPath = path.join(backendDir, "modal_vllm_serve.py");
+const STRUCTURED_LIFECYCLE_EVENT_PREFIX = "PT_LIFECYCLE_EVENT::";
+const DEFAULT_VLLM_PACKAGE_SPEC = "vllm==0.18.0";
+const DEFAULT_SERVE_TRANSFORMERS_SPEC = "transformers==5.2.0";
+const STRUCTURED_PROGRESS_PREFIX = "PT_PROGRESS::";
 
 function nowIso() {
   return new Date().toISOString();
@@ -25,6 +37,33 @@ function sleep(ms) {
 function truncateText(value, maxLength = 500) {
   const text = String(value ?? "");
   return text.length <= maxLength ? text : `${text.slice(0, maxLength - 3)}...`;
+}
+
+function readPositiveIntegerEnv(name, fallback) {
+  const raw = process.env[name];
+  if (raw == null || raw === "") {
+    return fallback;
+  }
+  const parsed = Number.parseInt(String(raw), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function getServeStartupTimeoutSeconds() {
+  return readPositiveIntegerEnv("POSTTRAINING_SERVE_STARTUP_TIMEOUT_SECONDS", 30 * 60);
+}
+
+function getSmokeTestConfig() {
+  const serveStartupTimeoutSeconds = getServeStartupTimeoutSeconds();
+  return {
+    maxAttempts: readPositiveIntegerEnv("POSTTRAINING_SMOKE_TEST_MAX_ATTEMPTS", 12),
+    retryDelayMs: readPositiveIntegerEnv("POSTTRAINING_SMOKE_TEST_RETRY_DELAY_MS", 15_000),
+    initialModelsTimeoutMs: readPositiveIntegerEnv(
+      "POSTTRAINING_SMOKE_TEST_INITIAL_MODELS_TIMEOUT_MS",
+      (serveStartupTimeoutSeconds + 120) * 1000,
+    ),
+    modelsTimeoutMs: readPositiveIntegerEnv("POSTTRAINING_SMOKE_TEST_MODELS_TIMEOUT_MS", 90_000),
+    chatTimeoutMs: readPositiveIntegerEnv("POSTTRAINING_SMOKE_TEST_CHAT_TIMEOUT_MS", 180_000),
+  };
 }
 
 function summarizeData(value, depth = 0) {
@@ -65,6 +104,283 @@ function safeError(error) {
   };
 }
 
+function buildTrainingMetricUiProgress(record) {
+  const step = Number(record?.step);
+  if (!Number.isFinite(step) || step <= 0) {
+    return null;
+  }
+
+  return `I'm training the model (${step} steps completed)`;
+}
+
+function detectTrainingStageUiProgress(line, stage) {
+  const text = String(line ?? "");
+  const structuredProgress = text.startsWith(STRUCTURED_PROGRESS_PREFIX)
+    ? text.slice(STRUCTURED_PROGRESS_PREFIX.length).trim()
+    : null;
+
+  if (structuredProgress?.startsWith("synthesizing_generation_cases ")) {
+    const counts = structuredProgress.slice("synthesizing_generation_cases ".length);
+    return `I'm preparing the evaluation cases (${counts})`;
+  }
+
+  if (structuredProgress?.startsWith("running_baseline_generation_cases ")) {
+    const counts = structuredProgress.slice("running_baseline_generation_cases ".length);
+    return `I'm testing the base model (${counts})`;
+  }
+
+  if (structuredProgress?.startsWith("running_candidate_generation_cases ")) {
+    const counts = structuredProgress.slice("running_candidate_generation_cases ".length);
+    return `I'm testing the tuned model (${counts})`;
+  }
+
+  if (structuredProgress?.startsWith("judging_generation_cases ")) {
+    const counts = structuredProgress.slice("judging_generation_cases ".length);
+    return `I'm comparing the new model with the original model (${counts})`;
+  }
+
+  if (structuredProgress === "preparing_merged_deployment_artifact") {
+    return "I'm packaging the merged model for deployment";
+  }
+
+  if (structuredProgress === "prepared_merged_deployment_artifact") {
+    return "I'm finishing the evaluation artifacts";
+  }
+
+  if (
+    text.includes("Generating train split:") ||
+    text.includes("Preparing ") ||
+    text.includes("Annotating provenance") ||
+    text.includes("Normalizing SFT text dataset")
+  ) {
+    return "I'm getting the training data ready";
+  }
+
+  if (text.includes("Fetching ") && text.includes(" files:")) {
+    return "I'm downloading the model files";
+  }
+
+  if (text.includes("Loading weights:")) {
+    return stage === "evaluating" ? "I'm loading the model for testing" : "I'm loading the model";
+  }
+
+  return null;
+}
+
+function detectDeploymentStageUiProgress(line) {
+  const text = String(line ?? "");
+
+  if (
+    text.startsWith("Building image ") ||
+    text.startsWith("=> Step ") ||
+    text.startsWith("Saving image") ||
+    text.startsWith("Built image ")
+  ) {
+    return "I'm getting the model ready to go live";
+  }
+
+  if (text.includes("✓ Created objects.") || text.includes("✓ App deployed in ")) {
+    return "I'm setting up the live model service";
+  }
+
+  if (text.includes("Created web function serve")) {
+    return "I'm creating the live model link";
+  }
+
+  return null;
+}
+
+function formatSmokeTestProbeLabel(probeId) {
+  switch (String(probeId ?? "")) {
+    case "role_demo":
+      return "style example";
+    case "representative_response":
+      return "real-world example";
+    default:
+      return String(probeId ?? "").replace(/[_-]+/g, " ").trim() || "example";
+  }
+}
+
+function normalizeModalTrainingGpuType(gpuType) {
+  const normalized = String(gpuType ?? "").trim().toUpperCase();
+  if (normalized === "A10" || normalized === "A10G") {
+    return "A10G";
+  }
+  if (normalized === "L40S") {
+    return "L40S";
+  }
+  if (normalized === "H100") {
+    return "H100";
+  }
+  return null;
+}
+
+function isGenerationTaskSpec(taskSpec) {
+  return String(taskSpec?.task_family ?? "").trim().toLowerCase() === "generation";
+}
+
+function isQwenFamilyBaseModel(modelId) {
+  return String(modelId ?? "").startsWith("Qwen/");
+}
+
+export function parseStructuredLifecycleEventLine(line) {
+  const text = String(line ?? "");
+  if (!text.startsWith(STRUCTURED_LIFECYCLE_EVENT_PREFIX)) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(text.slice(STRUCTURED_LIFECYCLE_EVENT_PREFIX.length));
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+export function resolveDeploymentArtifact(trainingResult) {
+  const merged = isQwenFamilyBaseModel(trainingResult?.base_model);
+  const artifactPath = merged ? trainingResult?.merged_dir : trainingResult?.final_adapter_dir;
+  if (!artifactPath) {
+    throw new Error(
+      merged
+        ? "Merged deployment requested but merged_dir was not produced by training."
+        : "Training did not produce final_adapter_dir for deployment.",
+    );
+  }
+  return {
+    merged,
+    path: artifactPath,
+    relativePath: toRelativeAdapterPath(artifactPath),
+  };
+}
+
+function getServePackageSpecs() {
+  return {
+    vllmPackageSpec:
+      process.env.POSTTRAINING_VLLM_PACKAGE_SPEC ||
+      process.env.VLLM_PACKAGE_SPEC ||
+      DEFAULT_VLLM_PACKAGE_SPEC,
+    transformersSpec:
+      process.env.POSTTRAINING_SERVE_TRANSFORMERS_SPEC ||
+      process.env.SERVE_TRANSFORMERS_SPEC ||
+      DEFAULT_SERVE_TRANSFORMERS_SPEC,
+  };
+}
+
+export function resolveDeploymentRuntimePolicy(trainingResult, deploymentArtifact = null) {
+  const artifact = deploymentArtifact ?? resolveDeploymentArtifact(trainingResult);
+  const compatMode = isQwenFamilyBaseModel(trainingResult?.base_model);
+  const packageSpecs = getServePackageSpecs();
+  return {
+    merged: artifact.merged,
+    compatMode,
+    vllmPackageSpec: packageSpecs.vllmPackageSpec,
+    transformersSpec: packageSpecs.transformersSpec,
+    vllmUseV1: compatMode ? "0" : "default",
+    modelImpl: compatMode ? "transformers" : "auto",
+    languageModelOnly: compatMode,
+  };
+}
+
+export function buildDeploymentEnvironment({
+  deploymentAppName,
+  deploymentArtifact,
+  adapterName,
+  trainingResult,
+  compiledConfig,
+  serveGpuType,
+  serveStartupTimeoutSeconds,
+  runtimePolicy = resolveDeploymentRuntimePolicy(trainingResult, deploymentArtifact),
+}) {
+  return {
+    APP_NAME: deploymentAppName,
+    ADAPTER_PATH: deploymentArtifact.relativePath,
+    ADAPTER_NAME: adapterName,
+    BASE_MODEL: trainingResult.base_model,
+    MERGED: deploymentArtifact.merged ? "1" : "0",
+    MAX_MODEL_LEN: String(compiledConfig.max_length ?? 2048),
+    GPU_TYPE: serveGpuType,
+    SERVE_STARTUP_TIMEOUT_SECONDS: String(serveStartupTimeoutSeconds),
+    VLLM_PACKAGE_SPEC: runtimePolicy.vllmPackageSpec,
+    SERVE_TRANSFORMERS_SPEC: runtimePolicy.transformersSpec,
+    QWEN_COMPAT_MODE: runtimePolicy.compatMode ? "1" : "0",
+  };
+}
+
+export function buildDeploymentRecord({
+  deploymentUrl,
+  deploymentAppName,
+  adapterName,
+  deploymentArtifact,
+  trainingResult,
+  serveGpuType,
+  serveStartupTimeoutSeconds,
+  runtimePolicy,
+}) {
+  return {
+    deployedAt: nowIso(),
+    appName: deploymentAppName,
+    url: deploymentUrl,
+    adapterName,
+    adapterPath: deploymentArtifact.relativePath,
+    baseModel: trainingResult.base_model,
+    gpuType: serveGpuType,
+    startupTimeoutSeconds: serveStartupTimeoutSeconds,
+    merged: deploymentArtifact.merged,
+    runtimePolicy,
+  };
+}
+
+function normalizeDescriptionForProbe(description) {
+  return truncateText(String(description ?? "").replace(/\s+/g, " ").trim(), 700);
+}
+
+export function buildGenerationSmokeTestProbes(description) {
+  const objective = normalizeDescriptionForProbe(description) || "Follow the user's requested role and style.";
+
+  return [
+    {
+      id: "role_demo",
+      prompt: [
+        "You are validating a freshly fine-tuned model.",
+        `Target behavior: ${objective}`,
+        "In 3-5 sentences, demonstrate the intended role, tone, and style for a user.",
+        "Do not mention training, system prompts, or evaluation.",
+      ].join("\n\n"),
+      minLength: 40,
+      maxTokens: 160,
+    },
+    {
+      id: "representative_response",
+      prompt: [
+        "You are validating a freshly fine-tuned model.",
+        `Target behavior: ${objective}`,
+        "Write one short representative response that this model might give to a realistic user request in that style.",
+        "Keep it concise but substantive.",
+      ].join("\n\n"),
+      minLength: 40,
+      maxTokens: 200,
+    },
+  ];
+}
+
+function extractChatCompletionText(chatPayload) {
+  const content = chatPayload?.choices?.[0]?.message?.content;
+  if (typeof content === "string") {
+    return content;
+  }
+  if (Array.isArray(content)) {
+    return content
+      .map((item) => (typeof item?.text === "string" ? item.text : ""))
+      .join("")
+      .trim();
+  }
+  if (typeof chatPayload?.choices?.[0]?.text === "string") {
+    return chatPayload.choices[0].text;
+  }
+  return "";
+}
+
 function getJobPaths(jobId) {
   const jobDir = path.join(jobsRoot, jobId);
   return {
@@ -77,7 +393,11 @@ function getJobPaths(jobId) {
     manifestPath: path.join(jobDir, "prepared_dataset_manifest.json"),
     compilerTracePath: path.join(jobDir, "compiler_trace.json"),
     trainingResultPath: path.join(jobDir, "training_result.json"),
+    trainingMetricsPath: path.join(jobDir, "training_metrics.jsonl"),
+    trainingLossGraphPath: path.join(jobDir, "training_loss.svg"),
+    learningRateGraphPath: path.join(jobDir, "learning_rate.svg"),
     evaluationPath: path.join(jobDir, "evaluation_result.json"),
+    comparisonEvaluationPath: path.join(jobDir, "comparison_evaluation.json"),
     deploymentPath: path.join(jobDir, "deployment.json"),
     smokeTestPath: path.join(jobDir, "smoke_test.json"),
   };
@@ -91,6 +411,22 @@ async function readJsonFile(filePath) {
 async function writeJsonFile(filePath, value) {
   await mkdir(path.dirname(filePath), { recursive: true });
   await writeFile(filePath, JSON.stringify(value, null, 2) + "\n", "utf8");
+}
+
+async function readOptionalJsonFile(filePath) {
+  try {
+    return await readJsonFile(filePath);
+  } catch (error) {
+    if (
+      typeof error === "object" &&
+      error !== null &&
+      "code" in error &&
+      error.code === "ENOENT"
+    ) {
+      return null;
+    }
+    throw error;
+  }
 }
 
 async function readJob(jobId) {
@@ -116,29 +452,120 @@ async function appendEvent(jobId, event) {
   return record;
 }
 
+async function appendUiProgressEvent(jobId, stage, text, tone = "normal") {
+  const event = buildUiProgressEvent({
+    stageId: stage,
+    text,
+    tone,
+  });
+  if (!event) {
+    return null;
+  }
+  return appendEvent(jobId, event);
+}
+
 function createStageLogger(jobId, stage) {
+  let currentStage = stage;
+  const lastUiProgressByStage = new Map();
+
+  const handleAppendFailure = (targetStage, error) => {
+    console.error(
+      JSON.stringify({
+        timestamp: nowIso(),
+        jobId,
+        stage: targetStage,
+        level: "error",
+        source: "orchestrator",
+        message: "Failed to append log event.",
+        data: safeError(error),
+      }),
+    );
+  };
+
   return {
+    setStage(nextStage) {
+      currentStage = nextStage;
+    },
+    getStage() {
+      return currentStage;
+    },
+    emitUiProgress(text, tone = "normal", stageOverride = null) {
+      const targetStage = stageOverride ?? currentStage;
+      const event = buildUiProgressEvent({
+        stageId: targetStage,
+        text,
+        tone,
+      });
+      if (!event) {
+        return false;
+      }
+
+      const dedupeKey = `${event.level}:${event.message}`;
+      if (lastUiProgressByStage.get(targetStage) === dedupeKey) {
+        return false;
+      }
+      lastUiProgressByStage.set(targetStage, dedupeKey);
+
+      void appendEvent(jobId, event).catch((error) => {
+        handleAppendFailure(targetStage, error);
+      });
+      return true;
+    },
     emit(payload) {
+      const targetStage = payload.stage ?? currentStage;
       void appendEvent(jobId, {
-        stage,
+        stage: targetStage,
         level: payload.level ?? "info",
         source: payload.source ?? "orchestrator",
         message: payload.message ?? "",
         data: payload.data === undefined ? undefined : summarizeData(payload.data),
       }).catch((error) => {
-        console.error(
-          JSON.stringify({
-            timestamp: nowIso(),
-            jobId,
-            stage,
-            level: "error",
-            source: "orchestrator",
-            message: "Failed to append log event.",
-            data: safeError(error),
-          }),
-        );
+        handleAppendFailure(targetStage, error);
       });
     },
+  };
+}
+
+function emitLoggerUiProgress(logger, text, tone = "normal", stage = null) {
+  if (!text) {
+    return false;
+  }
+
+  if (logger && typeof logger.emitUiProgress === "function") {
+    return logger.emitUiProgress(text, tone, stage);
+  }
+
+  return emitUiProgress(logger, {
+    stageId: stage ?? (typeof logger?.getStage === "function" ? logger.getStage() : null),
+    text,
+    tone,
+  });
+}
+
+async function appendTrainingMetricRecord(jobId, record) {
+  await appendFile(
+    getJobPaths(jobId).trainingMetricsPath,
+    JSON.stringify(record) + "\n",
+    "utf8",
+  );
+}
+
+async function writeTrainingMetricGraphs(jobId, metricRecords) {
+  const jobPaths = getJobPaths(jobId);
+  const bundle = buildTrainingMetricGraphArtifacts(metricRecords);
+
+  for (const artifact of bundle.artifacts) {
+    await writeFile(path.join(jobPaths.jobDir, artifact.filename), artifact.content, "utf8");
+  }
+
+  return {
+    summary: bundle.summary,
+    trainingLossGraphPath: bundle.artifacts.some((artifact) => artifact.filename === "training_loss.svg")
+      ? jobPaths.trainingLossGraphPath
+      : null,
+    learningRateGraphPath: bundle.artifacts.some((artifact) => artifact.filename === "learning_rate.svg")
+      ? jobPaths.learningRateGraphPath
+      : null,
   };
 }
 
@@ -199,6 +626,7 @@ async function failStage(jobId, stage, error) {
     job.errorSummary = details.message;
     return job;
   });
+  await appendUiProgressEvent(jobId, stage, details.message, "error");
   await appendEvent(jobId, {
     stage,
     level: "error",
@@ -255,21 +683,15 @@ function resolveModalBin() {
   return "modal";
 }
 
-function emitProcessOutput(logger, source, chunk) {
-  const lines = String(chunk)
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-  for (const line of lines) {
-    logger.emit({
-      source,
-      level: source === "stderr" ? "warn" : "info",
-      message: line,
-    });
-  }
+function emitProcessLine(logger, source, line) {
+  logger.emit({
+    source,
+    level: source === "stderr" ? "warn" : "info",
+    message: line,
+  });
 }
 
-async function runCommand({ command, args, env, cwd, logger, label }) {
+async function runCommand({ command, args, env, cwd, logger, label, onOutputLine = null }) {
   logger.emit({
     source: "orchestrator",
     level: "info",
@@ -286,29 +708,103 @@ async function runCommand({ command, args, env, cwd, logger, label }) {
 
     let stdout = "";
     let stderr = "";
+    let stdoutBuffer = "";
+    let stderrBuffer = "";
+    let settled = false;
+    let pendingOutputWork = Promise.resolve();
+
+    const settleResolve = (value) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      resolve(value);
+    };
+
+    const settleReject = (error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      reject(error);
+    };
+
+    const enqueueLine = (source, rawLine) => {
+      const line = String(rawLine ?? "").trim();
+      if (!line) {
+        return;
+      }
+
+      pendingOutputWork = pendingOutputWork.then(async () => {
+        const handled = typeof onOutputLine === "function" ? await onOutputLine({ source, line, logger }) : false;
+        if (!handled) {
+          emitProcessLine(logger, source, line);
+        }
+      });
+
+      pendingOutputWork.catch((error) => {
+        try {
+          child.kill();
+        } catch {
+          // Best effort cleanup while surfacing the original failure.
+        }
+        settleReject(error);
+      });
+    };
+
+    const pushChunk = (source, text) => {
+      if (source === "stdout") {
+        stdoutBuffer += text;
+        const lines = stdoutBuffer.split(/\r?\n/);
+        stdoutBuffer = lines.pop() ?? "";
+        for (const line of lines) {
+          enqueueLine(source, line);
+        }
+        return;
+      }
+
+      stderrBuffer += text;
+      const lines = stderrBuffer.split(/\r?\n/);
+      stderrBuffer = lines.pop() ?? "";
+      for (const line of lines) {
+        enqueueLine(source, line);
+      }
+    };
 
     child.stdout.on("data", (chunk) => {
       const text = chunk.toString();
       stdout += text;
-      emitProcessOutput(logger, "stdout", text);
+      pushChunk("stdout", text);
     });
 
     child.stderr.on("data", (chunk) => {
       const text = chunk.toString();
       stderr += text;
-      emitProcessOutput(logger, "stderr", text);
+      pushChunk("stderr", text);
     });
 
     child.on("error", (error) => {
-      reject(error);
+      settleReject(error);
     });
 
     child.on("close", (code) => {
-      if (code === 0) {
-        resolve({ stdout, stderr, combined: `${stdout}\n${stderr}` });
-        return;
-      }
-      reject(new Error(`${label} failed with exit code ${code}.`));
+      enqueueLine("stdout", stdoutBuffer);
+      enqueueLine("stderr", stderrBuffer);
+      stdoutBuffer = "";
+      stderrBuffer = "";
+
+      pendingOutputWork.then(
+        () => {
+          if (code === 0) {
+            settleResolve({ stdout, stderr, combined: `${stdout}\n${stderr}` });
+            return;
+          }
+          settleReject(new Error(`${label} failed with exit code ${code}.`));
+        },
+        (error) => {
+          settleReject(error);
+        },
+      );
     });
   });
 }
@@ -406,21 +902,41 @@ async function fetchJson(url, options = {}) {
   }
 }
 
-async function runSmokeTest({ jobId, deploymentUrl, model, logger }) {
+export async function runSmokeTest({ deploymentUrl, model, logger, taskSpec = null, description = "" }) {
   const modelsUrl = `${deploymentUrl}/v1/models`;
   const chatUrl = `${deploymentUrl}/v1/chat/completions`;
   const attempts = [];
+  const isGeneration = isGenerationTaskSpec(taskSpec);
+  const probes = isGeneration ? buildGenerationSmokeTestProbes(description) : [];
+  const smokeTestConfig = getSmokeTestConfig();
 
-  for (let attempt = 1; attempt <= 30; attempt += 1) {
+  for (let attempt = 1; attempt <= smokeTestConfig.maxAttempts; attempt += 1) {
     try {
+      const modelsTimeoutMs =
+        attempt === 1 ? smokeTestConfig.initialModelsTimeoutMs : smokeTestConfig.modelsTimeoutMs;
+      emitLoggerUiProgress(
+        logger,
+        `I'm waiting for the model to start (attempt ${attempt}/${smokeTestConfig.maxAttempts})`,
+      );
       logger.emit({
         source: "smoke-test",
         level: "info",
         message: `Smoke test attempt ${attempt}`,
-        data: { modelsUrl, chatUrl, model },
+        data: {
+          modelsUrl,
+          chatUrl,
+          model,
+          taskFamily: taskSpec?.task_family ?? null,
+          probeIds: probes.map((probe) => probe.id),
+          modelsTimeoutMs,
+          chatTimeoutMs: smokeTestConfig.chatTimeoutMs,
+        },
       });
 
-      const modelsPayload = await fetchJson(modelsUrl, { timeoutMs: 60_000 });
+      // The first /v1/models request is the cold-start trigger for Modal's
+      // web_server wrapper, so it needs to be allowed to span the whole vLLM boot.
+      emitLoggerUiProgress(logger, "I'm checking that the model is available");
+      const modelsPayload = await fetchJson(modelsUrl, { timeoutMs: modelsTimeoutMs });
       const modelIds = Array.isArray(modelsPayload?.data)
         ? modelsPayload.data.map((entry) => entry?.id).filter(Boolean)
         : [];
@@ -428,9 +944,72 @@ async function runSmokeTest({ jobId, deploymentUrl, model, logger }) {
         throw new Error(`Expected model '${model}' in /v1/models, got ${JSON.stringify(modelIds)}.`);
       }
 
+      if (isGeneration) {
+        const probeResults = [];
+
+        for (const probe of probes) {
+          emitLoggerUiProgress(
+            logger,
+            `I'm trying a sample request (${formatSmokeTestProbeLabel(probe.id)})`,
+          );
+          const chatPayload = await fetchJson(chatUrl, {
+            method: "POST",
+            timeoutMs: smokeTestConfig.chatTimeoutMs,
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              model,
+              messages: [
+                {
+                  role: "user",
+                  content: probe.prompt,
+                },
+              ],
+              chat_template_kwargs: {
+                enable_thinking: false,
+              },
+              max_tokens: probe.maxTokens,
+            }),
+          });
+
+          const completionText = extractChatCompletionText(chatPayload).trim();
+          const passed = completionText.length >= probe.minLength;
+          const probeResult = {
+            id: probe.id,
+            prompt: probe.prompt,
+            passed,
+            completionPreview: truncateText(completionText, 200),
+            error: passed
+              ? null
+              : `Completion was shorter than ${probe.minLength} characters.`,
+          };
+          probeResults.push(probeResult);
+
+          if (!passed) {
+            throw new Error(
+              `Generation smoke test probe '${probe.id}' returned an insufficient completion (${completionText.length} chars).`,
+            );
+          }
+        }
+
+        return {
+          passed: true,
+          checkedAt: nowIso(),
+          deploymentUrl,
+          model,
+          attempt,
+          modelIds,
+          completionPreview: probeResults[0]?.completionPreview ?? null,
+          probes: probeResults,
+          attempts,
+        };
+      }
+
+      emitLoggerUiProgress(logger, "I'm trying a quick sample request");
       const chatPayload = await fetchJson(chatUrl, {
         method: "POST",
-        timeoutMs: 120_000,
+        timeoutMs: smokeTestConfig.chatTimeoutMs,
         headers: {
           "Content-Type": "application/json",
         },
@@ -449,10 +1028,7 @@ async function runSmokeTest({ jobId, deploymentUrl, model, logger }) {
         }),
       });
 
-      const completionText =
-        chatPayload?.choices?.[0]?.message?.content ??
-        chatPayload?.choices?.[0]?.text ??
-        null;
+      const completionText = extractChatCompletionText(chatPayload);
 
       return {
         passed: true,
@@ -477,11 +1053,79 @@ async function runSmokeTest({ jobId, deploymentUrl, model, logger }) {
         message: `Smoke test attempt ${attempt} failed`,
         data: details,
       });
-      await sleep(10_000);
+      if (attempt < smokeTestConfig.maxAttempts) {
+        emitLoggerUiProgress(logger, "I'm waiting a moment before trying again");
+        await sleep(smokeTestConfig.retryDelayMs);
+      }
     }
   }
 
-  throw new Error("Smoke test did not succeed within the retry window.");
+  throw new Error(
+    `Smoke test did not succeed within the retry window after ${smokeTestConfig.maxAttempts} attempts.`,
+  );
+}
+
+export async function waitForDeploymentReady({ deploymentUrl, model, logger, runtimePolicy = null }) {
+  const modelsUrl = `${deploymentUrl}/v1/models`;
+  const readinessConfig = getSmokeTestConfig();
+  const attempts = [];
+
+  for (let attempt = 1; attempt <= readinessConfig.maxAttempts; attempt += 1) {
+    const modelsTimeoutMs =
+      attempt === 1 ? readinessConfig.initialModelsTimeoutMs : readinessConfig.modelsTimeoutMs;
+    try {
+      emitLoggerUiProgress(logger, "I'm waiting for the live model to start");
+      logger.emit({
+        source: "deploy-readiness",
+        level: "info",
+        message: `Deployment readiness attempt ${attempt}`,
+        data: {
+          modelsUrl,
+          model,
+          modelsTimeoutMs,
+          runtimePolicy,
+        },
+      });
+
+      const modelsPayload = await fetchJson(modelsUrl, { timeoutMs: modelsTimeoutMs });
+      const modelIds = Array.isArray(modelsPayload?.data)
+        ? modelsPayload.data.map((entry) => entry?.id).filter(Boolean)
+        : [];
+      if (!modelIds.includes(model)) {
+        throw new Error(`Expected model '${model}' in /v1/models, got ${JSON.stringify(modelIds)}.`);
+      }
+
+      return {
+        readyAt: nowIso(),
+        attempt,
+        modelIds,
+        attempts,
+      };
+    } catch (error) {
+      const details = safeError(error);
+      attempts.push({
+        attempt,
+        timestamp: nowIso(),
+        error: details.message,
+      });
+      logger.emit({
+        source: "deploy-readiness",
+        level: "warn",
+        message: `Deployment readiness attempt ${attempt} failed`,
+        data: {
+          ...details,
+          runtimePolicy,
+        },
+      });
+      if (attempt < readinessConfig.maxAttempts) {
+        await sleep(readinessConfig.retryDelayMs);
+      }
+    }
+  }
+
+  throw new Error(
+    `Deployment did not become ready within the retry window after ${readinessConfig.maxAttempts} attempts.`,
+  );
 }
 
 async function runRecommendationStage(jobId, job) {
@@ -565,33 +1209,7 @@ async function runCompilerStage(jobId, job) {
   return result;
 }
 
-async function runTrainingStage(jobId, compiledConfig) {
-  const logger = createStageLogger(jobId, "training");
-  await runCommand({
-    command: resolveModalBin(),
-    args: ["run", trainerScriptPath, "--config", getJobPaths(jobId).compiledConfigPath],
-    env: {
-      TRAIN_RESULT_PATH: getJobPaths(jobId).trainingResultPath,
-    },
-    cwd: repoRoot,
-    logger,
-    label: "Modal training run",
-  });
-
-  const trainingResult = await readJsonFile(getJobPaths(jobId).trainingResultPath);
-  if (!trainingResult) {
-    throw new Error("Training completed but training_result.json was not written.");
-  }
-
-  await completeStage(jobId, "training", "Training completed.", (draft) => {
-    draft.method = trainingResult.trainer_type ?? draft.method;
-    draft.selectedDatasets = Array.isArray(trainingResult.selected_datasets)
-      ? trainingResult.selected_datasets
-      : draft.selectedDatasets;
-    draft.artifacts.trainingResultPath = getJobPaths(jobId).trainingResultPath;
-    return draft;
-  });
-
+function summarizeTrainingFiltering(trainingResult) {
   const missingTargetFiltering =
     trainingResult?.preprocessing_diagnostics?.missing_target_label_filtering ?? null;
   const droppedMissingTargetRows = Number(missingTargetFiltering?.dropped_rows_missing_target ?? 0);
@@ -622,16 +1240,45 @@ async function runTrainingStage(jobId, compiledConfig) {
         }))
     : [];
 
+  return {
+    droppedMissingTargetRows,
+    droppedDatasets,
+    droppedInvalidSftRows,
+    invalidSftDatasets,
+  };
+}
+
+async function emitCapturedTrainingLogs({
+  logger,
+  trainingResult,
+  compiledConfig,
+  metricGraphArtifacts,
+}) {
+  const compiledGpuType = compiledConfig?.gpu_type ?? null;
+  const modalGpuType = normalizeModalTrainingGpuType(compiledGpuType);
+  const {
+    droppedMissingTargetRows,
+    droppedDatasets,
+    droppedInvalidSftRows,
+    invalidSftDatasets,
+  } = summarizeTrainingFiltering(trainingResult);
+
   await logger.emit({
     source: "orchestrator",
     level: "info",
     message: "Captured training result.",
     data: {
       finalAdapterDir: trainingResult.final_adapter_dir,
+      mergedDir: trainingResult.merged_dir ?? null,
       trainerType: trainingResult.trainer_type,
       selectedDatasets: trainingResult.selected_datasets,
+      compiledGpuType,
+      modalGpuType: trainingResult.modal_gpu_type ?? modalGpuType,
       globalStep: trainingResult.global_step,
       evalExamples: trainingResult.eval_examples,
+      availableTrainingMetrics: metricGraphArtifacts.summary.availableMetrics,
+      trainingLossGraphPath: metricGraphArtifacts.trainingLossGraphPath,
+      learningRateGraphPath: metricGraphArtifacts.learningRateGraphPath,
       droppedRowsMissingTargetLabels: droppedMissingTargetRows,
       droppedRowsInvalidSftExamples: droppedInvalidSftRows,
     },
@@ -660,6 +1307,135 @@ async function runTrainingStage(jobId, compiledConfig) {
       },
     });
   }
+}
+
+async function runTrainingAndEvaluationStage(jobId, compiledConfig) {
+  const logger = createStageLogger(jobId, "training");
+  const jobPaths = getJobPaths(jobId);
+  const compiledGpuType = compiledConfig?.gpu_type ?? null;
+  const modalGpuType = normalizeModalTrainingGpuType(compiledGpuType);
+  const metricRecords = [];
+  let trainingResult = null;
+  let trainingStageCompleted = false;
+  let evaluationStageStarted = false;
+  let metricGraphArtifacts = {
+    summary: {
+      availableMetrics: [],
+      latest: {},
+      series: {},
+    },
+    trainingLossGraphPath: null,
+    learningRateGraphPath: null,
+  };
+
+  await writeFile(jobPaths.trainingMetricsPath, "", "utf8");
+  emitLoggerUiProgress(logger, "I'm starting the training run");
+  await logger.emit({
+    source: "orchestrator",
+    level: "info",
+    message: "Launching same-container Modal train_then_evaluate run with resolved GPU types.",
+    data: {
+      compiledGpuType,
+      modalGpuType,
+      compiledConfigPath: jobPaths.compiledConfigPath,
+    },
+  });
+  const transitionToEvaluating = async () => {
+    if (!trainingResult) {
+      throw new Error("Combined training run emitted evaluation transition without a training_result payload.");
+    }
+    if (!trainingStageCompleted) {
+      emitLoggerUiProgress(logger, "I'm saving the trained model");
+      await completeStage(jobId, "training", "Training completed.", (draft) => {
+        draft.method = trainingResult.trainer_type ?? draft.method;
+        draft.selectedDatasets = Array.isArray(trainingResult.selected_datasets)
+          ? trainingResult.selected_datasets
+          : draft.selectedDatasets;
+        draft.artifacts.trainingResultPath = jobPaths.trainingResultPath;
+        draft.artifacts.trainingMetricsPath = jobPaths.trainingMetricsPath;
+        draft.artifacts.trainingLossGraphPath = metricGraphArtifacts.trainingLossGraphPath;
+        draft.artifacts.learningRateGraphPath = metricGraphArtifacts.learningRateGraphPath;
+        return draft;
+      });
+      await emitCapturedTrainingLogs({
+        logger,
+        trainingResult,
+        compiledConfig,
+        metricGraphArtifacts,
+      });
+      trainingStageCompleted = true;
+    }
+    if (!evaluationStageStarted) {
+      logger.setStage("evaluating");
+      await startStage(jobId, "evaluating", "Running offline evaluation.");
+      emitLoggerUiProgress(logger, "I'm testing how the model performs");
+      evaluationStageStarted = true;
+    }
+  };
+
+  try {
+    await runCommand({
+      command: resolveModalBin(),
+      args: ["run", trainerScriptPath, "--config", jobPaths.compiledConfigPath],
+      env: {
+        POSTTRAINING_RUN_MODE: "train_then_evaluate",
+        TRAIN_RESULT_PATH: jobPaths.trainingResultPath,
+        EVALUATION_RESULT_PATH: jobPaths.evaluationPath,
+        COMPARISON_EVALUATION_PATH: jobPaths.comparisonEvaluationPath,
+      },
+      cwd: repoRoot,
+      logger,
+      label: "Modal train_then_evaluate run",
+      onOutputLine: async ({ line }) => {
+        const record = parseStructuredTrainingMetricLine(line);
+        if (record) {
+          metricRecords.push(record);
+          await appendTrainingMetricRecord(jobId, record);
+          metricGraphArtifacts = await writeTrainingMetricGraphs(jobId, metricRecords);
+          const trainingProgress = buildTrainingMetricUiProgress(record);
+          if (trainingProgress && logger.getStage() === "training") {
+            emitLoggerUiProgress(logger, trainingProgress);
+          }
+          return true;
+        }
+
+        const stageProgress = detectTrainingStageUiProgress(line, logger.getStage());
+        if (stageProgress) {
+          emitLoggerUiProgress(logger, stageProgress);
+          if (line.startsWith(STRUCTURED_PROGRESS_PREFIX)) {
+            return true;
+          }
+        }
+
+        const lifecycleEvent = parseStructuredLifecycleEventLine(line);
+        if (!lifecycleEvent) {
+          return false;
+        }
+        if (lifecycleEvent.event !== "training_complete") {
+          return true;
+        }
+
+        trainingResult = lifecycleEvent.training_result ?? null;
+        if (!trainingResult) {
+          throw new Error("Structured lifecycle event omitted training_result.");
+        }
+        emitLoggerUiProgress(logger, "I'm saving the trained model");
+        await writeJsonFile(jobPaths.trainingResultPath, trainingResult);
+        await transitionToEvaluating();
+        return true;
+      },
+    });
+  } catch (error) {
+    if (trainingResult) {
+      await transitionToEvaluating();
+    }
+    throw error;
+  }
+
+  if (!trainingResult) {
+    throw new Error("Combined training run completed without emitting a training_result lifecycle event.");
+  }
+  await transitionToEvaluating();
 
   return {
     trainingResult,
@@ -671,11 +1447,14 @@ function isNonTrivialRun(trainingResult) {
   return Number(trainingResult?.train_examples ?? 0) >= 1000;
 }
 
-async function runEvaluatingStage(jobId, trainingResult) {
+async function finalizeEvaluationStage(jobId, trainingResult) {
   const logger = createStageLogger(jobId, "evaluating");
-  const evaluation = trainingResult?.evaluation;
-  if (!evaluation || typeof evaluation !== "object") {
-    throw new Error("Training completed without an evaluation result.");
+  const jobPaths = getJobPaths(jobId);
+  const evaluation = await readOptionalJsonFile(jobPaths.evaluationPath);
+  const comparisonEvaluation = await readOptionalJsonFile(jobPaths.comparisonEvaluationPath);
+  emitLoggerUiProgress(logger, "I'm checking the test results");
+  if (!evaluation && !comparisonEvaluation) {
+    throw new Error("Evaluation completed without writing any evaluation artifacts.");
   }
 
   if (isNonTrivialRun(trainingResult) && Number(trainingResult.global_step ?? 0) <= 1) {
@@ -684,17 +1463,21 @@ async function runEvaluatingStage(jobId, trainingResult) {
     );
   }
 
-  const invalidLabelRate = Number(evaluation?.metrics?.invalid_label_rate ?? 1);
-  if (!Number.isFinite(invalidLabelRate) || invalidLabelRate >= 1) {
+  const invalidLabelRate = Number(evaluation?.metrics?.invalid_label_rate ?? 0);
+  if (evaluation && (!Number.isFinite(invalidLabelRate) || invalidLabelRate >= 1)) {
     throw new Error(
       `Evaluation indicates catastrophic label prediction failure (invalid_label_rate=${invalidLabelRate}).`,
     );
   }
 
-  await writeJsonFile(getJobPaths(jobId).evaluationPath, evaluation);
+  if (comparisonEvaluation) {
+    emitLoggerUiProgress(logger, "I'm comparing the new model with the original model");
+  }
+
   await completeStage(jobId, "evaluating", "Offline evaluation completed.", (draft) => {
-    draft.artifacts.evaluationPath = getJobPaths(jobId).evaluationPath;
-    draft.evaluation = evaluation;
+    draft.artifacts.evaluationPath = evaluation ? jobPaths.evaluationPath : null;
+    draft.artifacts.comparisonEvaluationPath = comparisonEvaluation ? jobPaths.comparisonEvaluationPath : null;
+    draft.evaluation = evaluation ?? comparisonEvaluation;
     return draft;
   });
 
@@ -705,55 +1488,91 @@ async function runEvaluatingStage(jobId, trainingResult) {
     data: {
       accuracy: evaluation?.metrics?.accuracy ?? null,
       macroF1: evaluation?.metrics?.macro_f1 ?? null,
-      invalidLabelRate,
+      invalidLabelRate: evaluation ? invalidLabelRate : null,
       sampledExamples: evaluation?.sampled_examples ?? null,
+      comparisonTaskFamily: comparisonEvaluation?.task_family ?? null,
+      comparisonSampledCases: comparisonEvaluation?.sample_policy?.sampled_cases ?? null,
+      comparisonEvaluationPath: comparisonEvaluation ? jobPaths.comparisonEvaluationPath : null,
     },
   });
 
-  return evaluation;
+  return evaluation ?? comparisonEvaluation;
 }
 
 async function runDeploymentStage(jobId, trainingResult, compiledConfig) {
   const logger = createStageLogger(jobId, "deploying");
-  const adapterPath = toRelativeAdapterPath(trainingResult.final_adapter_dir);
+  const deploymentArtifact = resolveDeploymentArtifact(trainingResult);
+  const runtimePolicy = resolveDeploymentRuntimePolicy(trainingResult, deploymentArtifact);
   const deploymentAppName = buildServeAppName(jobId);
+  const serveStartupTimeoutSeconds = getServeStartupTimeoutSeconds();
   const serveGpuType =
     process.env.POSTTRAINING_SERVE_GPU ||
-    (compiledConfig.gpu_type === "A10" ? "A10G" : compiledConfig.gpu_type || "A10G");
+    normalizeModalTrainingGpuType(compiledConfig.gpu_type) ||
+    "A10G";
   const adapterName = jobId;
+  const deploymentEnv = buildDeploymentEnvironment({
+    deploymentAppName,
+    deploymentArtifact,
+    adapterName,
+    trainingResult,
+    compiledConfig,
+    serveGpuType,
+    serveStartupTimeoutSeconds,
+    runtimePolicy,
+  });
 
+  await logger.emit({
+    source: "orchestrator",
+    level: "info",
+    message: "Resolved deployment runtime policy.",
+    data: {
+      baseModel: trainingResult.base_model,
+      adapterPath: deploymentArtifact.relativePath,
+      ...runtimePolicy,
+    },
+  });
+
+  emitLoggerUiProgress(logger, "I'm getting the model ready to go live");
   const commandResult = await runCommand({
     command: resolveModalBin(),
     args: ["deploy", serveScriptPath],
-    env: {
-      APP_NAME: deploymentAppName,
-      ADAPTER_PATH: adapterPath,
-      ADAPTER_NAME: adapterName,
-      BASE_MODEL: trainingResult.base_model,
-      MAX_MODEL_LEN: String(compiledConfig.max_length ?? 2048),
-      GPU_TYPE: serveGpuType,
-    },
+    env: deploymentEnv,
     cwd: repoRoot,
     logger,
     label: "Modal deployment",
+    onOutputLine: async ({ line }) => {
+      const stageProgress = detectDeploymentStageUiProgress(line);
+      if (stageProgress) {
+        emitLoggerUiProgress(logger, stageProgress);
+      }
+      return false;
+    },
   });
 
+  emitLoggerUiProgress(logger, "I'm creating the live model link");
   const deploymentUrl = extractModalRunUrl(commandResult.combined);
   if (!deploymentUrl) {
     throw new Error("Could not determine the deployed modal.run URL from Modal deploy output.");
   }
 
-  const deployment = {
-    deployedAt: nowIso(),
-    appName: deploymentAppName,
-    url: deploymentUrl,
+  const deployment = buildDeploymentRecord({
+    deploymentUrl,
+    deploymentAppName,
     adapterName,
-    adapterPath,
-    baseModel: trainingResult.base_model,
-    gpuType: serveGpuType,
-  };
+    deploymentArtifact,
+    trainingResult,
+    serveGpuType,
+    serveStartupTimeoutSeconds,
+    runtimePolicy,
+  });
 
   await writeJsonFile(getJobPaths(jobId).deploymentPath, deployment);
+  const readiness = await waitForDeploymentReady({
+    deploymentUrl,
+    model: adapterName,
+    logger,
+    runtimePolicy,
+  });
   await completeStage(jobId, "deploying", "Deployment completed.", (draft) => {
     draft.deployment = deployment;
     draft.artifacts.deploymentPath = getJobPaths(jobId).deploymentPath;
@@ -764,19 +1583,27 @@ async function runDeploymentStage(jobId, trainingResult, compiledConfig) {
     source: "orchestrator",
     level: "info",
     message: "Deployment URL captured.",
-    data: deployment,
+    data: {
+      ...deployment,
+      ...runtimePolicy,
+      readinessAttempt: readiness.attempt,
+      readyAt: readiness.readyAt,
+      modelIds: readiness.modelIds,
+    },
   });
 
   return deployment;
 }
 
-async function runSmokeTestStage(jobId, deployment) {
+async function runSmokeTestStage(jobId, deployment, { taskSpec = null, description = "" } = {}) {
   const logger = createStageLogger(jobId, "smoke_testing");
   const smokeTestResult = await runSmokeTest({
     jobId,
     deploymentUrl: deployment.url,
     model: deployment.adapterName,
     logger,
+    taskSpec,
+    description,
   });
   await writeJsonFile(getJobPaths(jobId).smokeTestPath, smokeTestResult);
   await completeStage(jobId, "smoke_testing", "Smoke test passed.", (draft) => {
@@ -797,7 +1624,6 @@ async function runOrchestrator(jobId) {
   await startStage(jobId, "recommending", "Starting dataset recommendation.");
   let compiledResult = null;
   let trainingBundle = null;
-  let evaluationResult = null;
   let deployment = null;
 
   try {
@@ -808,10 +1634,8 @@ async function runOrchestrator(jobId) {
     compiledResult = await runCompilerStage(jobId, jobAfterRecommendation);
 
     await startStage(jobId, "training", "Starting Modal training.");
-    trainingBundle = await runTrainingStage(jobId, compiledResult.compiled_config);
-
-    await startStage(jobId, "evaluating", "Running offline evaluation.");
-    evaluationResult = await runEvaluatingStage(jobId, trainingBundle.trainingResult);
+    trainingBundle = await runTrainingAndEvaluationStage(jobId, compiledResult.compiled_config);
+    await finalizeEvaluationStage(jobId, trainingBundle.trainingResult);
 
     await startStage(jobId, "deploying", "Starting stable vLLM deployment.");
     deployment = await runDeploymentStage(
@@ -821,7 +1645,10 @@ async function runOrchestrator(jobId) {
     );
 
     await startStage(jobId, "smoke_testing", "Starting deployment smoke test.");
-    const smokeTestResult = await runSmokeTestStage(jobId, deployment);
+    const smokeTestResult = await runSmokeTestStage(jobId, deployment, {
+      taskSpec: trainingBundle.trainingResult?.task_spec ?? compiledResult.task_spec ?? null,
+      description: job.input.description,
+    });
     await markReady(jobId, {
       ...smokeTestResult,
       deploymentUrl: deployment.url,
@@ -833,10 +1660,8 @@ async function runOrchestrator(jobId) {
         ? currentJob.currentStage
         : deployment
           ? "smoke_testing"
-          : evaluationResult
-            ? "deploying"
           : trainingBundle
-            ? "evaluating"
+            ? "deploying"
             : compiledResult
               ? "training"
               : "recommending";

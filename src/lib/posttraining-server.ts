@@ -8,6 +8,7 @@ export type JobStage =
   | "recommending"
   | "compiling"
   | "training"
+  | "evaluating"
   | "deploying"
   | "smoke_testing"
   | "ready"
@@ -35,6 +36,7 @@ export type PostTrainingJobRecord = {
   selectedDatasets: string[];
   errorSummary: string | null;
   artifacts: Record<string, string | null>;
+  evaluation: Record<string, unknown> | null;
   deployment: Record<string, unknown> | null;
   smokeTest: Record<string, unknown> | null;
   stageHistory: JobHistoryEntry[];
@@ -187,9 +189,15 @@ export async function createPostTrainingJob(input: CreateJobInput): Promise<Post
       manifestPath: path.join(jobDir, "prepared_dataset_manifest.json"),
       compilerTracePath: path.join(jobDir, "compiler_trace.json"),
       trainingResultPath: path.join(jobDir, "training_result.json"),
+      trainingMetricsPath: path.join(jobDir, "training_metrics.jsonl"),
+      trainingLossGraphPath: path.join(jobDir, "training_loss.svg"),
+      learningRateGraphPath: path.join(jobDir, "learning_rate.svg"),
+      evaluationPath: path.join(jobDir, "evaluation_result.json"),
+      comparisonEvaluationPath: path.join(jobDir, "comparison_evaluation.json"),
       deploymentPath: path.join(jobDir, "deployment.json"),
       smokeTestPath: path.join(jobDir, "smoke_test.json"),
     },
+    evaluation: null,
     deployment: null,
     smokeTest: null,
     stageHistory: [

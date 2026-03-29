@@ -9,6 +9,7 @@ import {
   inferOutputKindFromNormalization as inferOutputKindFromNormalizationShared,
   validateNormalizationProposal as validateNormalizationProposalShared,
 } from "./posttraining-normalization.mjs";
+import { emitUiProgress } from "../src/lib/posttraining-progress.mjs";
 
 const OPENAI_RESPONSES_API_URL = "https://api.openai.com/v1/responses";
 const DEFAULT_OPENAI_MODEL = "gpt-5-mini";
@@ -16,6 +17,7 @@ const DEFAULT_INPUT_PATH = "backend/datasets.json";
 const DEFAULT_OUTPUT_ROOT = "backend/generated-posttraining-jobs";
 const REQUEST_TIMEOUT_MS = 10_000;
 const MAX_REPAIR_ATTEMPTS = 3;
+const MIN_EXPECTED_TRAINING_STEPS = 5;
 const LOG_PREFIX = "[posttraining-spec-compiler]";
 const TRANSIENT_STATUS_CODES = new Set([408, 409, 429, 500, 502, 503, 504]);
 
@@ -41,12 +43,22 @@ const DEFAULT_TRAINING_PARAMS = {
   save_steps: 200,
   eval_steps: 200,
 };
+const SFT_LEARNING_RATE_MIN = 1e-6;
+const SFT_LEARNING_RATE_MAX = 1e-3;
 
 const ALLOWED_GPUS = ["A10", "L40S", "H100"];
+const DEFAULT_MERGED_SFT_HOLDOUT_FRACTION = 0.1;
+const COMPILER_GPU_ALIAS_TO_CANONICAL = Object.freeze({
+  a10: "A10",
+  a10g: "A10",
+  l40s: "L40S",
+  h100: "H100",
+});
 
 export const DEFAULT_COMPILER_OVERRIDES = Object.freeze({
   sft_num_train_epochs: null,
   sft_gpu_type: null,
+  sft_max_length: null,
 });
 
 let dotEnvLoaded = false;
@@ -58,6 +70,14 @@ function logInfo(message) {
     return;
   }
   console.log(`${LOG_PREFIX} ${message}`);
+}
+
+function logUiProgress(message, tone = "normal") {
+  emitUiProgress(activeLogger, {
+    stageId: "compiling",
+    text: message,
+    tone,
+  });
 }
 
 async function withLoggerContext(logger, callback) {
@@ -75,6 +95,23 @@ function normalizeOptionalString(value) {
     return value.trim();
   }
   return null;
+}
+
+function normalizeSourceSplitList(value, fallbackSplit = null) {
+  const normalized = Array.isArray(value)
+    ? uniqueStrings(
+        value
+          .map((split) => normalizeOptionalString(split))
+          .filter(Boolean),
+      )
+    : [];
+
+  if (normalized.length > 0) {
+    return normalized;
+  }
+
+  const fallback = normalizeOptionalString(fallbackSplit);
+  return fallback ? [fallback] : [];
 }
 
 export function getCompilerOverridesConfigPath() {
@@ -151,15 +188,28 @@ export function resolveConfiguredSftGpuType(overrides = loadCompilerOverrides())
     return null;
   }
 
-  const matchedGpu = ALLOWED_GPUS.find(
-    (gpuType) => gpuType.toLowerCase() === overrideValue.toLowerCase(),
-  );
+  const matchedGpu = COMPILER_GPU_ALIAS_TO_CANONICAL[overrideValue.toLowerCase()] ?? null;
   if (!matchedGpu) {
     throw new Error(
-      `compiler override sft_gpu_type must be one of ${ALLOWED_GPUS.join(", ")} or null.`,
+      "compiler override sft_gpu_type must be one of A10, A10G, L40S, H100, or null.",
     );
   }
   return matchedGpu;
+}
+
+export function resolveConfiguredSftMaxLength(overrides = loadCompilerOverrides()) {
+  const overrideValue = overrides.sft_max_length;
+  if (overrideValue === null || overrideValue === undefined) {
+    return null;
+  }
+
+  const numericValue = Number(overrideValue);
+  if (!Number.isInteger(numericValue) || numericValue < 256) {
+    throw new Error(
+      "compiler override sft_max_length must be null or an integer greater than or equal to 256.",
+    );
+  }
+  return numericValue;
 }
 
 function uniqueStrings(values) {
@@ -192,6 +242,110 @@ function normalizeTaskSpec(taskSpec) {
     target_selection_reason: normalizeOptionalString(taskSpec.target_selection_reason),
     unsupported_reason: normalizeOptionalString(taskSpec.unsupported_reason),
   };
+}
+
+function isClassificationTaskSpec(taskSpec) {
+  return normalizeOptionalString(taskSpec?.task_family) === "classification";
+}
+
+function isGenerationTaskSpec(taskSpec) {
+  return normalizeOptionalString(taskSpec?.task_family) === "generation";
+}
+
+function getTaskRequirements(taskSpec) {
+  if (isGenerationTaskSpec(taskSpec)) {
+    return {
+      task_family: "generation",
+      target_policy: "none",
+      output_shape_preference: "prompt_completion",
+      allowed_output_kinds: ["text", "prompt_completion"],
+      requires_selected_target_column: false,
+      trainer_notes: [
+        "This quality-focused path supports raw-text and prompt/completion generation SFT.",
+        "All selected datasets must normalize to the same output shape for generation.",
+        "Runtime evaluation uses a merged deterministic 90/10 holdout over source_splits, including test when present.",
+      ],
+    };
+  }
+
+  if (isClassificationTaskSpec(taskSpec)) {
+    return {
+      task_family: "classification",
+      target_policy: "single_target",
+      output_shape_preference: "prompt_completion",
+      allowed_output_kinds: ["prompt_completion"],
+      requires_selected_target_column: true,
+      trainer_notes: [
+        "This quality-focused path supports single-target classification SFT.",
+        "All selected datasets must normalize to prompt-completion examples for classification.",
+        "Runtime evaluation uses a merged deterministic 90/10 holdout over source_splits, including test when present.",
+      ],
+    };
+  }
+
+  return null;
+}
+
+function resolveMergedSftHoldoutFraction(numTrainEpochs) {
+  const numericEpochs = Number(numTrainEpochs);
+  if (!Number.isFinite(numericEpochs) || numericEpochs <= 0 || numericEpochs >= 1) {
+    return DEFAULT_MERGED_SFT_HOLDOUT_FRACTION;
+  }
+  return DEFAULT_MERGED_SFT_HOLDOUT_FRACTION * numericEpochs;
+}
+
+function buildEvaluationPlan(taskRequirements, numTrainEpochs = 1.0) {
+  if (!taskRequirements) {
+    return null;
+  }
+
+  const plan = {
+    strategy: "merged_sft_holdout",
+    holdout_fraction: resolveMergedSftHoldoutFraction(numTrainEpochs),
+    deterministic_seed: 42,
+    comparison_max_examples: 30,
+    include_test_split_in_source_pool: true,
+    split_style:
+      taskRequirements.task_family === "classification"
+        ? "stratified_completion_label"
+        : "deterministic_random",
+    required_metrics: [],
+  };
+
+  if (taskRequirements.task_family === "classification") {
+    plan.required_metrics = [
+      "accuracy",
+      "macro_f1",
+      "invalid_label_rate",
+      "label_coverage",
+      "confusion_matrix",
+      "label_distributions",
+    ];
+  }
+
+  return plan;
+}
+
+function isCandidateCompatibleWithTaskSpec(candidate, taskSpec) {
+  if (!candidate?.normalization_proposal || !candidate?.compatible_methods?.includes("sft")) {
+    return false;
+  }
+
+  const taskRequirements = getTaskRequirements(taskSpec);
+  if (!taskRequirements) {
+    return false;
+  }
+
+  const outputKind = inferOutputKindFromNormalizationShared("sft", candidate.normalization_proposal);
+  if (!taskRequirements.allowed_output_kinds?.includes(outputKind)) {
+    return false;
+  }
+
+  if (taskRequirements.requires_selected_target_column) {
+    return Boolean(normalizeOptionalString(candidate.selected_target_column));
+  }
+
+  return true;
 }
 
 function isNoOpValueMapping(valueMapping) {
@@ -256,13 +410,19 @@ function canonicalizeNormalizationProposal(normalizationProposal) {
 }
 
 function buildTrainingEstimate(spec) {
-  const usesHoldout = spec.selected_datasets.some((dataset) => !normalizeOptionalString(dataset.eval_split));
+  const usesHoldout = spec.evaluation_plan?.strategy === "merged_sft_holdout";
   const estimatedSourceExamples = spec.selected_datasets.reduce(
     (sum, dataset) => sum + Math.max(0, Number(dataset.num_rows ?? 0)),
     0,
   );
+  const holdoutFraction =
+    typeof spec.evaluation_plan?.holdout_fraction === "number" &&
+    spec.evaluation_plan.holdout_fraction > 0 &&
+    spec.evaluation_plan.holdout_fraction < 1
+      ? spec.evaluation_plan.holdout_fraction
+      : DEFAULT_MERGED_SFT_HOLDOUT_FRACTION;
   const estimatedEvalExamples = usesHoldout
-    ? Math.max(1, Math.round(estimatedSourceExamples * 0.1))
+    ? Math.max(1, Math.round(estimatedSourceExamples * holdoutFraction))
     : null;
   const estimatedTrainExamples = usesHoldout
     ? Math.max(1, estimatedSourceExamples - (estimatedEvalExamples ?? 0))
@@ -295,14 +455,6 @@ function slugify(value) {
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
     .slice(0, 48);
-}
-
-function truncateText(value, maxLength = 240) {
-  const text = String(value ?? "").replace(/\s+/g, " ").trim();
-  if (text.length <= maxLength) {
-    return text;
-  }
-  return `${text.slice(0, maxLength - 3)}...`;
 }
 
 function safeUrlLabel(url) {
@@ -406,31 +558,6 @@ async function fetchJson(url, options = {}) {
   }
 
   throw new Error(`${requestLabel} failed unexpectedly without returning a response.`);
-}
-
-async function mapWithConcurrency(items, concurrency, mapper) {
-  const results = new Array(items.length);
-  let nextIndex = 0;
-
-  async function worker() {
-    while (true) {
-      const currentIndex = nextIndex;
-      nextIndex += 1;
-
-      if (currentIndex >= items.length) {
-        return;
-      }
-
-      results[currentIndex] = await mapper(items[currentIndex], currentIndex);
-    }
-  }
-
-  const workers = Array.from(
-    { length: Math.max(1, Math.min(concurrency, items.length || 1)) },
-    () => worker(),
-  );
-  await Promise.all(workers);
-  return results;
 }
 
 async function ensureDotEnvLoaded() {
@@ -587,6 +714,10 @@ function normalizeCandidate(candidate) {
     preferred_dataset_config: normalizeOptionalString(candidate.preferred_dataset_config),
     preferred_train_split: normalizeOptionalString(candidate.preferred_train_split) ?? "train",
     preferred_eval_split: normalizeOptionalString(candidate.preferred_eval_split),
+    source_splits: normalizeSourceSplitList(
+      candidate.source_splits,
+      normalizeOptionalString(candidate.preferred_train_split) ?? "train",
+    ),
     normalization_source: normalizeOptionalString(candidate.normalization_source),
     normalization_proposal:
       candidate.normalization_proposal && typeof candidate.normalization_proposal === "object"
@@ -697,12 +828,14 @@ function buildObjectiveSummary(context, args, candidates) {
   return "Create a useful text-only post-trained model from the selected Hugging Face datasets.";
 }
 
-function buildPlatformConstraints(seedArtifact) {
+function buildPlatformConstraints(taskSpec, seedArtifact) {
+  const taskRequirements = getTaskRequirements(taskSpec);
+
   return {
     text_only: true,
     supported_methods: ["sft"],
-    supported_task_families: ["classification"],
-    supported_target_policies: ["single_target"],
+    supported_task_families: taskRequirements ? [taskRequirements.task_family] : ["classification", "generation"],
+    supported_target_policies: taskRequirements ? [taskRequirements.target_policy] : ["single_target", "none"],
     default_adaptation_strategy: "lora",
     default_artifact_strategy: "adapter",
     allowed_normalization_shapes: ["text", "prompt_completion"],
@@ -710,9 +843,11 @@ function buildPlatformConstraints(seedArtifact) {
     allowed_base_models: [DEFAULT_BASE_MODEL],
     seed_artifact_available: Boolean(normalizeOptionalString(seedArtifact)),
     seed_artifact: normalizeOptionalString(seedArtifact),
+    task_requirements: taskRequirements,
     trainer_notes: [
-      "This quality-focused path currently supports single-target classification SFT only.",
-      "All selected datasets must normalize to prompt-completion examples for classification.",
+      ...(taskRequirements?.trainer_notes ?? [
+        "Honor the resolved backend task spec exactly.",
+      ]),
       "LoRA is the default adaptation strategy and should usually remain unchanged.",
     ],
   };
@@ -733,6 +868,7 @@ function buildCandidatePromptPayload(candidateProfiles) {
     preferred_dataset_config: candidate.preferred_dataset_config,
     preferred_train_split: candidate.preferred_train_split,
     preferred_eval_split: candidate.preferred_eval_split,
+    source_splits: candidate.source_splits,
     source_schema: candidate.source_schema,
     normalization_proposal: candidate.normalization_proposal,
     compatibility_status: candidate.compatibility_status,
@@ -766,8 +902,9 @@ export function buildSpecPrompt({
     "Choose 1-3 datasets only when mixing materially improves coverage or robustness.",
     "All selected datasets must be executable by the current trainer backend.",
     "Do not mix text-style outputs with prompt-completion-style outputs in the same job.",
-    "The current normalization redesign supports single-target classification SFT only.",
+    ...(platformConstraints.trainer_notes ?? []).map((note) => `Constraint: ${note}`),
     "For this backend's SFT jobs, set training_params.num_train_epochs to 1.0.",
+    "For this backend's SFT jobs, leave training_params.learning_rate null unless there is a clear reason to override it. If you set it explicitly, keep it in a standard LoRA SFT range around 1e-4 and never above 1e-3.",
     `Job id: ${jobId}`,
     `Objective summary: ${objectiveSummary}`,
     `Task spec: ${JSON.stringify(context.task_spec ?? {})}`,
@@ -789,7 +926,67 @@ export function buildSpecPrompt({
   return lines.join("\n");
 }
 
-function getSpecSchema(supportedMethods = ["sft"]) {
+export function validateStrictStructuredOutputSchema(schema) {
+  const errors = [];
+
+  function visit(node, nodePath) {
+    if (!isPlainObject(node)) {
+      return;
+    }
+
+    if (node.type === "object" || isPlainObject(node.properties)) {
+      const properties = isPlainObject(node.properties) ? node.properties : {};
+      const propertyNames = Object.keys(properties);
+
+      if (node.additionalProperties !== false) {
+        errors.push(`${nodePath}: object schemas must set additionalProperties to false.`);
+      }
+
+      if (!Array.isArray(node.required)) {
+        errors.push(`${nodePath}: object schemas must define required as an array.`);
+      } else {
+        const missingProperties = propertyNames.filter((propertyName) => !node.required.includes(propertyName));
+        const unknownRequiredKeys = node.required.filter((propertyName) => !propertyNames.includes(propertyName));
+
+        if (missingProperties.length > 0) {
+          errors.push(
+            `${nodePath}: required must include every property key. Missing ${JSON.stringify(missingProperties)}.`,
+          );
+        }
+        if (unknownRequiredKeys.length > 0) {
+          errors.push(
+            `${nodePath}: required includes keys not present in properties: ${JSON.stringify(unknownRequiredKeys)}.`,
+          );
+        }
+      }
+
+      for (const [propertyName, propertySchema] of Object.entries(properties)) {
+        visit(propertySchema, `${nodePath}.properties.${propertyName}`);
+      }
+    }
+
+    if (isPlainObject(node.items)) {
+      visit(node.items, `${nodePath}.items`);
+    }
+
+    for (const keyword of ["anyOf", "oneOf", "allOf"]) {
+      if (Array.isArray(node[keyword])) {
+        node[keyword].forEach((childSchema, index) => visit(childSchema, `${nodePath}.${keyword}[${index}]`));
+      }
+    }
+
+    if (isPlainObject(node.$defs)) {
+      for (const [definitionName, definitionSchema] of Object.entries(node.$defs)) {
+        visit(definitionSchema, `${nodePath}.$defs.${definitionName}`);
+      }
+    }
+  }
+
+  visit(schema, "$");
+  return errors;
+}
+
+export function getSpecSchema(supportedMethods = ["sft"]) {
   return {
     type: "object",
     additionalProperties: false,
@@ -819,6 +1016,11 @@ function getSpecSchema(supportedMethods = ["sft"]) {
             dataset_config: { type: ["string", "null"] },
             train_split: { type: "string" },
             eval_split: { type: ["string", "null"] },
+            source_splits: {
+              type: "array",
+              minItems: 1,
+              items: { type: "string" },
+            },
             weight: { type: "number", exclusiveMinimum: 0 },
             warnings: {
               type: "array",
@@ -831,6 +1033,7 @@ function getSpecSchema(supportedMethods = ["sft"]) {
             "dataset_config",
             "train_split",
             "eval_split",
+            "source_splits",
             "weight",
             "warnings",
             "include_reason",
@@ -996,6 +1199,7 @@ function validateAndFinalizeSpec(
   const candidateMap = new Map(candidateProfiles.map((candidate) => [candidate.dataset, candidate]));
   const modelIds = new Set(platformConstraints.allowed_base_models.map((model) => model.model_id));
   const normalizedTaskSpec = normalizeTaskSpec(taskSpec);
+  const taskRequirements = getTaskRequirements(normalizedTaskSpec);
   const spec = {
     ...rawSpec,
     job_id: jobId,
@@ -1007,18 +1211,23 @@ function validateAndFinalizeSpec(
   if (!normalizedTaskSpec?.supported) {
     errors.push("task_spec must describe a supported backend task.");
   } else {
-    if (!platformConstraints.supported_task_families.includes(normalizedTaskSpec.task_family)) {
+    if (!taskRequirements || !platformConstraints.supported_task_families.includes(normalizedTaskSpec.task_family)) {
       errors.push(
         `task_spec.task_family must be one of ${platformConstraints.supported_task_families.join(", ")}.`,
       );
     }
-    if (!platformConstraints.supported_target_policies.includes(normalizedTaskSpec.target_policy)) {
+    if (!taskRequirements || normalizedTaskSpec.target_policy !== taskRequirements.target_policy) {
       errors.push(
-        `task_spec.target_policy must be one of ${platformConstraints.supported_target_policies.join(", ")}.`,
+        `task_spec.target_policy must be '${taskRequirements?.target_policy ?? platformConstraints.supported_target_policies.join(", ")}' for ${normalizedTaskSpec.task_family} SFT.`,
       );
     }
-    if (normalizedTaskSpec.output_shape_preference !== "prompt_completion") {
-      errors.push("task_spec.output_shape_preference must be 'prompt_completion' for classification SFT.");
+    if (
+      !taskRequirements ||
+      !taskRequirements.allowed_output_kinds?.includes(normalizedTaskSpec.output_shape_preference)
+    ) {
+      errors.push(
+        `task_spec.output_shape_preference must be one of ${JSON.stringify(taskRequirements?.allowed_output_kinds ?? ["supported"])} for ${normalizedTaskSpec.task_family} SFT.`,
+      );
     }
   }
 
@@ -1061,6 +1270,16 @@ function validateAndFinalizeSpec(
     )
   ) {
     errors.push("training_params.learning_rate must be null or a positive number.");
+  }
+  if (
+    spec.method === "sft" &&
+    params.learning_rate !== null &&
+    typeof params.learning_rate === "number" &&
+    (params.learning_rate < SFT_LEARNING_RATE_MIN || params.learning_rate > SFT_LEARNING_RATE_MAX)
+  ) {
+    errors.push(
+      `training_params.learning_rate for SFT must be null or between ${SFT_LEARNING_RATE_MIN} and ${SFT_LEARNING_RATE_MAX}.`,
+    );
   }
   if (!(typeof params.num_train_epochs === "number" && params.num_train_epochs > 0)) {
     errors.push("training_params.num_train_epochs must be a positive number.");
@@ -1135,35 +1354,48 @@ function validateAndFinalizeSpec(
     outputKinds.add(outputKind);
 
     const selectedTargetColumn = normalizeOptionalString(candidate.selected_target_column);
-    if (!selectedTargetColumn) {
-      errors.push(`${datasetId}: candidate is missing selected_target_column for classification.`);
-    } else {
-      if (!candidate.source_schema?.available_columns?.includes(selectedTargetColumn)) {
-        errors.push(`${datasetId}: selected_target_column '${selectedTargetColumn}' is not present in source_schema.`);
-      }
-      if (!candidate.target_candidates.includes(selectedTargetColumn)) {
-        errors.push(
-          `${datasetId}: selected_target_column '${selectedTargetColumn}' was not validated as a plausible target candidate.`,
-        );
-      }
-      if (candidate.normalization_proposal?.fields?.completion?.source_column !== selectedTargetColumn) {
-        errors.push(
-          `${datasetId}: normalization completion field must point at selected_target_column '${selectedTargetColumn}'.`,
-        );
+    if (taskRequirements?.requires_selected_target_column) {
+      if (!selectedTargetColumn) {
+        errors.push(`${datasetId}: candidate is missing selected_target_column for classification.`);
+      } else {
+        if (!candidate.source_schema?.available_columns?.includes(selectedTargetColumn)) {
+          errors.push(`${datasetId}: selected_target_column '${selectedTargetColumn}' is not present in source_schema.`);
+        }
+        if (!candidate.target_candidates.includes(selectedTargetColumn)) {
+          errors.push(
+            `${datasetId}: selected_target_column '${selectedTargetColumn}' was not validated as a plausible target candidate.`,
+          );
+        }
+        if (candidate.normalization_proposal?.fields?.completion?.source_column !== selectedTargetColumn) {
+          errors.push(
+            `${datasetId}: normalization completion field must point at selected_target_column '${selectedTargetColumn}'.`,
+          );
+        }
       }
     }
 
-    if (outputKind !== "prompt_completion") {
-      errors.push(`${datasetId}: classification SFT requires prompt_completion normalization.`);
+    if (taskRequirements && !taskRequirements.allowed_output_kinds?.includes(outputKind)) {
+      errors.push(
+        `${datasetId}: ${taskRequirements.task_family} SFT requires one of ${JSON.stringify(taskRequirements.allowed_output_kinds)} normalization shapes.`,
+      );
+    }
+
+    const resolvedTrainSplit =
+      normalizeOptionalString(selectedDataset.train_split) ?? candidate.preferred_train_split ?? "train";
+    const resolvedSourceSplits = normalizeSourceSplitList(
+      selectedDataset.source_splits ?? candidate.source_splits,
+      resolvedTrainSplit,
+    );
+    if (resolvedSourceSplits.length === 0) {
+      errors.push(`${datasetId}: source_splits must include at least one split.`);
     }
 
     selectedDatasets.push({
       dataset: datasetId,
       dataset_config: normalizeOptionalString(selectedDataset.dataset_config) ?? candidate.preferred_dataset_config,
-      train_split:
-        normalizeOptionalString(selectedDataset.train_split) ?? candidate.preferred_train_split ?? "train",
-      eval_split:
-        normalizeOptionalString(selectedDataset.eval_split) ?? candidate.preferred_eval_split ?? null,
+      train_split: resolvedTrainSplit,
+      eval_split: null,
+      source_splits: resolvedSourceSplits,
       weight: rawWeight,
       num_rows: candidate.num_rows,
       source_schema: candidate.source_schema,
@@ -1198,10 +1430,22 @@ function validateAndFinalizeSpec(
   const compilerOverrides = spec.method === "sft" ? loadCompilerOverrides() : DEFAULT_COMPILER_OVERRIDES;
   const overriddenSftGpuType =
     spec.method === "sft" ? resolveConfiguredSftGpuType(compilerOverrides) : null;
+  const overriddenSftMaxLength =
+    spec.method === "sft" ? resolveConfiguredSftMaxLength(compilerOverrides) : null;
+  const resolvedNumTrainEpochs =
+    spec.method === "sft"
+      ? resolveConfiguredSftNumTrainEpochs(compilerOverrides)
+      : params.num_train_epochs;
+  const resolvedEvaluationPlan = buildEvaluationPlan(taskRequirements, resolvedNumTrainEpochs);
+  const resolvedOutputShapePreference =
+    outputKinds.size === 1 ? [...outputKinds][0] : normalizedTaskSpec.output_shape_preference;
   const finalized = {
     job_id: jobId,
     objective_summary: normalizeOptionalString(spec.objective_summary) ?? "",
-    task_spec: normalizedTaskSpec,
+    task_spec: {
+      ...normalizedTaskSpec,
+      output_shape_preference: resolvedOutputShapePreference,
+    },
     method: spec.method,
     adaptation_strategy: "lora",
     artifact_strategy: spec.artifact_strategy,
@@ -1212,17 +1456,14 @@ function validateAndFinalizeSpec(
     selected_datasets: normalizeWeights(selectedDatasets),
     compute_preset: {
       gpu_type: overriddenSftGpuType ?? compute.gpu_type,
-      max_length: compute.max_length,
+      max_length: overriddenSftMaxLength ?? compute.max_length,
       per_device_train_batch_size: compute.per_device_train_batch_size,
       per_device_eval_batch_size: compute.per_device_eval_batch_size,
       gradient_accumulation_steps: compute.gradient_accumulation_steps,
     },
     training_params: {
       learning_rate: params.learning_rate,
-      num_train_epochs:
-        spec.method === "sft"
-          ? resolveConfiguredSftNumTrainEpochs(compilerOverrides)
-          : params.num_train_epochs,
+      num_train_epochs: resolvedNumTrainEpochs,
       max_steps: -1,
       lora_r: params.lora_r,
       lora_alpha: params.lora_alpha,
@@ -1234,6 +1475,7 @@ function validateAndFinalizeSpec(
     },
     seed_artifact: spec.seed_artifact,
     notes: Array.isArray(spec.notes) ? spec.notes.map((note) => String(note)) : [],
+    evaluation_plan: resolvedEvaluationPlan,
   };
 
   if (
@@ -1256,26 +1498,34 @@ function validateAndFinalizeSpec(
     );
   }
 
-  const trainingEstimate = buildTrainingEstimate(finalized);
-  if (trainingEstimate.expected_total_steps < 5) {
+  if (
+    spec.method === "sft" &&
+    overriddenSftMaxLength !== null &&
+    Number(compute.max_length) !== finalized.compute_preset.max_length
+  ) {
+    finalized.notes.push(
+      `Compiler override applied: max_length=${finalized.compute_preset.max_length}.`,
+    );
+  }
+
+  let trainingEstimate = buildTrainingEstimate(finalized);
+  if (
+    finalized.training_params.max_steps <= 0 &&
+    trainingEstimate.expected_total_steps < MIN_EXPECTED_TRAINING_STEPS
+  ) {
+    const flooredFromSteps = trainingEstimate.expected_total_steps;
+    finalized.training_params.max_steps = MIN_EXPECTED_TRAINING_STEPS;
+    finalized.notes.push(
+      `Compiler safeguard applied: max_steps=${MIN_EXPECTED_TRAINING_STEPS} because epoch-based expected_total_steps=${flooredFromSteps} fell below the minimum of ${MIN_EXPECTED_TRAINING_STEPS}.`,
+    );
+    trainingEstimate = buildTrainingEstimate(finalized);
+  }
+  if (trainingEstimate.expected_total_steps < MIN_EXPECTED_TRAINING_STEPS) {
     errors.push(
-      `training plan is degenerate: expected_total_steps=${trainingEstimate.expected_total_steps}, which is below the minimum of 5.`,
+      `training plan is degenerate: expected_total_steps=${trainingEstimate.expected_total_steps}, which is below the minimum of ${MIN_EXPECTED_TRAINING_STEPS}.`,
     );
   }
   finalized.training_estimate = trainingEstimate;
-  finalized.evaluation_plan = {
-    strategy: "classification_holdout_or_eval_split",
-    holdout_fraction: 0.1,
-    deterministic_seed: 42,
-    required_metrics: [
-      "accuracy",
-      "macro_f1",
-      "invalid_label_rate",
-      "label_coverage",
-      "confusion_matrix",
-      "label_distributions",
-    ],
-  };
   if (trainingEstimate.expected_total_steps < 20) {
     finalized.notes.push(
       `Warning: expected_total_steps is low (${trainingEstimate.expected_total_steps}); the run may under-train.`,
@@ -1304,6 +1554,7 @@ function buildPreparedDatasetManifest(spec) {
       dataset_config: dataset.dataset_config,
       train_split: dataset.train_split,
       eval_split: dataset.eval_split,
+      source_splits: dataset.source_splits,
       weight: dataset.weight,
       num_rows: dataset.num_rows,
       source_schema: dataset.source_schema,
@@ -1447,8 +1698,12 @@ function buildDefaultTrainingParams(method) {
   };
 }
 
-function buildFallbackSpec(objectiveSummary, jobId, candidateProfiles, seedArtifact) {
-  const firstCandidate = candidateProfiles.find((candidate) => candidate.compatible_methods.includes("sft"));
+function buildFallbackSpec(objectiveSummary, jobId, candidateProfiles, seedArtifact, taskSpec) {
+  const normalizedTaskSpec = normalizeTaskSpec(taskSpec);
+  const taskRequirements = getTaskRequirements(normalizedTaskSpec);
+  const firstCandidate = candidateProfiles.find((candidate) =>
+    isCandidateCompatibleWithTaskSpec(candidate, normalizedTaskSpec),
+  );
   if (!firstCandidate || !firstCandidate.normalization_proposal) {
     throw new Error("Unable to build even a fallback SFT spec because no compatible SFT dataset candidate was found.");
   }
@@ -1456,14 +1711,16 @@ function buildFallbackSpec(objectiveSummary, jobId, candidateProfiles, seedArtif
   return {
     job_id: jobId,
     objective_summary: objectiveSummary,
-    task_spec: normalizeTaskSpec({
-      supported: true,
-      task_family: "classification",
-      target_policy: "single_target",
-      output_shape_preference: "prompt_completion",
-      objective_summary: objectiveSummary,
-      unsupported_reason: null,
-    }),
+    task_spec:
+      normalizedTaskSpec ??
+      normalizeTaskSpec({
+        supported: true,
+        task_family: taskRequirements?.task_family ?? "classification",
+        target_policy: taskRequirements?.target_policy ?? "single_target",
+        output_shape_preference: taskRequirements?.output_shape_preference ?? "prompt_completion",
+        objective_summary: objectiveSummary,
+        unsupported_reason: null,
+      }),
     method: "sft",
     adaptation_strategy: "lora",
     artifact_strategy: "adapter",
@@ -1473,7 +1730,8 @@ function buildFallbackSpec(objectiveSummary, jobId, candidateProfiles, seedArtif
         dataset: firstCandidate.dataset,
         dataset_config: firstCandidate.preferred_dataset_config,
         train_split: firstCandidate.preferred_train_split,
-        eval_split: firstCandidate.preferred_eval_split,
+        eval_split: null,
+        source_splits: firstCandidate.source_splits,
         weight: 1,
         source_schema: firstCandidate.source_schema,
         normalization: firstCandidate.normalization_proposal,
@@ -1510,8 +1768,17 @@ async function generateValidatedSpec({
   let previousSpec = null;
   let validationErrors = [];
   const specSchema = getSpecSchema(platformConstraints.supported_methods);
+  const schemaErrors = validateStrictStructuredOutputSchema(specSchema);
+  if (schemaErrors.length > 0) {
+    throw new Error(
+      `Internal post-training spec schema is invalid for OpenAI Structured Outputs: ${schemaErrors.join(" ")}`,
+    );
+  }
 
   for (let attempt = 1; attempt <= MAX_REPAIR_ATTEMPTS; attempt += 1) {
+    if (attempt > 1) {
+      logUiProgress("I'm refining the training plan");
+    }
     const prompt = buildSpecPrompt({
       objectiveSummary,
       context,
@@ -1556,7 +1823,13 @@ async function generateValidatedSpec({
   }
 
   logInfo("LLM spec generation could not be repaired after retries; falling back to a deterministic SFT plan.");
-  const fallbackSpec = buildFallbackSpec(objectiveSummary, jobId, candidateProfiles, seedArtifact);
+  const fallbackSpec = buildFallbackSpec(
+    objectiveSummary,
+    jobId,
+    candidateProfiles,
+    seedArtifact,
+    context.task_spec,
+  );
   const fallbackValidation = validateAndFinalizeSpec(
     fallbackSpec,
     candidateProfiles,
@@ -1619,11 +1892,14 @@ export async function runCompiler(args, options = {}) {
     const rawInput = await loadJsonFile(args.inputPath);
     const contextOverride = args.contextPath ? await loadJsonFile(args.contextPath) : null;
     const normalizedInput = normalizeCompilerInput(rawInput, contextOverride);
-    const sortedCandidates = [...normalizedInput.candidates].sort((left, right) => right.score - left.score);
-    const candidateProfiles = sortedCandidates.slice(0, 8);
+  const normalizedTaskSpec = normalizeTaskSpec(normalizedInput.context.task_spec);
+  const sortedCandidates = [...normalizedInput.candidates].sort((left, right) => right.score - left.score);
+  const candidateProfiles = sortedCandidates.slice(0, 8);
 
-    logInfo(`loaded ${candidateProfiles.length} ranked dataset candidates from recommendation output`);
-    const candidateDiagnostics = candidateProfiles.map((candidate) => {
+  logUiProgress("I'm loading the training data");
+  logInfo(`loaded ${candidateProfiles.length} ranked dataset candidates from recommendation output`);
+  logUiProgress("I'm checking that the data is ready for training");
+  const candidateDiagnostics = candidateProfiles.map((candidate) => {
       const validationErrors = candidate.normalization_proposal
         ? validateNormalizationProposalShared(
             candidate.normalization_proposal,
@@ -1638,13 +1914,16 @@ export async function runCompiler(args, options = {}) {
     const usableCandidates = candidateDiagnostics
       .filter(
         ({ candidate, validationErrors }) =>
-          validationErrors.length === 0 && candidate.compatible_methods.includes("sft"),
+          validationErrors.length === 0 && isCandidateCompatibleWithTaskSpec(candidate, normalizedTaskSpec),
       )
       .map(({ candidate }) => candidate);
     if (!usableCandidates.length) {
       const diagnosticMessage = candidateDiagnostics
         .map(({ candidate, validationErrors }) =>
-          `${candidate.dataset}: ${validationErrors.join(" ") || "not compatible with sft."}`,
+          `${candidate.dataset}: ${
+            validationErrors.join(" ") ||
+            `not compatible with ${normalizedTaskSpec?.task_family ?? "the requested"} SFT requirements.`
+          }`,
         )
         .join(" ; ");
       throw new Error(
@@ -1658,12 +1937,13 @@ export async function runCompiler(args, options = {}) {
     const generatedJobId = explicitJobId
       ? explicitJobId
       : `${slugify(objectiveSummary || usableCandidates[0].dataset || "job")}-${timestamp}`;
-    const platformConstraints = buildPlatformConstraints(args.seedArtifact);
+  const platformConstraints = buildPlatformConstraints(normalizedTaskSpec, args.seedArtifact);
 
-    const { spec, attempts } = await generateValidatedSpec({
-      objectiveSummary,
-      context: normalizedInput.context,
-      candidateProfiles: usableCandidates,
+  logUiProgress("I'm putting together the training plan");
+  const { spec, attempts } = await generateValidatedSpec({
+    objectiveSummary,
+    context: normalizedInput.context,
+    candidateProfiles: usableCandidates,
       platformConstraints,
       seedArtifact: args.seedArtifact,
       jobId: generatedJobId,
@@ -1696,6 +1976,7 @@ export async function runCompiler(args, options = {}) {
         preferred_dataset_config: candidate.preferred_dataset_config,
         preferred_train_split: candidate.preferred_train_split,
         preferred_eval_split: candidate.preferred_eval_split,
+        source_splits: candidate.source_splits,
         warnings: candidate.warnings,
       })),
       attempts,
@@ -1707,6 +1988,7 @@ export async function runCompiler(args, options = {}) {
       },
     };
 
+    logUiProgress("I'm saving the training setup");
     await writeArtifacts(outputDir, {
       spec,
       compiledConfig,
@@ -1727,6 +2009,7 @@ export async function runCompiler(args, options = {}) {
         dataset: dataset.dataset,
         weight: dataset.weight,
         normalization_shape: dataset.normalization?.shape ?? null,
+        source_splits: dataset.source_splits,
       })),
       compiled_config_path: path.join(outputDir, "compiled_train_config.yaml"),
       spec_path: path.join(outputDir, "post_training_job_spec.yaml"),

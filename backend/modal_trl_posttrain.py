@@ -25,8 +25,8 @@ vllm serve Qwen/Qwen3.5-9B-Base --enable-lora --lora-modules run=/checkpoints/ex
 
 Notes:
 - This example is intentionally PEFT/LoRA-first.
-- `gpu_type` is part of the public config. Because Modal GPU resources are static on
-  plain functions, the runtime GPU override is implemented with `Cls.with_options(...)`.
+- `gpu_type` is part of the public config. Runtime launch normalizes public aliases
+  (`A10`, `A10G`, `L40S`, `H100`) and dispatches to GPU-specific Modal classes.
 - For non-SFT trainers, this example expects a prior SFT adapter path in
   `seed_artifact`, following TRL's recommended workflow.
 - Create a Modal secret named `huggingface-secret` before running this example.
@@ -39,7 +39,10 @@ import json
 import os
 import random
 import re
+import urllib.error
+import urllib.request
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
@@ -61,6 +64,12 @@ DEFAULT_TARGET_MODULES = [
     "up_proj",
     "down_proj",
 ]
+DEFAULT_COMPARISON_MAX_EXAMPLES = 30
+DEFAULT_CLASSIFICATION_EVAL_MAX_EXAMPLES = 256
+DEFAULT_GENERATION_EVAL_MAX_NEW_TOKENS = 256
+DEFAULT_EVAL_JUDGE_MODEL = "gpt-5.4"
+OPENAI_RESPONSES_API_URL = "https://api.openai.com/v1/responses"
+THINK_TAG_BLOCK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
 
 NON_TEXT_COLUMN_PATTERNS = (
     re.compile(r"(^|_)(image|images|img|photo|picture|pixel|pixels|frame|frames)(_|$)", re.IGNORECASE),
@@ -71,6 +80,11 @@ MODEL_CACHE_DIR = Path("/model_cache")
 DATASET_CACHE_DIR = Path("/dataset_cache")
 CHECKPOINTS_DIR = Path("/checkpoints")
 EXPERIMENTS_DIR = CHECKPOINTS_DIR / "experiments"
+PROVENANCE_DATASET_COLUMN = "__pt_dataset_id"
+PROVENANCE_SPLIT_COLUMN = "__pt_source_split"
+STRUCTURED_TRAINING_METRIC_PREFIX = "PT_METRIC_EVENT::"
+STRUCTURED_LIFECYCLE_EVENT_PREFIX = "PT_LIFECYCLE_EVENT::"
+STRUCTURED_PROGRESS_PREFIX = "PT_PROGRESS::"
 
 HF_SECRET = modal.Secret.from_name("huggingface-secret")
 MODEL_CACHE_VOLUME = modal.Volume.from_name("trl-model-cache", create_if_missing=True)
@@ -103,6 +117,33 @@ train_image = (
 )
 
 app = modal.App(APP_NAME)
+
+PUBLIC_GPU_TYPE_BY_ALIAS = {
+    "A10": "A10",
+    "A10G": "A10",
+    "L40S": "L40S",
+    "H100": "H100",
+}
+MODAL_GPU_TYPE_BY_PUBLIC_GPU_TYPE = {
+    "A10": "A10G",
+    "L40S": "L40S",
+    "H100": "H100",
+}
+
+
+def _normalize_gpu_type(value: Any) -> tuple[str, str]:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("gpu_type must be one of A10, A10G, L40S, or H100.")
+
+    normalized = value.strip().upper()
+    public_gpu_type = PUBLIC_GPU_TYPE_BY_ALIAS.get(normalized)
+    if public_gpu_type is None:
+        raise ValueError(
+            f"Unsupported gpu_type {value!r}. Expected one of A10, A10G, L40S, or H100."
+        )
+
+    modal_gpu_type = MODAL_GPU_TYPE_BY_PUBLIC_GPU_TYPE[public_gpu_type]
+    return public_gpu_type, modal_gpu_type
 
 
 @dataclass
@@ -161,6 +202,7 @@ class TrainConfig:
             raise ValueError("output_name must be a non-empty string.")
         if not self.base_model.strip():
             raise ValueError("base_model must be a non-empty string.")
+        self.gpu_type, _ = _normalize_gpu_type(self.gpu_type)
         if self.trainer_type != "sft" and not (self.seed_artifact or "").strip():
             raise ValueError("seed_artifact is required for dpo, kto, orpo, cpo, and bco runs.")
         if not self.use_peft:
@@ -216,6 +258,11 @@ class TrainConfig:
     def run_config_path(self) -> Path:
         return self.run_dir / "run_config.yaml"
 
+    @property
+    def modal_gpu_type(self) -> str:
+        _, modal_gpu_type = _normalize_gpu_type(self.gpu_type)
+        return modal_gpu_type
+
     def to_serializable_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["learning_rate"] = self.resolved_learning_rate
@@ -231,6 +278,18 @@ def _build_runtime_secrets(config: TrainConfig) -> list[modal.Secret]:
     secrets = [HF_SECRET]
     if config.enable_wandb:
         secrets.append(modal.Secret.from_name("wandb-secret"))
+    if (
+        config.trainer_type == "sft"
+        and (config.task_spec or {}).get("task_family") == "generation"
+        and _maybe_none(os.environ.get("OPENAI_API_KEY"))
+    ):
+        secret_payload = {
+            "OPENAI_API_KEY": os.environ["OPENAI_API_KEY"],
+        }
+        judge_model = _maybe_none(os.environ.get("POSTTRAINING_EVAL_JUDGE_MODEL"))
+        if judge_model:
+            secret_payload["POSTTRAINING_EVAL_JUDGE_MODEL"] = judge_model
+        secrets.append(modal.Secret.from_dict(secret_payload))
     return secrets
 
 
@@ -246,6 +305,10 @@ def _maybe_none(value: Any) -> str | None:
         raise ValueError(f"Expected a string or null value, got {type(value).__name__}.")
     normalized = value.strip()
     return normalized or None
+
+
+def _is_qwen_family_base_model(model_id: Any) -> bool:
+    return isinstance(model_id, str) and model_id.startswith("Qwen/")
 
 
 def _is_conversational_value(value: Any) -> bool:
@@ -841,6 +904,223 @@ def _concat_datasets(datasets_to_concat: list[Any]) -> Any:
     return concatenate_datasets(datasets_to_concat)
 
 
+def _resolve_source_splits_for_entry(entry: dict[str, Any], config: TrainConfig) -> list[str]:
+    raw_source_splits = entry.get("source_splits")
+    if isinstance(raw_source_splits, list):
+        source_splits: list[str] = []
+        for raw_split in raw_source_splits:
+            normalized = _maybe_none(raw_split)
+            if normalized and normalized not in source_splits:
+                source_splits.append(normalized)
+        if source_splits:
+            return source_splits
+
+    fallback_split = _maybe_none(entry.get("train_split")) or config.train_split
+    if not fallback_split:
+        raise ValueError("Prepared dataset manifest entry is missing both source_splits and train_split.")
+    return [fallback_split]
+
+
+def _annotate_dataset_provenance(dataset: Any, dataset_id: str, split_name: str) -> Any:
+    return dataset.map(
+        lambda example: {
+            **example,
+            PROVENANCE_DATASET_COLUMN: dataset_id,
+            PROVENANCE_SPLIT_COLUMN: split_name,
+        },
+        desc=f"Annotating provenance for {dataset_id}:{split_name}",
+    )
+
+
+def _dataset_distribution_by_provenance(dataset: Any) -> dict[str, int]:
+    if dataset is None or PROVENANCE_DATASET_COLUMN not in set(dataset.column_names):
+        return {}
+
+    counts: dict[str, int] = {}
+    for dataset_id in dataset[PROVENANCE_DATASET_COLUMN]:
+        normalized = str(dataset_id).strip()
+        counts[normalized] = counts.get(normalized, 0) + 1
+    return dict(sorted(counts.items(), key=lambda item: item[0]))
+
+
+def _create_random_holdout(
+    dataset: Any,
+    *,
+    fraction: float,
+    seed: int,
+) -> tuple[Any, Any, dict[str, Any]]:
+    total_rows = len(dataset)
+    if total_rows <= 1:
+        return dataset, dataset.select([]), {
+            "created_holdout": False,
+            "strategy": "deterministic_random_holdout",
+            "fraction": fraction,
+            "seed": seed,
+            "train_examples": total_rows,
+            "eval_examples": 0,
+        }
+
+    rng = random.Random(seed)
+    indices = list(range(total_rows))
+    rng.shuffle(indices)
+    eval_count = max(1, round(total_rows * fraction))
+    eval_count = min(eval_count, total_rows - 1)
+    eval_indices = sorted(indices[:eval_count])
+    train_indices = sorted(indices[eval_count:])
+
+    train_dataset = dataset.select(train_indices)
+    eval_dataset = dataset.select(eval_indices)
+    return train_dataset, eval_dataset, {
+        "created_holdout": True,
+        "strategy": "deterministic_random_holdout",
+        "fraction": fraction,
+        "seed": seed,
+        "train_examples": len(train_dataset),
+        "eval_examples": len(eval_dataset),
+    }
+
+
+def _reweight_train_dataset_by_provenance(train_dataset: Any, dataset_weights: dict[str, float]) -> Any:
+    if (
+        train_dataset is None
+        or len(train_dataset) <= 0
+        or PROVENANCE_DATASET_COLUMN not in set(train_dataset.column_names)
+    ):
+        return train_dataset
+
+    indices_by_dataset: dict[str, list[int]] = {}
+    for index, dataset_id in enumerate(train_dataset[PROVENANCE_DATASET_COLUMN]):
+        normalized = str(dataset_id).strip()
+        indices_by_dataset.setdefault(normalized, []).append(index)
+
+    datasets_to_mix: list[Any] = []
+    probabilities: list[float] = []
+    for dataset_id, weight in dataset_weights.items():
+        indices = indices_by_dataset.get(dataset_id, [])
+        if not indices:
+            continue
+        datasets_to_mix.append(train_dataset.select(indices))
+        probabilities.append(float(weight))
+
+    if not datasets_to_mix:
+        return train_dataset
+    return _mix_datasets(datasets_to_mix, probabilities)
+
+
+def _load_sft_prepared_manifest_datasets(
+    config: TrainConfig,
+) -> tuple[Any, Any | None, dict[str, Any] | None, dict[str, Any] | None]:
+    manifest = config.prepared_dataset_manifest or {}
+    selected_datasets = manifest.get("selected_datasets")
+    if not isinstance(selected_datasets, list) or not selected_datasets:
+        raise ValueError(
+            "prepared_dataset_manifest must include a non-empty `selected_datasets` list."
+        )
+
+    prepared_pools: list[Any] = []
+    dataset_weights: dict[str, float] = {}
+    expected_signature: tuple[str, ...] | None = None
+    preprocessing_entries: list[dict[str, Any]] = []
+    source_splits_by_dataset: dict[str, list[str]] = {}
+
+    for raw_entry in selected_datasets:
+        if not isinstance(raw_entry, dict):
+            raise ValueError("Each prepared_dataset_manifest selected_datasets entry must be an object.")
+
+        dataset_id = _require_manifest_string(raw_entry, "dataset", raw_entry.get("dataset", "dataset"))
+        dataset_config = _maybe_none(raw_entry.get("dataset_config"))
+        source_splits = _resolve_source_splits_for_entry(raw_entry, config)
+        source_splits_by_dataset[dataset_id] = source_splits
+
+        raw_weight = raw_entry.get("weight", 1)
+        try:
+            train_weight = float(raw_weight)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Prepared dataset `{dataset_id}` has invalid weight `{raw_weight}`."
+            ) from exc
+        if train_weight <= 0:
+            raise ValueError(f"Prepared dataset `{dataset_id}` weight must be positive.")
+
+        per_split_datasets: list[Any] = []
+        for split_name in source_splits:
+            source_dataset = _load_single_dataset(
+                dataset_name=dataset_id,
+                dataset_config=dataset_config,
+                split=split_name,
+            )
+            prepared_split, split_diagnostics = _prepare_prepared_dataset_entry(
+                source_dataset,
+                raw_entry,
+                split_name=split_name,
+            )
+            if split_diagnostics is not None:
+                preprocessing_entries.append(split_diagnostics)
+            if len(prepared_split) <= 0:
+                continue
+
+            prepared_split = _annotate_dataset_provenance(prepared_split, dataset_id, split_name)
+            current_signature = _dataset_column_signature(prepared_split)
+            if expected_signature is None:
+                expected_signature = current_signature
+            elif current_signature != expected_signature:
+                raise ValueError(
+                    "All selected datasets in prepared_dataset_manifest must normalize to the same "
+                    f"column shape. Expected {expected_signature}, got {current_signature} for `{dataset_id}`."
+                )
+            per_split_datasets.append(prepared_split)
+
+        if not per_split_datasets:
+            raise ValueError(
+                f"Prepared dataset `{dataset_id}` has no usable rows across source_splits {source_splits}."
+            )
+
+        prepared_pools.append(_concat_datasets(per_split_datasets))
+        dataset_weights[dataset_id] = train_weight
+
+    combined_pool = _concat_datasets(prepared_pools)
+    evaluation_plan = config.evaluation_plan or {}
+    holdout_fraction = float(evaluation_plan.get("holdout_fraction", 0.1))
+    deterministic_seed = int(evaluation_plan.get("deterministic_seed", 42))
+    use_stratified_holdout = (
+        (config.task_spec or {}).get("task_family") == "classification"
+        and "completion" in set(combined_pool.column_names)
+    )
+
+    if use_stratified_holdout:
+        raw_train_dataset, raw_eval_dataset, holdout_metadata = _create_stratified_holdout(
+            combined_pool,
+            fraction=holdout_fraction,
+            seed=deterministic_seed,
+        )
+    else:
+        raw_train_dataset, raw_eval_dataset, holdout_metadata = _create_random_holdout(
+            combined_pool,
+            fraction=holdout_fraction,
+            seed=deterministic_seed,
+        )
+
+    weighted_train_dataset = _reweight_train_dataset_by_provenance(raw_train_dataset, dataset_weights)
+    if raw_eval_dataset is not None and len(raw_eval_dataset) <= 0:
+        raw_eval_dataset = None
+
+    if holdout_metadata is not None:
+        holdout_metadata["source_splits_by_dataset"] = source_splits_by_dataset
+        holdout_metadata["pre_weight_train_examples"] = len(raw_train_dataset)
+        holdout_metadata["weighted_train_examples"] = len(weighted_train_dataset)
+        holdout_metadata["train_dataset_distribution"] = _dataset_distribution_by_provenance(raw_train_dataset)
+        holdout_metadata["eval_dataset_distribution"] = (
+            _dataset_distribution_by_provenance(raw_eval_dataset) if raw_eval_dataset is not None else {}
+        )
+
+    return (
+        weighted_train_dataset,
+        raw_eval_dataset,
+        _summarize_preprocessing_diagnostics(preprocessing_entries),
+        holdout_metadata,
+    )
+
+
 def _load_prepared_manifest_datasets(config: TrainConfig) -> tuple[Any, Any, dict[str, Any] | None]:
     manifest = config.prepared_dataset_manifest or {}
     selected_datasets = manifest.get("selected_datasets")
@@ -1041,6 +1321,22 @@ def _sample_eval_dataset(dataset: Any, *, max_examples: int, seed: int) -> Any:
     return dataset.select(sorted(indices[:max_examples]))
 
 
+def _truncate_preview(value: Any, limit: int = 200) -> str:
+    text = str(value).strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)] + "..."
+
+
+def _comparison_sample_policy(total_eval_examples: int, *, max_examples: int, seed: int) -> dict[str, Any]:
+    return {
+        "max_cases": max_examples,
+        "sampled_cases": min(total_eval_examples, max_examples),
+        "total_eval_examples": total_eval_examples,
+        "seed": seed,
+    }
+
+
 def _predict_completion_label(model: Any, tokenizer: Any, prompt: str, max_new_tokens: int = 16) -> str:
     import torch
 
@@ -1063,6 +1359,95 @@ def _predict_completion_label(model: Any, tokenizer: Any, prompt: str, max_new_t
     prompt_length = encoded["input_ids"].shape[1]
     completion_ids = generated[0][prompt_length:]
     return tokenizer.decode(completion_ids, skip_special_tokens=True).strip()
+
+
+def _predict_classification_outputs(model: Any, tokenizer: Any, eval_dataset: Any) -> dict[str, Any]:
+    gold_labels = [str(value).strip() for value in eval_dataset["completion"]]
+    normalized_to_label = {}
+    for label in gold_labels:
+        normalized = _normalized_label(label)
+        if normalized and normalized not in normalized_to_label:
+            normalized_to_label[normalized] = label
+
+    predictions: list[str | None] = []
+    raw_predictions: list[str] = []
+    for prompt in eval_dataset["prompt"]:
+        raw_prediction = _predict_completion_label(model, tokenizer, str(prompt))
+        raw_predictions.append(raw_prediction)
+        canonical = normalized_to_label.get(_normalized_label(raw_prediction))
+        predictions.append(canonical)
+
+    return {
+        "gold_labels": gold_labels,
+        "labels": sorted(set(gold_labels)),
+        "predictions": predictions,
+        "raw_predictions": raw_predictions,
+    }
+
+
+def _build_classification_eval_result(eval_dataset: Any, prediction_bundle: dict[str, Any]) -> dict[str, Any]:
+    gold_labels = prediction_bundle["gold_labels"]
+    labels = prediction_bundle["labels"]
+    predictions = prediction_bundle["predictions"]
+    raw_predictions = prediction_bundle["raw_predictions"]
+
+    total = len(gold_labels)
+    invalid_predictions = sum(1 for prediction in predictions if prediction is None)
+    valid_predictions = [prediction if prediction is not None else "__invalid__" for prediction in predictions]
+    accuracy = (
+        sum(1 for expected, actual in zip(gold_labels, predictions) if expected == actual) / total
+        if total
+        else 0.0
+    )
+    macro_f1 = _macro_f1(labels, gold_labels, valid_predictions)
+    coverage = len({prediction for prediction in predictions if prediction in labels}) / len(labels) if labels else 0.0
+
+    confusion_matrix: dict[str, dict[str, int]] = {}
+    for expected, actual in zip(gold_labels, valid_predictions):
+        row = confusion_matrix.setdefault(expected, {})
+        row[actual] = row.get(actual, 0) + 1
+
+    return {
+        "task_family": "classification",
+        "strategy": "offline_prompt_completion_eval",
+        "sampled_examples": total,
+        "metrics": {
+            "accuracy": accuracy,
+            "macro_f1": macro_f1,
+            "invalid_label_rate": (invalid_predictions / total) if total else 1.0,
+            "label_coverage": coverage,
+        },
+        "label_distributions": {
+            "gold": _label_distribution(eval_dataset),
+            "predicted": dict(
+                sorted(
+                    (
+                        (
+                            label,
+                            sum(1 for prediction in predictions if prediction == label),
+                        )
+                        for label in labels
+                    ),
+                    key=lambda item: item[0],
+                )
+            ),
+        },
+        "confusion_matrix": confusion_matrix,
+        "sample_predictions": [
+            {
+                "prompt_preview": str(prompt)[:160],
+                "gold": gold,
+                "prediction": prediction,
+                "raw_prediction": raw_prediction[:80],
+            }
+            for prompt, gold, prediction, raw_prediction in zip(
+                eval_dataset["prompt"][:10],
+                gold_labels[:10],
+                predictions[:10],
+                raw_predictions[:10],
+            )
+        ],
+    }
 
 
 def _macro_f1(labels: list[str], gold: list[str], predicted: list[str]) -> float:
@@ -1089,80 +1474,806 @@ def _evaluate_classification_dataset(
     seed: int,
 ) -> dict[str, Any]:
     sampled_eval = _sample_eval_dataset(eval_dataset, max_examples=max_examples, seed=seed)
-    gold_labels = [str(value).strip() for value in sampled_eval["completion"]]
-    normalized_to_label = {}
-    for label in gold_labels:
-        normalized = _normalized_label(label)
-        if normalized and normalized not in normalized_to_label:
-            normalized_to_label[normalized] = label
+    prediction_bundle = _predict_classification_outputs(model, tokenizer, sampled_eval)
+    return _build_classification_eval_result(sampled_eval, prediction_bundle)
 
-    predictions: list[str | None] = []
-    raw_predictions: list[str] = []
-    for prompt in sampled_eval["prompt"]:
-        raw_prediction = _predict_completion_label(model, tokenizer, str(prompt))
-        raw_predictions.append(raw_prediction)
-        canonical = normalized_to_label.get(_normalized_label(raw_prediction))
-        predictions.append(canonical)
 
-    total = len(gold_labels)
-    invalid_predictions = sum(1 for prediction in predictions if prediction is None)
-    valid_predictions = [prediction if prediction is not None else "__invalid__" for prediction in predictions]
-    accuracy = (
-        sum(1 for expected, actual in zip(gold_labels, predictions) if expected == actual) / total
-        if total
-        else 0.0
-    )
-    labels = sorted(set(gold_labels))
-    macro_f1 = _macro_f1(labels, gold_labels, valid_predictions)
-    coverage = len({prediction for prediction in predictions if prediction in labels}) / len(labels) if labels else 0.0
+def _classification_winner_from_metrics(
+    baseline_metrics: dict[str, Any],
+    candidate_metrics: dict[str, Any],
+) -> str:
+    baseline_accuracy = float(baseline_metrics.get("accuracy", 0.0))
+    candidate_accuracy = float(candidate_metrics.get("accuracy", 0.0))
+    if candidate_accuracy > baseline_accuracy:
+        return "candidate"
+    if baseline_accuracy > candidate_accuracy:
+        return "baseline"
 
-    confusion_matrix: dict[str, dict[str, int]] = {}
-    for expected, actual in zip(gold_labels, valid_predictions):
-        row = confusion_matrix.setdefault(expected, {})
-        row[actual] = row.get(actual, 0) + 1
+    baseline_macro_f1 = float(baseline_metrics.get("macro_f1", 0.0))
+    candidate_macro_f1 = float(candidate_metrics.get("macro_f1", 0.0))
+    if candidate_macro_f1 > baseline_macro_f1:
+        return "candidate"
+    if baseline_macro_f1 > candidate_macro_f1:
+        return "baseline"
+    return "tie"
 
+
+def _metric_deltas(baseline_metrics: dict[str, Any], candidate_metrics: dict[str, Any]) -> dict[str, float]:
+    deltas: dict[str, float] = {}
+    for key, candidate_value in candidate_metrics.items():
+        baseline_value = baseline_metrics.get(key)
+        if isinstance(candidate_value, (int, float)) and isinstance(baseline_value, (int, float)):
+            deltas[key] = float(candidate_value) - float(baseline_value)
+    return deltas
+
+
+def _clear_inference_model(model: Any | None) -> None:
+    if model is None:
+        return
+
+    try:
+        del model
+    finally:
+        import gc
+
+        gc.collect()
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+
+def _selected_dataset_ids(config: TrainConfig) -> list[str]:
+    if config.dataset_source_type != "prepared_manifest":
+        return [config.dataset_name]
+    return [
+        entry.get("dataset")
+        for entry in (config.prepared_dataset_manifest or {}).get("selected_datasets", [])
+        if isinstance(entry, dict) and entry.get("dataset")
+    ]
+
+
+def _should_build_merged_artifact(config: TrainConfig) -> bool:
+    return bool(config.merge_after_train or _is_qwen_family_base_model(config.base_model))
+
+
+def _emit_structured_lifecycle_event(event_type: str, **data: Any) -> None:
+    payload = {
+        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "event": event_type,
+        **data,
+    }
+    print(f"{STRUCTURED_LIFECYCLE_EVENT_PREFIX}{json.dumps(payload, sort_keys=True)}", flush=True)
+
+
+def _emit_progress_update(message: str) -> None:
+    print(f"{STRUCTURED_PROGRESS_PREFIX}{message}", flush=True)
+
+
+def _build_training_result(
+    config: TrainConfig,
+    *,
+    trainer_meta: dict[str, Any],
+    normalized_train_dataset: Any,
+    normalized_eval_dataset: Any | None,
+    training_output: Any,
+    preprocessing_diagnostics: dict[str, Any] | None,
+    holdout_metadata: dict[str, Any] | None,
+    resumed_from_checkpoint: str | None,
+    include_merged_dir: bool,
+) -> dict[str, Any]:
     return {
-        "task_family": "classification",
-        "strategy": "offline_prompt_completion_eval",
-        "sampled_examples": total,
-        "metrics": {
-            "accuracy": accuracy,
-            "macro_f1": macro_f1,
-            "invalid_label_rate": (invalid_predictions / total) if total else 1.0,
-            "label_coverage": coverage,
-        },
-        "label_distributions": {
-            "gold": _label_distribution(sampled_eval),
-            "predicted": dict(
-                sorted(
-                    (
-                        (
-                            label,
-                            sum(1 for prediction in predictions if prediction == label),
-                        )
-                        for label in labels
-                    ),
-                    key=lambda item: item[0],
-                )
-            ),
-        },
-        "confusion_matrix": confusion_matrix,
-        "sample_predictions": [
-            {
-                "prompt_preview": str(prompt)[:160],
-                "gold": gold,
-                "prediction": prediction,
-                "raw_prediction": raw_prediction[:80],
-            }
-            for prompt, gold, prediction, raw_prediction in zip(
-                sampled_eval["prompt"][:10],
-                gold_labels[:10],
-                predictions[:10],
-                raw_predictions[:10],
-            )
+        "trainer_type": config.trainer_type,
+        "trainer_class": trainer_meta["trainer"],
+        "base_model": config.base_model,
+        "dataset_name": config.dataset_name,
+        "dataset_source_type": config.dataset_source_type,
+        "selected_datasets": _selected_dataset_ids(config),
+        "output_name": config.output_name,
+        "gpu_type": config.gpu_type,
+        "modal_gpu_type": config.modal_gpu_type,
+        "learning_rate": config.resolved_learning_rate,
+        "task_spec": config.task_spec,
+        "training_estimate": config.training_estimate,
+        "preprocessing_diagnostics": preprocessing_diagnostics,
+        "train_examples": len(normalized_train_dataset),
+        "eval_examples": len(normalized_eval_dataset) if normalized_eval_dataset is not None else 0,
+        "checkpoint_dir": str(config.checkpoints_dir),
+        "final_adapter_dir": str(config.final_adapter_dir),
+        "merged_dir": str(config.merged_dir) if include_merged_dir else None,
+        "resumed_from_checkpoint": resumed_from_checkpoint,
+        "global_step": int(getattr(training_output, "global_step", 0)),
+        "training_loss": float(getattr(training_output, "training_loss", 0.0)),
+        "evaluation": None,
+        "holdout": holdout_metadata,
+        "notes": [
+            "Use final_adapter_dir for vLLM LoRA serving with --enable-lora.",
+            "Use merged_dir for direct vLLM base-model serving when merge_after_train=True or for Qwen-family deployments.",
         ],
     }
 
+
+def _load_adapter_inference_model(config: TrainConfig) -> Any:
+    from peft import PeftModel
+
+    adapter_dir = config.final_adapter_dir
+    if not adapter_dir.exists():
+        raise FileNotFoundError(f"final_adapter_dir does not exist: {adapter_dir}")
+
+    model = _load_base_model(config)
+    model = PeftModel.from_pretrained(model, str(adapter_dir), is_trainable=False)
+    model.config.use_cache = False
+    return model
+
+
+def _predict_generation_response(
+    model: Any,
+    tokenizer: Any,
+    prompt: str,
+    *,
+    max_new_tokens: int,
+) -> str:
+    return _predict_completion_label(
+        model,
+        tokenizer,
+        prompt,
+        max_new_tokens=max_new_tokens,
+    )
+
+
+def _strip_thinking_blocks(text: str) -> str:
+    value = str(text or "")
+    if "<think>" not in value.lower():
+        return value.strip()
+
+    stripped = THINK_TAG_BLOCK_RE.sub("", value)
+    stripped = re.sub(r"</?think>", "", stripped, flags=re.IGNORECASE)
+    stripped = re.sub(r"\n{3,}", "\n\n", stripped)
+    return stripped.strip()
+
+
+_GENERATION_EVAL_TARGET_SECTION_MARKERS = (
+    "\n\n### Clinical Note\n",
+    "\n\n### Answer\n",
+    "\n\n### Response\n",
+    "\n\n### Completion\n",
+)
+
+
+def _extract_generation_eval_source_input(source_text: str) -> str:
+    text = str(source_text).strip()
+    for marker in _GENERATION_EVAL_TARGET_SECTION_MARKERS:
+        marker_index = text.find(marker)
+        if marker_index > 0:
+            return text[:marker_index].rstrip()
+    return text
+
+
+def _build_grounded_generation_eval_prompt(prompt: str, source_text: str) -> str:
+    grounded_source_text = _extract_generation_eval_source_input(source_text)
+    return (
+        "Answer the task below using only the provided source text.\n"
+        "Do not use outside knowledge, placeholders, or unsupported details.\n"
+        "Return only the final answer.\n\n"
+        f"Task:\n{str(prompt).strip()}\n\n"
+        f"Source text:\n{grounded_source_text}"
+    )
+
+
+def _extract_openai_output_text(response: dict[str, Any]) -> str | None:
+    top_level = response.get("output_text")
+    if isinstance(top_level, str) and top_level.strip():
+        return top_level.strip()
+
+    for output_item in response.get("output", []):
+        if not isinstance(output_item, dict):
+            continue
+        for content_item in output_item.get("content", []):
+            if (
+                isinstance(content_item, dict)
+                and content_item.get("type") == "output_text"
+                and isinstance(content_item.get("text"), str)
+                and content_item["text"].strip()
+            ):
+                return content_item["text"].strip()
+    return None
+
+
+def _call_openai_json_response(
+    *,
+    model: str,
+    schema_name: str,
+    schema: dict[str, Any],
+    system_prompt: str,
+    user_prompt: str,
+) -> dict[str, Any]:
+    api_key = _maybe_none(os.environ.get("OPENAI_API_KEY"))
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is required for generation comparison evaluation.")
+
+    payload = {
+        "model": model,
+        "store": False,
+        "input": [
+            {
+                "role": "system",
+                "content": system_prompt,
+            },
+            {
+                "role": "user",
+                "content": user_prompt,
+            },
+        ],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": schema_name,
+                "schema": schema,
+                "strict": True,
+            }
+        },
+    }
+
+    request = urllib.request.Request(
+        OPENAI_RESPONSES_API_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            body = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"OpenAI API error {exc.code}: {_truncate_preview(body, 400)}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"OpenAI API request failed: {exc.reason}") from exc
+
+    parsed = json.loads(body)
+    output_text = _extract_openai_output_text(parsed)
+    if not output_text:
+        raise RuntimeError("OpenAI comparison call returned no output_text.")
+
+    try:
+        return json.loads(output_text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"OpenAI comparison call returned invalid JSON: {exc}") from exc
+
+
+def _synthesize_generation_case(source_text: str, *, judge_model: str) -> dict[str, Any]:
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "prompt": {"type": "string"},
+            "reference_answer": {"type": "string"},
+            "rubric": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 3,
+                "maxItems": 5,
+            },
+            "source_summary": {"type": "string"},
+        },
+        "required": ["prompt", "reference_answer", "rubric", "source_summary"],
+    }
+
+    result = _call_openai_json_response(
+        model=judge_model,
+        schema_name="generation_eval_case",
+        schema=schema,
+        system_prompt=(
+            "You convert a raw post-training eval text sample into a deterministic evaluation case. "
+            "Return only strict JSON."
+        ),
+        user_prompt=(
+            "Given the raw eval text below, create:\n"
+            "1. one realistic user prompt that the sample implies the assistant should answer\n"
+            "2. one ideal reference answer in the same task/style\n"
+            "3. a short rubric with 3-5 criteria\n"
+            "4. a one-sentence source summary\n\n"
+            f"Raw eval text:\n{_truncate_preview(source_text, 2400)}"
+        ),
+    )
+
+    prompt = str(result.get("prompt", "")).strip()
+    reference_answer = str(result.get("reference_answer", "")).strip()
+    rubric = [str(item).strip() for item in result.get("rubric", []) if str(item).strip()]
+    source_summary = str(result.get("source_summary", "")).strip()
+    if not prompt or not reference_answer or len(rubric) < 3 or not source_summary:
+        raise RuntimeError("OpenAI generation case synthesis returned incomplete fields.")
+
+    return {
+        "prompt": prompt,
+        "reference_answer": reference_answer,
+        "rubric": rubric,
+        "source_summary": source_summary,
+    }
+
+
+def _judge_generation_outputs(
+    *,
+    prompt: str,
+    source_text: str,
+    reference_answer: str,
+    rubric: list[str],
+    baseline_output: str,
+    candidate_output: str,
+    judge_model: str,
+    flip_order: bool,
+) -> dict[str, Any]:
+    output_a = candidate_output if flip_order else baseline_output
+    output_b = baseline_output if flip_order else candidate_output
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "winner": {
+                "type": "string",
+                "enum": ["output_a", "output_b", "tie"],
+            },
+            "score_output_a": {"type": "number"},
+            "score_output_b": {"type": "number"},
+            "reason": {"type": "string"},
+        },
+        "required": ["winner", "score_output_a", "score_output_b", "reason"],
+    }
+
+    result = _call_openai_json_response(
+        model=judge_model,
+        schema_name="generation_eval_judgment",
+        schema=schema,
+        system_prompt=(
+            "You compare two model outputs against a reference answer and rubric. "
+            "Score each from 0 to 10, pick the better output, and return only strict JSON."
+        ),
+        user_prompt=(
+            f"Prompt:\n{prompt}\n\n"
+            f"Source eval text:\n{_truncate_preview(source_text, 1800)}\n\n"
+            f"Reference answer:\n{reference_answer}\n\n"
+            f"Rubric:\n- " + "\n- ".join(rubric) + "\n\n"
+            f"Output A:\n{output_a}\n\n"
+            f"Output B:\n{output_b}"
+        ),
+    )
+
+    winner = str(result.get("winner", "")).strip()
+    score_output_a = float(result.get("score_output_a", 0.0))
+    score_output_b = float(result.get("score_output_b", 0.0))
+    reason = str(result.get("reason", "")).strip()
+    if winner not in {"output_a", "output_b", "tie"}:
+        raise RuntimeError(f"Unexpected generation judge winner: {winner}")
+
+    mapped_winner = winner
+    if winner == "output_a":
+        mapped_winner = "candidate" if flip_order else "baseline"
+    elif winner == "output_b":
+        mapped_winner = "baseline" if flip_order else "candidate"
+
+    baseline_score = score_output_b if flip_order else score_output_a
+    candidate_score = score_output_a if flip_order else score_output_b
+    return {
+        "winner": mapped_winner,
+        "baseline_score": baseline_score,
+        "candidate_score": candidate_score,
+        "reason": reason,
+    }
+
+
+def _evaluate_classification_model_comparison(
+    config: TrainConfig,
+    tokenizer: Any,
+    eval_dataset: Any,
+    *,
+    holdout_metadata: dict[str, Any] | None,
+    candidate_model: Any | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    evaluation_plan = config.evaluation_plan or {}
+    seed = int(evaluation_plan.get("deterministic_seed", 42))
+    comparison_max_examples = int(evaluation_plan.get("comparison_max_examples", DEFAULT_COMPARISON_MAX_EXAMPLES))
+    sample = _sample_eval_dataset(eval_dataset, max_examples=comparison_max_examples, seed=seed)
+
+    baseline_model = _load_base_model(config)
+    baseline_model.eval()
+    baseline_predictions = _predict_classification_outputs(baseline_model, tokenizer, sample)
+    baseline_eval = _build_classification_eval_result(sample, baseline_predictions)
+    _clear_inference_model(baseline_model)
+
+    owned_candidate_model = candidate_model is None
+    candidate_model = candidate_model or _load_adapter_inference_model(config)
+    candidate_model.eval()
+    candidate_predictions = _predict_classification_outputs(candidate_model, tokenizer, sample)
+    candidate_eval = _build_classification_eval_result(sample, candidate_predictions)
+    evaluation_result = _evaluate_classification_dataset(
+        candidate_model,
+        tokenizer,
+        eval_dataset,
+        max_examples=int(evaluation_plan.get("max_examples", DEFAULT_CLASSIFICATION_EVAL_MAX_EXAMPLES)),
+        seed=seed,
+    )
+    if owned_candidate_model:
+        _clear_inference_model(candidate_model)
+
+    if holdout_metadata is not None:
+        evaluation_result["holdout"] = holdout_metadata
+
+    disagreements = {
+        "both_correct": 0,
+        "baseline_only_correct": 0,
+        "candidate_only_correct": 0,
+        "both_wrong": 0,
+    }
+    cases = []
+    for index, prompt in enumerate(sample["prompt"]):
+        gold = baseline_predictions["gold_labels"][index]
+        baseline_prediction = baseline_predictions["predictions"][index]
+        candidate_prediction = candidate_predictions["predictions"][index]
+        baseline_correct = baseline_prediction == gold
+        candidate_correct = candidate_prediction == gold
+        if baseline_correct and candidate_correct:
+            disagreements["both_correct"] += 1
+        elif baseline_correct:
+            disagreements["baseline_only_correct"] += 1
+        elif candidate_correct:
+            disagreements["candidate_only_correct"] += 1
+        else:
+            disagreements["both_wrong"] += 1
+
+        cases.append(
+            {
+                "case_id": index + 1,
+                "prompt_preview": _truncate_preview(prompt, 200),
+                "gold": gold,
+                "baseline_prediction": baseline_prediction,
+                "baseline_raw_prediction": baseline_predictions["raw_predictions"][index][:120],
+                "candidate_prediction": candidate_prediction,
+                "candidate_raw_prediction": candidate_predictions["raw_predictions"][index][:120],
+                "baseline_correct": baseline_correct,
+                "candidate_correct": candidate_correct,
+            }
+        )
+
+    comparison = {
+        "task_family": "classification",
+        "strategy": "sampled_base_vs_tuned_prompt_completion_eval",
+        "gold_available": True,
+        "sample_policy": _comparison_sample_policy(
+            len(eval_dataset),
+            max_examples=comparison_max_examples,
+            seed=seed,
+        ),
+        "baseline": {
+            "kind": "base_model",
+            "model_id": config.base_model,
+            "adapter_path": None,
+        },
+        "candidate": {
+            "kind": "adapter",
+            "model_id": config.base_model,
+            "adapter_path": str(config.final_adapter_dir),
+        },
+        "summary": {
+            "winner": _classification_winner_from_metrics(
+                baseline_eval["metrics"],
+                candidate_eval["metrics"],
+            ),
+            "baseline_metrics": baseline_eval["metrics"],
+            "candidate_metrics": candidate_eval["metrics"],
+            "delta_metrics": _metric_deltas(
+                baseline_eval["metrics"],
+                candidate_eval["metrics"],
+            ),
+            "disagreement_counts": disagreements,
+        },
+        "cases": cases,
+    }
+    if holdout_metadata is not None:
+        comparison["holdout"] = holdout_metadata
+
+    return evaluation_result, comparison
+
+
+def _evaluate_generation_model_comparison(
+    config: TrainConfig,
+    tokenizer: Any,
+    eval_dataset: Any,
+    *,
+    holdout_metadata: dict[str, Any] | None,
+    candidate_model: Any | None = None,
+) -> dict[str, Any]:
+    evaluation_plan = config.evaluation_plan or {}
+    seed = int(evaluation_plan.get("deterministic_seed", 42))
+    comparison_max_examples = int(evaluation_plan.get("comparison_max_examples", DEFAULT_COMPARISON_MAX_EXAMPLES))
+    max_new_tokens = int(
+        evaluation_plan.get("comparison_max_new_tokens", DEFAULT_GENERATION_EVAL_MAX_NEW_TOKENS)
+    )
+    judge_model = _maybe_none(os.environ.get("POSTTRAINING_EVAL_JUDGE_MODEL")) or DEFAULT_EVAL_JUDGE_MODEL
+    sample = _sample_eval_dataset(eval_dataset, max_examples=comparison_max_examples, seed=seed)
+    total_cases = len(sample)
+
+    _emit_progress_update(f"synthesizing_generation_cases 0/{total_cases}")
+    case_specs = []
+    for index, text in enumerate(sample["text"], start=1):
+        case_specs.append(_synthesize_generation_case(str(text), judge_model=judge_model))
+        _emit_progress_update(f"synthesizing_generation_cases {index}/{total_cases}")
+    model_inputs = [
+        _build_grounded_generation_eval_prompt(case_spec["prompt"], str(source_text))
+        for source_text, case_spec in zip(sample["text"], case_specs)
+    ]
+
+    baseline_model = _load_base_model(config)
+    baseline_model.eval()
+    baseline_outputs = []
+    _emit_progress_update(f"running_baseline_generation_cases 0/{total_cases}")
+    for index, model_input in enumerate(model_inputs, start=1):
+        baseline_outputs.append(
+            _strip_thinking_blocks(
+                _predict_generation_response(
+                    baseline_model,
+                    tokenizer,
+                    model_input,
+                    max_new_tokens=max_new_tokens,
+                )
+            )
+        )
+        _emit_progress_update(f"running_baseline_generation_cases {index}/{total_cases}")
+    _clear_inference_model(baseline_model)
+
+    owned_candidate_model = candidate_model is None
+    candidate_model = candidate_model or _load_adapter_inference_model(config)
+    candidate_model.eval()
+    candidate_outputs = []
+    _emit_progress_update(f"running_candidate_generation_cases 0/{total_cases}")
+    for index, model_input in enumerate(model_inputs, start=1):
+        candidate_outputs.append(
+            _strip_thinking_blocks(
+                _predict_generation_response(
+                    candidate_model,
+                    tokenizer,
+                    model_input,
+                    max_new_tokens=max_new_tokens,
+                )
+            )
+        )
+        _emit_progress_update(f"running_candidate_generation_cases {index}/{total_cases}")
+    if owned_candidate_model:
+        _clear_inference_model(candidate_model)
+
+    baseline_wins = 0
+    candidate_wins = 0
+    ties = 0
+    baseline_score_total = 0.0
+    candidate_score_total = 0.0
+    cases = []
+
+    _emit_progress_update(f"judging_generation_cases 0/{total_cases}")
+    for index, (source_text, case_spec, model_input, baseline_output, candidate_output) in enumerate(
+        zip(sample["text"], case_specs, model_inputs, baseline_outputs, candidate_outputs)
+    ):
+        judgment = _judge_generation_outputs(
+            prompt=case_spec["prompt"],
+            source_text=str(source_text),
+            reference_answer=case_spec["reference_answer"],
+            rubric=case_spec["rubric"],
+            baseline_output=baseline_output,
+            candidate_output=candidate_output,
+            judge_model=judge_model,
+            flip_order=bool(index % 2),
+        )
+        _emit_progress_update(f"judging_generation_cases {index + 1}/{total_cases}")
+        winner = judgment["winner"]
+        if winner == "baseline":
+            baseline_wins += 1
+        elif winner == "candidate":
+            candidate_wins += 1
+        else:
+            ties += 1
+
+        baseline_score_total += float(judgment["baseline_score"])
+        candidate_score_total += float(judgment["candidate_score"])
+        cases.append(
+            {
+                "case_id": index + 1,
+                "source_text_preview": _truncate_preview(source_text, 220),
+                "source_summary": case_spec["source_summary"],
+                "prompt": case_spec["prompt"],
+                "model_input_preview": _truncate_preview(model_input, 500),
+                "reference_answer": case_spec["reference_answer"],
+                "rubric": case_spec["rubric"],
+                "baseline_output": baseline_output,
+                "candidate_output": candidate_output,
+                "judgment": judgment,
+            }
+        )
+
+    total_cases = len(cases)
+    comparison = {
+        "task_family": "generation",
+        "strategy": "sampled_base_vs_tuned_generation_eval",
+        "gold_available": False,
+        "judge_model": judge_model,
+        "sample_policy": _comparison_sample_policy(
+            len(eval_dataset),
+            max_examples=comparison_max_examples,
+            seed=seed,
+        ),
+        "baseline": {
+            "kind": "base_model",
+            "model_id": config.base_model,
+            "adapter_path": None,
+        },
+        "candidate": {
+            "kind": "adapter",
+            "model_id": config.base_model,
+            "adapter_path": str(config.final_adapter_dir),
+        },
+        "summary": {
+            "baseline_wins": baseline_wins,
+            "candidate_wins": candidate_wins,
+            "ties": ties,
+            "baseline_win_rate": (baseline_wins / total_cases) if total_cases else 0.0,
+            "candidate_win_rate": (candidate_wins / total_cases) if total_cases else 0.0,
+            "tie_rate": (ties / total_cases) if total_cases else 0.0,
+            "baseline_average_score": (baseline_score_total / total_cases) if total_cases else 0.0,
+            "candidate_average_score": (candidate_score_total / total_cases) if total_cases else 0.0,
+        },
+        "cases": cases,
+    }
+    if holdout_metadata is not None:
+        comparison["holdout"] = holdout_metadata
+    return comparison
+
+
+def _evaluate_generation_prompt_completion_model_comparison(
+    config: TrainConfig,
+    tokenizer: Any,
+    eval_dataset: Any,
+    *,
+    holdout_metadata: dict[str, Any] | None,
+    candidate_model: Any | None = None,
+) -> dict[str, Any]:
+    evaluation_plan = config.evaluation_plan or {}
+    seed = int(evaluation_plan.get("deterministic_seed", 42))
+    comparison_max_examples = int(evaluation_plan.get("comparison_max_examples", DEFAULT_COMPARISON_MAX_EXAMPLES))
+    max_new_tokens = int(
+        evaluation_plan.get("comparison_max_new_tokens", DEFAULT_GENERATION_EVAL_MAX_NEW_TOKENS)
+    )
+    judge_model = _maybe_none(os.environ.get("POSTTRAINING_EVAL_JUDGE_MODEL")) or DEFAULT_EVAL_JUDGE_MODEL
+    sample = _sample_eval_dataset(eval_dataset, max_examples=comparison_max_examples, seed=seed)
+    total_cases = len(sample)
+
+    baseline_model = _load_base_model(config)
+    baseline_model.eval()
+    baseline_outputs = []
+    _emit_progress_update(f"running_baseline_generation_cases 0/{total_cases}")
+    for index, prompt in enumerate(sample["prompt"], start=1):
+        baseline_outputs.append(
+            _strip_thinking_blocks(
+                _predict_generation_response(
+                    baseline_model,
+                    tokenizer,
+                    str(prompt),
+                    max_new_tokens=max_new_tokens,
+                )
+            )
+        )
+        _emit_progress_update(f"running_baseline_generation_cases {index}/{total_cases}")
+    _clear_inference_model(baseline_model)
+
+    owned_candidate_model = candidate_model is None
+    candidate_model = candidate_model or _load_adapter_inference_model(config)
+    candidate_model.eval()
+    candidate_outputs = []
+    _emit_progress_update(f"running_candidate_generation_cases 0/{total_cases}")
+    for index, prompt in enumerate(sample["prompt"], start=1):
+        candidate_outputs.append(
+            _strip_thinking_blocks(
+                _predict_generation_response(
+                    candidate_model,
+                    tokenizer,
+                    str(prompt),
+                    max_new_tokens=max_new_tokens,
+                )
+            )
+        )
+        _emit_progress_update(f"running_candidate_generation_cases {index}/{total_cases}")
+    if owned_candidate_model:
+        _clear_inference_model(candidate_model)
+
+    baseline_wins = 0
+    candidate_wins = 0
+    ties = 0
+    baseline_score_total = 0.0
+    candidate_score_total = 0.0
+    cases = []
+    rubric = [
+        "Answers the prompt directly and follows the requested output format and task instructions.",
+        "Matches the gold reference closely on key facts, structure, and level of detail without obvious unsupported additions.",
+        "Uses clear, coherent wording suitable for the target task style.",
+    ]
+
+    _emit_progress_update(f"judging_generation_cases 0/{total_cases}")
+    for index, (prompt, reference_answer, baseline_output, candidate_output) in enumerate(
+        zip(sample["prompt"], sample["completion"], baseline_outputs, candidate_outputs)
+    ):
+        judgment = _judge_generation_outputs(
+            prompt=str(prompt),
+            source_text=str(prompt),
+            reference_answer=str(reference_answer),
+            rubric=rubric,
+            baseline_output=baseline_output,
+            candidate_output=candidate_output,
+            judge_model=judge_model,
+            flip_order=bool(index % 2),
+        )
+        _emit_progress_update(f"judging_generation_cases {index + 1}/{total_cases}")
+        winner = judgment["winner"]
+        if winner == "baseline":
+            baseline_wins += 1
+        elif winner == "candidate":
+            candidate_wins += 1
+        else:
+            ties += 1
+
+        baseline_score_total += float(judgment["baseline_score"])
+        candidate_score_total += float(judgment["candidate_score"])
+        cases.append(
+            {
+                "case_id": index + 1,
+                "prompt": str(prompt),
+                "prompt_preview": _truncate_preview(prompt, 500),
+                "reference_answer": str(reference_answer),
+                "rubric": rubric,
+                "baseline_output": baseline_output,
+                "candidate_output": candidate_output,
+                "judgment": judgment,
+            }
+        )
+
+    total_cases = len(cases)
+    comparison = {
+        "task_family": "generation",
+        "strategy": "sampled_base_vs_tuned_prompt_completion_generation_eval",
+        "gold_available": True,
+        "judge_model": judge_model,
+        "sample_policy": _comparison_sample_policy(
+            len(eval_dataset),
+            max_examples=comparison_max_examples,
+            seed=seed,
+        ),
+        "baseline": {
+            "kind": "base_model",
+            "model_id": config.base_model,
+            "adapter_path": None,
+        },
+        "candidate": {
+            "kind": "adapter",
+            "model_id": config.base_model,
+            "adapter_path": str(config.final_adapter_dir),
+        },
+        "summary": {
+            "baseline_wins": baseline_wins,
+            "candidate_wins": candidate_wins,
+            "ties": ties,
+            "baseline_win_rate": (baseline_wins / total_cases) if total_cases else 0.0,
+            "candidate_win_rate": (candidate_wins / total_cases) if total_cases else 0.0,
+            "tie_rate": (ties / total_cases) if total_cases else 0.0,
+            "baseline_average_score": (baseline_score_total / total_cases) if total_cases else 0.0,
+            "candidate_average_score": (candidate_score_total / total_cases) if total_cases else 0.0,
+        },
+        "cases": cases,
+    }
+    if holdout_metadata is not None:
+        comparison["holdout"] = holdout_metadata
+
+    return comparison
 
 def _normalize_sft_dataset(dataset: Any, tokenizer: Any, apply_chat_template: Any) -> tuple[Any, str]:
     column_names = set(dataset.column_names)
@@ -1478,6 +2589,49 @@ def _resolve_resume_checkpoint(output_dir: Path) -> str | None:
     return get_last_checkpoint(str(output_dir))
 
 
+def _emit_structured_training_metric(state: Any, metrics: dict[str, Any] | None) -> None:
+    numeric_metrics: dict[str, float] = {}
+    for key, raw_value in (metrics or {}).items():
+        if isinstance(raw_value, bool):
+            continue
+        try:
+            numeric_value = float(raw_value)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(key, str):
+            continue
+        numeric_metrics[key] = numeric_value
+
+    if not numeric_metrics:
+        return
+
+    epoch_value = getattr(state, "epoch", None)
+    payload = {
+        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "step": int(getattr(state, "global_step", 0)),
+        "epoch": float(epoch_value) if epoch_value is not None else None,
+        "metrics": numeric_metrics,
+    }
+    print(f"{STRUCTURED_TRAINING_METRIC_PREFIX}{json.dumps(payload, sort_keys=True)}", flush=True)
+
+
+def _build_structured_metric_callback() -> Any:
+    from transformers import TrainerCallback
+
+    class StructuredMetricPrinterCallback(TrainerCallback):
+        def on_log(
+            self,
+            args: Any,
+            state: Any,
+            control: Any,
+            logs: dict[str, Any] | None = None,
+            **kwargs: Any,
+        ) -> None:
+            _emit_structured_training_metric(state, logs)
+
+    return StructuredMetricPrinterCallback()
+
+
 def _build_common_trainer_kwargs(
     config: TrainConfig,
     output_dir: Path,
@@ -1521,6 +2675,7 @@ def _build_trainer_bundle(
 
     has_eval = eval_dataset is not None
     common = _build_common_trainer_kwargs(config, config.checkpoints_dir, has_eval)
+    callbacks = [_build_structured_metric_callback()]
 
     if config.trainer_type == "sft":
         model = _prepare_model_for_training(config, _load_base_model(config))
@@ -1536,6 +2691,7 @@ def _build_trainer_bundle(
             eval_dataset=eval_dataset,
             processing_class=tokenizer,
             peft_config=_build_lora_config(config),
+            callbacks=callbacks,
         )
         return trainer, {"trainer": "SFTTrainer"}
 
@@ -1555,6 +2711,7 @@ def _build_trainer_bundle(
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
             processing_class=tokenizer,
+            callbacks=callbacks,
         )
         return trainer, {"trainer": "DPOTrainer"}
 
@@ -1572,6 +2729,7 @@ def _build_trainer_bundle(
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
             processing_class=tokenizer,
+            callbacks=callbacks,
         )
         return trainer, {"trainer": "KTOTrainer"}
 
@@ -1587,6 +2745,7 @@ def _build_trainer_bundle(
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
             processing_class=tokenizer,
+            callbacks=callbacks,
         )
         return trainer, {"trainer": "ORPOTrainer"}
 
@@ -1603,6 +2762,7 @@ def _build_trainer_bundle(
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
             processing_class=tokenizer,
+            callbacks=callbacks,
         )
         return trainer, {"trainer": "CPOTrainer"}
 
@@ -1619,6 +2779,7 @@ def _build_trainer_bundle(
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         processing_class=tokenizer,
+        callbacks=callbacks,
     )
     return trainer, {"trainer": "BCOTrainer"}
 
@@ -1652,12 +2813,14 @@ def _save_final_adapter(trainer: Any, tokenizer: Any, output_dir: Path) -> None:
 def _merge_adapter_into_base(config: TrainConfig, tokenizer: Any) -> None:
     from peft import PeftModel
 
+    _emit_progress_update("preparing_merged_deployment_artifact")
     config.merged_dir.mkdir(parents=True, exist_ok=True)
     base_model = _load_base_model(config, for_merge=True)
     merged = PeftModel.from_pretrained(base_model, str(config.final_adapter_dir))
     merged = merged.merge_and_unload()
     merged.save_pretrained(str(config.merged_dir), safe_serialization=True)
     tokenizer.save_pretrained(str(config.merged_dir))
+    _emit_progress_update("prepared_merged_deployment_artifact")
 
 
 def _commit_all_volumes() -> None:
@@ -1666,24 +2829,51 @@ def _commit_all_volumes() -> None:
     CHECKPOINTS_VOLUME.commit()
 
 
-def _train_impl(config: TrainConfig) -> dict[str, Any]:
-    MODEL_CACHE_VOLUME.reload()
-    DATASET_CACHE_VOLUME.reload()
-    CHECKPOINTS_VOLUME.reload()
+def _load_normalized_training_datasets(
+    config: TrainConfig,
+    tokenizer: Any,
+) -> tuple[Any, Any | None, str | None, dict[str, Any] | None, dict[str, Any] | None]:
+    evaluation_plan = config.evaluation_plan or {}
+    holdout_metadata = None
 
-    _write_run_config(config)
-
-    tokenizer = _load_tokenizer(config)
-    tokenizer.padding_side = "right" if config.trainer_type == "sft" else "left"
+    if (
+        config.trainer_type == "sft"
+        and config.dataset_source_type == "prepared_manifest"
+        and evaluation_plan.get("strategy") == "merged_sft_holdout"
+    ):
+        prepared_train_dataset, prepared_eval_dataset, preprocessing_diagnostics, holdout_metadata = (
+            _load_sft_prepared_manifest_datasets(config)
+        )
+        normalized_train_dataset, sft_dataset_style = _normalize_for_trainer(
+            config,
+            tokenizer,
+            prepared_train_dataset,
+        )
+        normalized_eval_dataset = None
+        if prepared_eval_dataset is not None:
+            normalized_eval_dataset, _ = _normalize_for_trainer(
+                config,
+                tokenizer,
+                prepared_eval_dataset,
+            )
+        return (
+            normalized_train_dataset,
+            normalized_eval_dataset,
+            sft_dataset_style,
+            preprocessing_diagnostics,
+            holdout_metadata,
+        )
 
     train_dataset, eval_dataset, preprocessing_diagnostics = _load_datasets(config)
-    normalized_train_dataset, sft_dataset_style = _normalize_for_trainer(config, tokenizer, train_dataset)
+    normalized_train_dataset, sft_dataset_style = _normalize_for_trainer(
+        config,
+        tokenizer,
+        train_dataset,
+    )
     normalized_eval_dataset = None
     if eval_dataset is not None:
         normalized_eval_dataset, _ = _normalize_for_trainer(config, tokenizer, eval_dataset)
 
-    evaluation_plan = config.evaluation_plan or {}
-    holdout_metadata = None
     if (
         config.trainer_type == "sft"
         and (config.task_spec or {}).get("task_family") == "classification"
@@ -1695,6 +2885,90 @@ def _train_impl(config: TrainConfig) -> dict[str, Any]:
             fraction=float(evaluation_plan.get("holdout_fraction", 0.1)),
             seed=int(evaluation_plan.get("deterministic_seed", 42)),
         )
+
+    return (
+        normalized_train_dataset,
+        normalized_eval_dataset,
+        sft_dataset_style,
+        preprocessing_diagnostics,
+        holdout_metadata,
+    )
+
+
+def _release_trainer_model(trainer: Any) -> None:
+    model = getattr(trainer, "model", None)
+    if model is None:
+        return
+    try:
+        trainer.model = None
+    except Exception:
+        pass
+    _clear_inference_model(model)
+
+
+def _run_offline_evaluation(
+    config: TrainConfig,
+    tokenizer: Any,
+    normalized_eval_dataset: Any | None,
+    *,
+    sft_dataset_style: str | None,
+    preprocessing_diagnostics: dict[str, Any] | None,
+    holdout_metadata: dict[str, Any] | None,
+    candidate_model: Any,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    if config.trainer_type != "sft":
+        raise ValueError("Comparison evaluation currently supports SFT jobs only.")
+    if normalized_eval_dataset is None or len(normalized_eval_dataset) <= 0:
+        raise ValueError("Evaluation requested but no eval dataset is available after preprocessing.")
+
+    task_family = (config.task_spec or {}).get("task_family")
+    if task_family == "classification" and sft_dataset_style == "prompt_completion":
+        return _evaluate_classification_model_comparison(
+            config,
+            tokenizer,
+            normalized_eval_dataset,
+            holdout_metadata=holdout_metadata,
+            candidate_model=candidate_model,
+        )
+    if task_family == "generation" and sft_dataset_style == "prompt_completion":
+        return None, _evaluate_generation_prompt_completion_model_comparison(
+            config,
+            tokenizer,
+            normalized_eval_dataset,
+            holdout_metadata=holdout_metadata,
+            candidate_model=candidate_model,
+        )
+    if task_family == "generation" and sft_dataset_style == "language_modeling":
+        return None, _evaluate_generation_model_comparison(
+            config,
+            tokenizer,
+            normalized_eval_dataset,
+            holdout_metadata=holdout_metadata,
+            candidate_model=candidate_model,
+        )
+
+    raise ValueError(
+        f"Comparison evaluation is not supported for task_family={task_family!r} "
+        f"with dataset_style={sft_dataset_style!r}."
+    )
+
+
+def _train_then_evaluate_impl(config: TrainConfig) -> dict[str, Any]:
+    MODEL_CACHE_VOLUME.reload()
+    DATASET_CACHE_VOLUME.reload()
+    CHECKPOINTS_VOLUME.reload()
+
+    _write_run_config(config)
+
+    tokenizer = _load_tokenizer(config)
+    tokenizer.padding_side = "right" if config.trainer_type == "sft" else "left"
+    (
+        normalized_train_dataset,
+        normalized_eval_dataset,
+        sft_dataset_style,
+        preprocessing_diagnostics,
+        holdout_metadata,
+    ) = _load_normalized_training_datasets(config, tokenizer)
 
     trainer, trainer_meta = _build_trainer_bundle(
         config,
@@ -1708,100 +2982,138 @@ def _train_impl(config: TrainConfig) -> dict[str, Any]:
     training_output = trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 
     _save_final_adapter(trainer, tokenizer, config.final_adapter_dir)
+    training_result = _build_training_result(
+        config,
+        trainer_meta=trainer_meta,
+        normalized_train_dataset=normalized_train_dataset,
+        normalized_eval_dataset=normalized_eval_dataset,
+        training_output=training_output,
+        preprocessing_diagnostics=preprocessing_diagnostics,
+        holdout_metadata=holdout_metadata,
+        resumed_from_checkpoint=resume_from_checkpoint,
+        include_merged_dir=_should_build_merged_artifact(config),
+    )
 
-    if config.merge_after_train:
+    CHECKPOINTS_VOLUME.commit()
+    _emit_structured_lifecycle_event("training_complete", training_result=training_result)
+
+    candidate_model = getattr(trainer, "model", None)
+    if candidate_model is None:
+        raise RuntimeError("Trainer did not expose a model for same-container evaluation.")
+    candidate_model.eval()
+    evaluation_result, comparison_evaluation = _run_offline_evaluation(
+        config,
+        tokenizer,
+        normalized_eval_dataset,
+        sft_dataset_style=sft_dataset_style,
+        preprocessing_diagnostics=preprocessing_diagnostics,
+        holdout_metadata=holdout_metadata,
+        candidate_model=candidate_model,
+    )
+
+    _release_trainer_model(trainer)
+    if _should_build_merged_artifact(config):
         _merge_adapter_into_base(config, tokenizer)
-
-    evaluation_result = None
-    if (
-        config.trainer_type == "sft"
-        and (config.task_spec or {}).get("task_family") == "classification"
-        and sft_dataset_style == "prompt_completion"
-        and normalized_eval_dataset is not None
-    ):
-        trainer.model.eval()
-        evaluation_result = _evaluate_classification_dataset(
-            trainer.model,
-            tokenizer,
-            normalized_eval_dataset,
-            max_examples=int(evaluation_plan.get("max_examples", 256)),
-            seed=int(evaluation_plan.get("deterministic_seed", 42)),
-        )
-        if holdout_metadata is not None:
-            evaluation_result["holdout"] = holdout_metadata
 
     _commit_all_volumes()
 
-    result = {
-        "trainer_type": config.trainer_type,
-        "trainer_class": trainer_meta["trainer"],
-        "base_model": config.base_model,
-        "dataset_name": config.dataset_name,
-        "dataset_source_type": config.dataset_source_type,
-        "selected_datasets": (
-            [
-                entry.get("dataset")
-                for entry in (config.prepared_dataset_manifest or {}).get("selected_datasets", [])
-                if isinstance(entry, dict) and entry.get("dataset")
-            ]
-            if config.dataset_source_type == "prepared_manifest"
-            else [config.dataset_name]
-        ),
-        "output_name": config.output_name,
-        "gpu_type": config.gpu_type,
-        "learning_rate": config.resolved_learning_rate,
-        "task_spec": config.task_spec,
-        "training_estimate": config.training_estimate,
-        "preprocessing_diagnostics": preprocessing_diagnostics,
-        "train_examples": len(normalized_train_dataset),
-        "eval_examples": len(normalized_eval_dataset) if normalized_eval_dataset is not None else 0,
-        "checkpoint_dir": str(config.checkpoints_dir),
-        "final_adapter_dir": str(config.final_adapter_dir),
-        "merged_dir": str(config.merged_dir) if config.merge_after_train else None,
-        "resumed_from_checkpoint": resume_from_checkpoint,
-        "global_step": int(getattr(training_output, "global_step", 0)),
-        "training_loss": float(getattr(training_output, "training_loss", 0.0)),
+    return {
+        "training_result": training_result,
         "evaluation": evaluation_result,
-        "holdout": holdout_metadata,
-        "notes": [
-            "Use final_adapter_dir for vLLM LoRA serving with --enable-lora.",
-            "Use merged_dir for direct vLLM base-model serving when merge_after_train=True.",
-        ],
+        "comparison_evaluation": comparison_evaluation,
     }
-    return result
 
 
-@app.cls(
-    image=train_image,
-    gpu=DEFAULT_GPU_TYPE,
-    timeout=12 * 60 * 60,
-    retries=modal.Retries(initial_delay=0.0, max_retries=3),
-    single_use_containers=True,
-    volumes={
-        str(MODEL_CACHE_DIR): MODEL_CACHE_VOLUME,
-        str(DATASET_CACHE_DIR): DATASET_CACHE_VOLUME,
-        str(CHECKPOINTS_DIR): CHECKPOINTS_VOLUME,
-    },
-    secrets=[HF_SECRET],
-)
-class TrainingRunner:
+def _training_runner_cls(modal_gpu_type: str):
+    return app.cls(
+        image=train_image,
+        gpu=modal_gpu_type,
+        timeout=12 * 60 * 60,
+        retries=modal.Retries(initial_delay=0.0, max_retries=3),
+        single_use_containers=True,
+        volumes={
+            str(MODEL_CACHE_DIR): MODEL_CACHE_VOLUME,
+            str(DATASET_CACHE_DIR): DATASET_CACHE_VOLUME,
+            str(CHECKPOINTS_DIR): CHECKPOINTS_VOLUME,
+        },
+        secrets=[HF_SECRET],
+    )
+
+
+class _TrainingRunnerMethods:
     @modal.method()
-    def train(self, config: TrainConfig) -> dict[str, Any]:
-        return _train_impl(config)
+    def train_then_evaluate(self, config: TrainConfig) -> dict[str, Any]:
+        return _train_then_evaluate_impl(config)
+
+
+@_training_runner_cls("A10G")
+class A10GTrainingRunner(_TrainingRunnerMethods):
+    pass
+
+
+@_training_runner_cls("L40S")
+class L40STrainingRunner(_TrainingRunnerMethods):
+    pass
+
+
+@_training_runner_cls("H100")
+class H100TrainingRunner(_TrainingRunnerMethods):
+    pass
+
+
+TRAINING_RUNNER_CLS_BY_MODAL_GPU = {
+    "A10G": A10GTrainingRunner,
+    "L40S": L40STrainingRunner,
+    "H100": H100TrainingRunner,
+}
+
+
+def _resolve_training_runner(config: TrainConfig) -> tuple[Any, str]:
+    modal_gpu_type = config.modal_gpu_type
+    runner_cls = TRAINING_RUNNER_CLS_BY_MODAL_GPU.get(modal_gpu_type)
+    if runner_cls is None:
+        raise ValueError(f"Unsupported Modal runtime GPU type {modal_gpu_type!r}.")
+    return runner_cls, modal_gpu_type
+
+
+def _with_runtime_runner_options(runner_cls: Any, config: TrainConfig) -> Any:
+    if hasattr(runner_cls, "with_options"):
+        return runner_cls.with_options(secrets=_build_runtime_secrets(config))
+    return runner_cls
 
 
 @app.local_entrypoint()
 def main(config: str = "backend/modal_trl_posttrain.example.yaml") -> None:
     raw_config = _load_yaml_mapping(config)
     train_config = _config_from_mapping(raw_config)
-    runner_cls = TrainingRunner.with_options(
-        gpu=train_config.gpu_type,
-        secrets=_build_runtime_secrets(train_config),
+    run_mode = (_maybe_none(os.environ.get("POSTTRAINING_RUN_MODE")) or "train_then_evaluate").lower()
+    if run_mode != "train_then_evaluate":
+        raise ValueError("POSTTRAINING_RUN_MODE must be 'train_then_evaluate'.")
+    runner_cls, modal_gpu_type = _resolve_training_runner(train_config)
+    print(
+        f"PT_GPU_SELECTION public_gpu_type={train_config.gpu_type} "
+        f"modal_gpu_type={modal_gpu_type} run_mode={run_mode}",
+        flush=True,
     )
-    result = runner_cls().train.spawn(train_config).get()
+    runner_cls = _with_runtime_runner_options(runner_cls, train_config)
+    result = runner_cls().train_then_evaluate.spawn(train_config).get()
     print(json.dumps(result, indent=2, sort_keys=True))
-    result_path = os.environ.get("TRAIN_RESULT_PATH")
-    if result_path:
-        output_path = Path(result_path)
+
+    training_result_path = _maybe_none(os.environ.get("TRAIN_RESULT_PATH"))
+    evaluation_result_path = _maybe_none(os.environ.get("EVALUATION_RESULT_PATH"))
+    comparison_evaluation_path = _maybe_none(os.environ.get("COMPARISON_EVALUATION_PATH"))
+    if training_result_path and result.get("training_result") is not None:
+        output_path = Path(training_result_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        output_path.write_text(json.dumps(result["training_result"], indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if evaluation_result_path and result.get("evaluation") is not None:
+        output_path = Path(evaluation_result_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(result["evaluation"], indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if comparison_evaluation_path and result.get("comparison_evaluation") is not None:
+        output_path = Path(comparison_evaluation_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(
+            json.dumps(result["comparison_evaluation"], indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )

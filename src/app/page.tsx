@@ -6,12 +6,17 @@ import { Textarea } from "@/components/ui/textarea";
 import { ArrowUp, Sparkles, Plus, Play, Rewind, ChevronDown } from "lucide-react";
 import { cn } from "@/lib/utils";
 import ReactMarkdown from "react-markdown";
+import { getSidebarStageProgress } from "@/lib/posttraining-progress.mjs";
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import {
+  ComparisonBar,
+  type ComparisonEvaluationSummary,
+} from "@/components/comparison-bar";
 
 // =============================================================================
 // Types
@@ -22,12 +27,18 @@ interface ChatMessage {
   role: "user" | "assistant";
   content: string;
   deploymentUrl?: string;
+  comparisonEvaluation?: ComparisonEvaluationSummary;
 }
 
 interface PipelineStage {
   id: string;
   label: string;
-  detail: string;
+}
+
+interface StageProgressItem {
+  id: string;
+  text: string;
+  tone: "normal" | "error";
 }
 
 // =============================================================================
@@ -37,33 +48,111 @@ interface PipelineStage {
 const PIPELINE_STAGES: readonly PipelineStage[] = [
   {
     id: "recommending",
-    label: "Finding datasets...",
-    detail: "Searching Hugging Face for relevant training data.",
+    label: "Finding training data...",
   },
   {
     id: "compiling",
-    label: "Compiling training spec...",
-    detail: "Building the training configuration from recommended datasets.",
+    label: "Preparing the training plan...",
   },
   {
     id: "training",
-    label: "Training the model...",
-    detail: "Fine-tuning the model on Modal GPUs.",
+    label: "Training your model...",
+  },
+  {
+    id: "evaluating",
+    label: "Checking model quality...",
   },
   {
     id: "deploying",
-    label: "Deploying the model...",
-    detail: "Spinning up a vLLM inference server on Modal.",
+    label: "Getting the model ready to use...",
   },
   {
     id: "smoke_testing",
     label: "Running smoke tests...",
-    detail: "Verifying the deployed model responds correctly.",
   },
 ];
 
 function stageIndexById(id: string): number {
   return PIPELINE_STAGES.findIndex((s) => s.id === id);
+}
+
+function getStageById(id: string): PipelineStage | null {
+  return PIPELINE_STAGES.find((stage) => stage.id === id) ?? null;
+}
+
+function getVisiblePipelineStageIds(job: {
+  currentStage?: string;
+  stageHistory?: Array<{ stage?: string }>;
+}): string[] {
+  const visible = new Set(
+    Array.isArray(job.stageHistory)
+      ? job.stageHistory
+        .map((entry) => String(entry?.stage ?? ""))
+        .filter((stage) => stageIndexById(stage) >= 0)
+      : [],
+  );
+
+  const currentStage = String(job.currentStage ?? "");
+  if (stageIndexById(currentStage) >= 0) {
+    visible.add(currentStage);
+  }
+
+  return PIPELINE_STAGES.map((stage) => stage.id).filter((stageId) => visible.has(stageId));
+}
+
+function getCompletedPipelineStageIds(job: {
+  stageHistory?: Array<{ stage?: string; status?: string }>;
+}): string[] {
+  const completed = new Set(
+    Array.isArray(job.stageHistory)
+      ? job.stageHistory
+        .filter((entry) => entry?.status === "completed")
+        .map((entry) => String(entry?.stage ?? ""))
+        .filter((stage) => stageIndexById(stage) >= 0)
+      : [],
+  );
+
+  return PIPELINE_STAGES.map((stage) => stage.id).filter((stageId) => completed.has(stageId));
+}
+
+function getInProgressPipelineStageId(job: {
+  currentStage?: string;
+  stageHistory?: Array<{ stage?: string; status?: string }>;
+}): string | null {
+  const inProgressStage = Array.isArray(job.stageHistory)
+    ? [...job.stageHistory]
+      .reverse()
+      .find(
+        (entry) =>
+          entry?.status === "in_progress" && stageIndexById(String(entry?.stage ?? "")) >= 0,
+      )
+    : null;
+
+  if (inProgressStage?.stage && stageIndexById(String(inProgressStage.stage)) >= 0) {
+    return String(inProgressStage.stage);
+  }
+
+  const currentStage = String(job.currentStage ?? "");
+  return stageIndexById(currentStage) >= 0 ? currentStage : null;
+}
+
+function getFailedPipelineStageId(job: {
+  stageHistory?: Array<{ stage?: string; status?: string }>;
+}): string | null {
+  const failedStage = Array.isArray(job.stageHistory)
+    ? [...job.stageHistory]
+      .reverse()
+      .find(
+        (entry) =>
+          entry?.status === "failed" && stageIndexById(String(entry?.stage ?? "")) >= 0,
+      )
+    : null;
+
+  if (!failedStage?.stage) {
+    return null;
+  }
+
+  return String(failedStage.stage);
 }
 
 // =============================================================================
@@ -151,19 +240,18 @@ function ProcessingIndicator({
 
 function ProcessingSidebar({
   isOpen,
-  activeStageIndex,
-  completedStageCount,
+  visibleStageIds,
+  stageProgressById,
   onClose,
 }: {
   isOpen: boolean;
-  activeStageIndex: number | null;
-  completedStageCount: number;
+  visibleStageIds: string[];
+  stageProgressById: Record<string, StageProgressItem[]>;
   onClose: () => void;
 }) {
-  const visibleStageCount =
-    activeStageIndex === null
-      ? completedStageCount
-      : Math.max(completedStageCount, activeStageIndex + 1);
+  const visibleStages = visibleStageIds
+    .map((stageId) => getStageById(stageId))
+    .filter((stage): stage is PipelineStage => Boolean(stage));
 
   return (
     <aside
@@ -194,32 +282,50 @@ function ProcessingSidebar({
         <div className="flex-1 overflow-y-auto px-5 py-5">
           <div className="space-y-8">
             {isOpen &&
-              PIPELINE_STAGES.slice(0, visibleStageCount).map((stage, index) => {
-                const isComplete = index < completedStageCount;
-                const isActive = index === activeStageIndex;
-                const status = isComplete ? "Done" : "Working on this now";
+              visibleStages.map((stage) => {
+                const progressItems = stageProgressById[stage.id] ?? [];
 
                 return (
                   <section key={stage.id} className="space-y-2.5">
-                    <div className="space-y-1">
-                      <h3 className="text-sm font-semibold text-foreground">
-                        {stage.label}
-                      </h3>
-                      <p
-                        className={cn(
-                          "text-[11px] font-medium uppercase tracking-[0.16em]",
-                          isComplete && "text-foreground/75",
-                          isActive && "text-foreground",
-                          !isComplete && !isActive && "text-muted-foreground/55",
-                        )}
-                      >
-                        {status}
-                      </p>
-                    </div>
+                    <h3 className="text-sm font-semibold text-foreground">
+                      {stage.label}
+                    </h3>
 
-                    <p className="text-sm leading-relaxed text-muted-foreground">
-                      {stage.detail}
-                    </p>
+                    {progressItems.length > 0 && (
+                      <ul className="space-y-0.5">
+                        {progressItems.map((progressItem, index) => (
+                          <li
+                            key={progressItem.id}
+                            className="grid grid-cols-[0.875rem_1fr] gap-3 pb-3 motion-safe:animate-in motion-safe:fade-in-0 motion-safe:slide-in-from-top-1 motion-safe:duration-500 last:pb-0"
+                          >
+                            <div className="flex h-full min-h-6 flex-col items-center">
+                              <span
+                                className={cn(
+                                  "mt-1.5 h-2 w-2 rounded-full border bg-background",
+                                  progressItem.tone === "error"
+                                    ? "border-destructive/60"
+                                    : "border-foreground/30",
+                                )}
+                              />
+                              {index < progressItems.length - 1 && (
+                                <span className="mt-2 w-px flex-1 bg-border" />
+                              )}
+                            </div>
+
+                            <p
+                              className={cn(
+                                "text-sm leading-relaxed",
+                                progressItem.tone === "error"
+                                  ? "text-destructive"
+                                  : "text-foreground/65",
+                              )}
+                            >
+                              {progressItem.text}
+                            </p>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
                   </section>
                 );
               })}
@@ -242,7 +348,12 @@ export default function ChatPage() {
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const [isResponding, setIsResponding] = useState(false);
   const [activeStageIndex, setActiveStageIndex] = useState<number | null>(null);
-  const [completedStageCount, setCompletedStageCount] = useState(0);
+  const [visibleStageIds, setVisibleStageIds] = useState<string[]>([]);
+  const [, setCompletedStageIds] = useState<string[]>([]);
+  const [, setFailedStageId] = useState<string | null>(null);
+  const [stageProgressById, setStageProgressById] = useState<Record<string, StageProgressItem[]>>(
+    {},
+  );
   const [isProcessSidebarOpen, setIsProcessSidebarOpen] = useState(false);
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
   const [fineTunedEndpoint, setFineTunedEndpoint] = useState<string | null>(null);
@@ -252,19 +363,20 @@ export default function ChatPage() {
   const abortRef = useRef<AbortController | null>(null);
   const [showIndicator, setShowIndicator] = useState(false);
   const indicatorTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const evalShownRef = useRef(false);
 
   // Scroll to bottom when new messages appear
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, isResponding, activeStageIndex]);
 
-  // Delay showing the processing indicator by 3 seconds
+  // Delay showing the processing indicator slightly to avoid flicker
   useEffect(() => {
-    if (activeJobId) {
-      indicatorTimerRef.current = setTimeout(() => setShowIndicator(true), 1500);
-    } else {
-      setShowIndicator(false);
+    if (!activeJobId) {
+      return;
     }
+
+    indicatorTimerRef.current = setTimeout(() => setShowIndicator(true), 1500);
     return () => {
       if (indicatorTimerRef.current) clearTimeout(indicatorTimerRef.current);
     };
@@ -280,6 +392,18 @@ export default function ChatPage() {
     }
   }, [input]);
 
+  const stopPolling = useCallback(() => {
+    if (pollingRef.current) {
+      clearInterval(pollingRef.current);
+      pollingRef.current = null;
+    }
+    lastStageRef.current = null;
+    setActiveJobId(null);
+    setIsResponding(false);
+    setShowIndicator(false);
+    inputRef.current?.focus();
+  }, []);
+
   // Job polling
   useEffect(() => {
     if (!activeJobId) return;
@@ -290,18 +414,66 @@ export default function ChatPage() {
         if (!res.ok) return;
         const job = await res.json();
 
-        const currentStageId: string = job.currentStage;
-        const idx = stageIndexById(currentStageId);
+        const currentStageId: string = String(job.currentStage ?? "");
+        const nextActiveStageId =
+          job.status === "ready" || job.status === "failed"
+            ? null
+            : getInProgressPipelineStageId(job);
+        const idx = nextActiveStageId ? stageIndexById(nextActiveStageId) : -1;
+        const nextVisibleStageIds = getVisiblePipelineStageIds(job);
+        const nextCompletedStageIds = getCompletedPipelineStageIds(job);
+        const nextFailedStageId = getFailedPipelineStageId(job);
+        const nextStageProgressById = getSidebarStageProgress({
+          logs: Array.isArray(job.logs) ? job.logs : [],
+          activeStageId: nextActiveStageId,
+          completedStageIds: nextCompletedStageIds,
+          failedStageId: nextFailedStageId,
+          jobStatus: String(job.status ?? ""),
+        }) as Record<string, StageProgressItem[]>;
 
         // Update sidebar
         if (idx >= 0) {
           setActiveStageIndex(idx);
-          setCompletedStageCount(idx);
+        } else {
+          setActiveStageIndex(null);
         }
+        setVisibleStageIds(nextVisibleStageIds);
+        setCompletedStageIds(nextCompletedStageIds);
+        setFailedStageId(nextFailedStageId);
+        setStageProgressById(nextStageProgressById);
 
         // Track stage changes (no chat bubbles — ProcessingIndicator handles it)
         if (currentStageId !== lastStageRef.current) {
           lastStageRef.current = currentStageId;
+        }
+
+        // Show comparison evaluation bar when evaluating stage completes
+        if (
+          !evalShownRef.current &&
+          nextCompletedStageIds.includes("evaluating") &&
+          job.evaluation?.summary
+        ) {
+          evalShownRef.current = true;
+          const evalSummary = job.evaluation.summary;
+          const evalCases = job.evaluation.sample_policy?.sampled_cases;
+          if (typeof evalCases === "number") {
+            setMessages((prev) => [
+              ...prev,
+              {
+                id: crypto.randomUUID(),
+                role: "assistant",
+                content: "",
+                comparisonEvaluation: {
+                  candidateWins: evalSummary.candidate_wins ?? 0,
+                  baselineWins: evalSummary.baseline_wins ?? 0,
+                  ties: evalSummary.ties ?? 0,
+                  totalCases: evalCases,
+                  baseModelName:
+                    job.evaluation.baseline?.model_id ?? "Base model",
+                },
+              },
+            ]);
+          }
         }
 
         // Terminal states
@@ -313,7 +485,10 @@ export default function ChatPage() {
           if (deploymentUrl) {
             setFineTunedEndpoint(deploymentUrl);
           }
-          setCompletedStageCount(PIPELINE_STAGES.length);
+          setCompletedStageIds(nextVisibleStageIds);
+          setActiveStageIndex(null);
+          setFailedStageId(null);
+          setStageProgressById(nextStageProgressById);
           setMessages((prev) => [
             ...prev,
             {
@@ -325,6 +500,8 @@ export default function ChatPage() {
           ]);
           stopPolling();
         } else if (job.status === "failed") {
+          setActiveStageIndex(null);
+          setStageProgressById(nextStageProgressById);
           setMessages((prev) => [
             ...prev,
             {
@@ -346,19 +523,7 @@ export default function ChatPage() {
     return () => {
       if (pollingRef.current) clearInterval(pollingRef.current);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeJobId]);
-
-  function stopPolling() {
-    if (pollingRef.current) {
-      clearInterval(pollingRef.current);
-      pollingRef.current = null;
-    }
-    setActiveJobId(null);
-    setIsResponding(false);
-    setActiveStageIndex(null);
-    inputRef.current?.focus();
-  }
+  }, [activeJobId, stopPolling]);
 
   const sendToChat = useCallback(
     async (chatMessages: ChatMessage[]) => {
@@ -452,11 +617,16 @@ export default function ChatPage() {
                 }
               } else if (event.type === "job_started" && event.jobId) {
                 jobStarted = true;
+                setShowIndicator(false);
                 setActiveJobId(event.jobId);
                 setActiveStageIndex(0);
-                setCompletedStageCount(0);
+                setVisibleStageIds(["recommending"]);
+                setCompletedStageIds([]);
+                setFailedStageId(null);
+                setStageProgressById({});
                 setIsProcessSidebarOpen(true);
                 lastStageRef.current = null;
+                evalShownRef.current = false;
               } else if (event.type === "error") {
                 streamingContent += event.message || "An error occurred.";
                 if (!messageAdded) {
@@ -544,13 +714,18 @@ export default function ChatPage() {
     setMessages([]);
     setInput("");
     setIsResponding(false);
+    setShowIndicator(false);
     setActiveStageIndex(null);
-    setCompletedStageCount(0);
+    setVisibleStageIds([]);
+    setCompletedStageIds([]);
+    setFailedStageId(null);
+    setStageProgressById({});
     setIsProcessSidebarOpen(false);
     setActiveJobId(null);
     setActiveModel("openai");
     setFineTunedEndpoint(null);
     lastStageRef.current = null;
+    evalShownRef.current = false;
     inputRef.current?.focus();
   }, []);
 
@@ -612,7 +787,7 @@ export default function ChatPage() {
                     What should your AI do?
                   </h2>
                   <p className="text-sm text-muted-foreground max-w-md mx-auto">
-                    Build a specialized AI for any use case.
+                    Create a custom AI using your documents or example data.
                   </p>
                 </div>
 
@@ -638,7 +813,11 @@ export default function ChatPage() {
             <div className="max-w-3xl mx-auto px-4 pt-6 pb-36 space-y-6">
               {messages.map((msg) => (
                 <div key={msg.id}>
-                  <MessageBubble message={msg} />
+                  {msg.comparisonEvaluation ? (
+                    <ComparisonBar data={msg.comparisonEvaluation} />
+                  ) : (
+                    <MessageBubble message={msg} />
+                  )}
                   {msg.deploymentUrl && (
                     <div className="flex justify-start pl-1 pt-3">
                       <Button
@@ -703,7 +882,7 @@ export default function ChatPage() {
                 placeholder={
                   isResponding && currentStage
                     ? currentStage.label
-                    : "Describe the AI you want to build..."
+                    : "Describe the AI or labeling task you want to build..."
                 }
                 rows={1}
                 className={cn(
@@ -740,9 +919,9 @@ export default function ChatPage() {
       </div>
 
       <ProcessingSidebar
-        isOpen={isProcessSidebarOpen && activeStageIndex !== null}
-        activeStageIndex={activeStageIndex}
-        completedStageCount={completedStageCount}
+        isOpen={isProcessSidebarOpen && visibleStageIds.length > 0}
+        visibleStageIds={visibleStageIds}
+        stageProgressById={stageProgressById}
         onClose={() => setIsProcessSidebarOpen(false)}
       />
     </div>
