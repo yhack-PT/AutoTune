@@ -6,8 +6,10 @@ import {
   buildDeploymentEnvironment,
   buildDeploymentRecord,
   buildGenerationSmokeTestProbes,
+  detectTrainingStageUiProgress,
   handleProcessOutputLine,
   extractModalRunUrl,
+  getRecommendationStageSelectedDatasets,
   parseStructuredLifecycleEventLine,
   resolveDeploymentRuntimePolicy,
   resolveDeploymentArtifact,
@@ -60,6 +62,34 @@ test("buildGenerationSmokeTestProbes creates deterministic role and response pro
   assert.match(probes[1].prompt, /representative response/i);
 });
 
+test("getRecommendationStageSelectedDatasets returns recommendation ids when no SFT dataset override is active", () => {
+  assert.deepEqual(
+    getRecommendationStageSelectedDatasets(
+      {
+        recommended_datasets: [
+          { dataset: "acme/first-dataset" },
+          { dataset: " acme/second-dataset " },
+          { dataset: null },
+        ],
+      },
+      null,
+    ),
+    ["acme/first-dataset", "acme/second-dataset"],
+  );
+});
+
+test("getRecommendationStageSelectedDatasets hides recommendation ids when an SFT dataset override is active", () => {
+  assert.deepEqual(
+    getRecommendationStageSelectedDatasets(
+      {
+        recommended_datasets: [{ dataset: "acme/original-recommendation" }],
+      },
+      "starmpcc/Asclepius-Synthetic-Clinical-Notes",
+    ),
+    [],
+  );
+});
+
 test("parseStructuredLifecycleEventLine parses training lifecycle events", () => {
   const payload = parseStructuredLifecycleEventLine(
     'PT_LIFECYCLE_EVENT::{"event":"training_complete","training_result":{"global_step":5}}',
@@ -68,6 +98,40 @@ test("parseStructuredLifecycleEventLine parses training lifecycle events", () =>
   assert.equal(payload?.event, "training_complete");
   assert.equal(payload?.training_result?.global_step, 5);
   assert.equal(parseStructuredLifecycleEventLine("PT_METRIC_EVENT::{}"), null);
+});
+
+test("detectTrainingStageUiProgress strips baseline evaluation counters from sidebar progress", () => {
+  assert.equal(
+    detectTrainingStageUiProgress(
+      "PT_PROGRESS::running_baseline_generation_cases 0/15",
+      "evaluating",
+    ),
+    "I'm testing the base model",
+  );
+  assert.equal(
+    detectTrainingStageUiProgress(
+      "PT_PROGRESS::running_baseline_generation_cases 7/15",
+      "evaluating",
+    ),
+    "I'm testing the base model",
+  );
+});
+
+test("detectTrainingStageUiProgress strips tuned-model and comparison counters from sidebar progress", () => {
+  assert.equal(
+    detectTrainingStageUiProgress(
+      "PT_PROGRESS::running_candidate_generation_cases 3/15",
+      "evaluating",
+    ),
+    "I'm testing the tuned model",
+  );
+  assert.equal(
+    detectTrainingStageUiProgress(
+      "PT_PROGRESS::judging_generation_cases 11/15",
+      "evaluating",
+    ),
+    "I'm comparing the new model with the original model",
+  );
 });
 
 test("shouldSuppressProcessOutputLine matches the tokenizer mismatch warning family", () => {

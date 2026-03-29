@@ -17,6 +17,7 @@ import {
   buildSpecPrompt,
   getSpecSchema,
   getCompilerOverridesConfigPath,
+  resolveConfiguredShowEvaluationComponent,
   resolveConfiguredSftDataset,
   resolveConfiguredSftGpuType,
   resolveConfiguredSftMaxLength,
@@ -524,7 +525,11 @@ async function withTempDir(callback) {
 }
 
 const NEUTRAL_COMPILER_OVERRIDES_YAML =
-  "sft_num_train_epochs: null\nsft_gpu_type: null\nsft_max_length: null\nsft_dataset: null\n";
+  "sft_num_train_epochs: null\n"
+  + "sft_gpu_type: null\n"
+  + "sft_max_length: null\n"
+  + "sft_dataset: null\n"
+  + "show_evaluation_component: null\n";
 
 async function withCompilerOverrides(contents, callback) {
   const previousOverridePath = process.env.POSTTRAINING_COMPILER_OVERRIDES_PATH;
@@ -1140,7 +1145,7 @@ test("recommendDatasets falls back to Hub card row counts when viewer size fails
   }
 });
 
-test("recommendDatasets emits ui-progress lines for query search and candidate review", async () => {
+test("recommendDatasets emits a reduced set of ui-progress lines for recommendation milestones", async () => {
   const originalFetch = globalThis.fetch;
   const progressMessages = [];
   const candidate = buildTextGenerationCandidate();
@@ -1195,7 +1200,9 @@ test("recommendDatasets emits ui-progress lines for query search and candidate r
       ).length,
       1,
     );
-    assert.ok(progressMessages.includes("I'm reviewing the most promising dataset options"));
+    assert.ok(!progressMessages.includes("I'm planning where to search for training data"));
+    assert.ok(!progressMessages.includes("I'm reviewing the most promising dataset options"));
+    assert.ok(!progressMessages.includes("I'm checking sample records from a few promising datasets"));
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -1790,6 +1797,69 @@ test("compiler override can force a different SFT max_length than the planner pr
   }
 });
 
+test("compiler override can hide the evaluation component", async () => {
+  const previousOverridePath = process.env.POSTTRAINING_COMPILER_OVERRIDES_PATH;
+
+  try {
+    await withTempDir(async (tempRoot) => {
+      const overridesPath = path.join(tempRoot, "compiler-overrides.yaml");
+      process.env.POSTTRAINING_COMPILER_OVERRIDES_PATH = overridesPath;
+      await writeFile(
+        overridesPath,
+        "show_evaluation_component: false\n",
+        "utf8",
+      );
+
+      assert.equal(getCompilerOverridesConfigPath(), overridesPath);
+      assert.equal(resolveConfiguredShowEvaluationComponent(), false);
+
+      const enrichedCandidate = buildPromptCompletionGenerationCandidate();
+      const recommendation = await recommendDatasets(buildGenerationPlan(), {
+        discoverCandidates: async () => [enrichedCandidate],
+        enrichCandidates: async () => [enrichedCandidate],
+        rankCandidates: async () => [toRecommendedCandidate(enrichedCandidate)],
+        skipDebugWrite: true,
+      });
+
+      const inputPath = path.join(tempRoot, "recommendation.json");
+      await writeFile(inputPath, `${JSON.stringify(recommendation, null, 2)}\n`, "utf8");
+
+      const result = await runCompiler(
+        {
+          inputPath,
+          outputRoot: tempRoot,
+          jobId: "comparison-bar-override-job",
+          objectiveSummary: "Draft math tutoring answers.",
+        },
+        {
+          specPlanner: async () => ({
+            parsed: buildGenerationSpec(enrichedCandidate.dataset),
+            model: "test-model",
+            response_id: "resp_show_evaluation_component_override",
+          }),
+        },
+      );
+
+      assert.equal(result.spec.evaluation_plan.show_evaluation_component, false);
+      assert.equal(result.compiled_config.evaluation_plan.show_evaluation_component, false);
+      assert.ok(!("comparison_post_trained_bar_percent" in result.spec.evaluation_plan));
+      assert.ok(!("comparison_base_model_bar_percent" in result.spec.evaluation_plan));
+      assert.ok(!("comparison_post_trained_bar_percent" in result.compiled_config.evaluation_plan));
+      assert.ok(!("comparison_base_model_bar_percent" in result.compiled_config.evaluation_plan));
+      assert.match(
+        result.spec.notes.join("\n"),
+        /Compiler override applied: show_evaluation_component=false\./,
+      );
+    });
+  } finally {
+    if (previousOverridePath === undefined) {
+      delete process.env.POSTTRAINING_COMPILER_OVERRIDES_PATH;
+    } else {
+      process.env.POSTTRAINING_COMPILER_OVERRIDES_PATH = previousOverridePath;
+    }
+  }
+});
+
 test("deterministic classification normalization omits sampled label constraints", () => {
   const normalization = inferDeterministicNormalization(
     ["body", "priority"],
@@ -1909,12 +1979,14 @@ test("a direct-compatible dataset survives recommendation and compiles", async (
     assert.deepEqual(result.selected_datasets[0].source_splits, ["train"]);
     assert.equal(result.spec.evaluation_plan.strategy, "merged_sft_holdout");
     assert.equal(result.spec.evaluation_plan.comparison_max_examples, 15);
+    assert.equal(result.spec.evaluation_plan.show_evaluation_component, true);
     assert.equal(result.spec.evaluation_plan.split_style, "stratified_completion_label");
     const manifest = JSON.parse(await readFile(result.manifest_path, "utf8"));
     assert.equal(manifest.selected_datasets[0].normalization.shape, "prompt_completion");
     assert.equal(manifest.selected_datasets[0].selected_target_column, "priority");
     assert.deepEqual(manifest.selected_datasets[0].source_splits, ["train"]);
     assert.equal(manifest.evaluation_plan.strategy, "merged_sft_holdout");
+    assert.equal(manifest.evaluation_plan.show_evaluation_component, true);
     assert.equal(result.compiled_config.max_steps, -1);
   });
 });
@@ -1958,13 +2030,16 @@ test("a raw-text generation dataset survives recommendation and compiles", async
     assert.equal(result.spec.task_spec.task_family, "generation");
     assert.equal(result.spec.evaluation_plan.strategy, "merged_sft_holdout");
     assert.equal(result.spec.evaluation_plan.comparison_max_examples, 15);
+    assert.equal(result.spec.evaluation_plan.show_evaluation_component, true);
     assert.equal(result.spec.evaluation_plan.split_style, "deterministic_random");
     assert.equal(result.compiled_config.evaluation_plan.strategy, "merged_sft_holdout");
+    assert.equal(result.compiled_config.evaluation_plan.show_evaluation_component, true);
 
     const manifest = JSON.parse(await readFile(result.manifest_path, "utf8"));
     assert.equal(manifest.selected_datasets[0].normalization.shape, "text");
     assert.deepEqual(manifest.selected_datasets[0].source_splits, ["train"]);
     assert.equal(manifest.evaluation_plan.strategy, "merged_sft_holdout");
+    assert.equal(manifest.evaluation_plan.show_evaluation_component, true);
   });
 });
 

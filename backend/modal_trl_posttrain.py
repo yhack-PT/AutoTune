@@ -1350,6 +1350,16 @@ def _comparison_sample_policy(total_eval_examples: int, *, max_examples: int, se
     }
 
 
+def _resolve_show_evaluation_component(config: TrainConfig) -> bool:
+    evaluation_plan = config.evaluation_plan or {}
+    show_evaluation_component = evaluation_plan.get("show_evaluation_component")
+    if show_evaluation_component is None:
+        return True
+    if isinstance(show_evaluation_component, bool):
+        return show_evaluation_component
+    raise ValueError("evaluation_plan.show_evaluation_component must be a boolean.")
+
+
 def _predict_completion_label(model: Any, tokenizer: Any, prompt: str, max_new_tokens: int = 16) -> str:
     import torch
 
@@ -2001,6 +2011,7 @@ def _evaluate_classification_model_comparison(
         "task_family": "classification",
         "strategy": "sampled_base_vs_tuned_prompt_completion_eval",
         "gold_available": True,
+        "show_evaluation_component": _resolve_show_evaluation_component(config),
         "sample_policy": _comparison_sample_policy(
             len(eval_dataset),
             max_examples=comparison_max_examples,
@@ -2170,6 +2181,7 @@ def _evaluate_generation_model_comparison(
         "strategy": "sampled_base_vs_tuned_generation_eval",
         "gold_available": False,
         "judge_model": judge_model,
+        "show_evaluation_component": _resolve_show_evaluation_component(config),
         "sample_policy": _comparison_sample_policy(
             len(eval_dataset),
             max_examples=comparison_max_examples,
@@ -2332,6 +2344,7 @@ def _evaluate_generation_prompt_completion_model_comparison(
         "strategy": "sampled_base_vs_tuned_prompt_completion_generation_eval",
         "gold_available": True,
         "judge_model": judge_model,
+        "show_evaluation_component": _resolve_show_evaluation_component(config),
         "sample_policy": _comparison_sample_policy(
             len(eval_dataset),
             max_examples=comparison_max_examples,

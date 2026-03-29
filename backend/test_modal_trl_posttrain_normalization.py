@@ -1123,6 +1123,7 @@ class ModalTrlNormalizationTests(unittest.TestCase):
                 "evaluation_plan": {
                     "deterministic_seed": 42,
                     "comparison_max_examples": MODULE.DEFAULT_COMPARISON_MAX_EXAMPLES,
+                    "show_evaluation_component": False,
                 },
                 "output_name": "generation-comparison-demo",
             }
@@ -1192,6 +1193,7 @@ class ModalTrlNormalizationTests(unittest.TestCase):
 
         self.assertEqual(comparison["summary"]["candidate_wins"], 1)
         self.assertEqual(comparison["summary"]["ties"], 1)
+        self.assertEqual(comparison["show_evaluation_component"], False)
         self.assertEqual(comparison["sample_policy"]["sampled_cases"], 2)
         self.assertEqual(comparison["holdout"]["strategy"], "test_holdout")
         self.assertEqual(len(captured_prompts), 4)
@@ -1474,6 +1476,7 @@ class ModalTrlNormalizationTests(unittest.TestCase):
             sorted(judgment["reference_answer"] for judgment in captured_judgments),
             ["Gold answer 1", "Gold answer 2"],
         )
+        self.assertEqual(comparison["show_evaluation_component"], True)
         self.assertEqual(comparison["summary"]["candidate_wins"], 1)
         self.assertEqual(comparison["summary"]["ties"], 1)
         self.assertEqual(comparison["cases"][0]["prompt"], "Solve problem 1")

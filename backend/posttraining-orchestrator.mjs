@@ -6,7 +6,10 @@ import { spawn } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { recommendDatasets } from "./hf-dataset-recommender.mjs";
-import { runCompiler } from "./posttraining-spec-compiler.mjs";
+import {
+  loadCompilerOverrides,
+  runCompiler,
+} from "./posttraining-spec-compiler.mjs";
 import {
   buildTrainingMetricGraphArtifacts,
   parseStructuredTrainingMetricLine,
@@ -118,10 +121,10 @@ function buildTrainingMetricUiProgress(record) {
     return null;
   }
 
-  return `I'm training the model (${step} steps completed)`;
+  return "I'm training the model";
 }
 
-function detectTrainingStageUiProgress(line, stage) {
+export function detectTrainingStageUiProgress(line, stage) {
   const text = String(line ?? "");
   const structuredProgress = text.startsWith(STRUCTURED_PROGRESS_PREFIX)
     ? text.slice(STRUCTURED_PROGRESS_PREFIX.length).trim()
@@ -133,18 +136,15 @@ function detectTrainingStageUiProgress(line, stage) {
   }
 
   if (structuredProgress?.startsWith("running_baseline_generation_cases ")) {
-    const counts = structuredProgress.slice("running_baseline_generation_cases ".length);
-    return `I'm testing the base model (${counts})`;
+    return "I'm testing the base model";
   }
 
   if (structuredProgress?.startsWith("running_candidate_generation_cases ")) {
-    const counts = structuredProgress.slice("running_candidate_generation_cases ".length);
-    return `I'm testing the tuned model (${counts})`;
+    return "I'm testing the tuned model";
   }
 
   if (structuredProgress?.startsWith("judging_generation_cases ")) {
-    const counts = structuredProgress.slice("judging_generation_cases ".length);
-    return `I'm comparing the new model with the original model (${counts})`;
+    return "I'm comparing the new model with the original model";
   }
 
   if (structuredProgress === "preparing_merged_deployment_artifact") {
@@ -225,6 +225,23 @@ function normalizeModalTrainingGpuType(gpuType) {
 
 function isGenerationTaskSpec(taskSpec) {
   return String(taskSpec?.task_family ?? "").trim().toLowerCase() === "generation";
+}
+
+export function getRecommendationStageSelectedDatasets(
+  recommendation,
+  overriddenSftDataset = null,
+) {
+  if (overriddenSftDataset !== null && overriddenSftDataset !== undefined) {
+    return [];
+  }
+
+  if (!Array.isArray(recommendation?.recommended_datasets)) {
+    return [];
+  }
+
+  return recommendation.recommended_datasets
+    .map((item) => (typeof item?.dataset === "string" ? item.dataset.trim() : ""))
+    .filter(Boolean);
 }
 
 export function parseStructuredLifecycleEventLine(line) {
@@ -1165,8 +1182,14 @@ async function runRecommendationStage(jobId, job) {
       skipDebugWrite: true,
       },
     );
+    const overriddenSftDataset = loadCompilerOverrides().sft_dataset;
+    const recommendationStageSelectedDatasets = getRecommendationStageSelectedDatasets(
+      recommendation,
+      overriddenSftDataset,
+    );
     await writeJsonFile(getJobPaths(jobId).recommendationPath, recommendation);
     await completeStage(jobId, "recommending", "Recommendation completed.", (draft) => {
+      draft.selectedDatasets = recommendationStageSelectedDatasets;
       draft.artifacts.recommendationPath = getJobPaths(jobId).recommendationPath;
       return draft;
     });

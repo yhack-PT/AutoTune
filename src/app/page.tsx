@@ -37,6 +37,7 @@ interface ChatMessage {
   content: string;
   deploymentUrl?: string;
   deploymentModel?: string;
+  deploymentJobId?: string;
   comparisonEvaluation?: ComparisonEvaluationSummary;
 }
 
@@ -346,17 +347,14 @@ function ProcessingSidebar({
     <aside
       id="processing-sidebar"
       aria-hidden={!isOpen}
-      className={cn(
-        "shrink-0 overflow-hidden border-l bg-background transition-[width,border-color] duration-300 ease-out",
-        isOpen ? "border-border" : "border-transparent",
-      )}
-      style={{ width: isOpen ? "min(24rem, 38vw)" : 0 }}
+      className="shrink-0 overflow-hidden bg-background transition-[width] duration-300 ease-out"
+      style={{ width: isOpen ? "clamp(18rem, 38vw, 24rem)" : 0 }}
     >
-      <div className="flex h-full min-h-0 w-[min(24rem,38vw)] min-w-[18rem] flex-col">
+      <div className="flex h-full min-h-0 w-full min-w-0 flex-col">
         <div className="flex items-start justify-between gap-4 border-b border-border px-5 py-5">
           <div>
             <h2 className="text-base font-semibold text-foreground">
-              What&apos;s Happening
+              Activity
             </h2>
           </div>
 
@@ -375,7 +373,7 @@ function ProcessingSidebar({
                 <p className="text-xs leading-relaxed text-foreground/60">
                   {selectedDatasets.length > 0
                     ? `Using ${selectedDatasets.length === 1 ? "this dataset" : "these datasets"} to train your model.`
-                    : "We'll show the selected datasets here once the training plan is ready."}
+                    : "We'll show the selected datasets here as soon as they're chosen."}
                 </p>
               </div>
 
@@ -394,7 +392,7 @@ function ProcessingSidebar({
                 </ul>
               ) : (
                 <p className="text-sm leading-relaxed text-foreground/65">
-                  Selecting the best public datasets for this run.
+                  
                 </p>
               )}
             </section>
@@ -477,7 +475,6 @@ export default function ChatPage() {
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
   const [fineTunedEndpoint, setFineTunedEndpoint] = useState<string | null>(null);
   const [fineTunedModel, setFineTunedModel] = useState<string | null>(null);
-  const [fineTunedJobId, setFineTunedJobId] = useState<string | null>(null);
   const [copiedDeploymentUrl, setCopiedDeploymentUrl] = useState<string | null>(null);
   const [activeModel, setActiveModel] = useState<"openai" | "finetuned">("openai");
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -597,7 +594,8 @@ export default function ChatPage() {
         if (
           !evalShownRef.current &&
           nextCompletedStageIds.includes("evaluating") &&
-          job.evaluation?.summary
+          job.evaluation?.summary &&
+          job.evaluation?.show_evaluation_component !== false
         ) {
           evalShownRef.current = true;
           const evalSummary = job.evaluation.summary;
@@ -629,7 +627,6 @@ export default function ChatPage() {
             setFineTunedEndpoint(deploymentUrl);
             setFineTunedModel(deploymentModel);
           }
-          setFineTunedJobId(jobId);
           setCompletedStageIds(nextVisibleStageIds);
           setActiveStageIndex(null);
           setFailedStageId(null);
@@ -647,6 +644,7 @@ export default function ChatPage() {
                 id: crypto.randomUUID(),
                 role: "assistant",
                 content: "Your model is ready!",
+                deploymentJobId: jobId,
                 ...(deploymentUrl
                   ? {
                     deploymentUrl,
@@ -920,7 +918,7 @@ export default function ChatPage() {
                   )}
                   {activeModel !== "finetuned" && (
                     <DropdownMenuItem onClick={() => setActiveModel("finetuned")} style={{ borderRadius: '10px', padding: '8px 10px' }} className="flex justify-between items-center w-full cursor-pointer hover:bg-black/5 transition-colors text-sm font-medium">
-                      Fine-tuned Model
+                      Post-trained Model
                     </DropdownMenuItem>
                   )}
                 </DropdownMenuContent>
@@ -929,19 +927,7 @@ export default function ChatPage() {
               <span className="text-sm font-medium text-foreground/80">AutoTune</span>
             )}
           </div>
-          <div className="flex items-center gap-2">
-            {activeModel === "finetuned" && fineTunedJobId && (
-              <Button asChild variant="outline" size="sm" className="gap-2">
-                <a
-                  href={`/api/posttraining/jobs/${fineTunedJobId}/weights`}
-                  download
-                >
-                  <Download className="h-3.5 w-3.5" />
-                  Download weights
-                </a>
-              </Button>
-            )}
-          </div>
+          <div className="flex items-center gap-2" />
         </header>
 
         {/* Messages area */}
@@ -1035,25 +1021,39 @@ export default function ChatPage() {
                               </code>
                             </div>
 
-                            <Button
-                              type="button"
-                              variant="outline"
-                              size="xs"
-                              className="shrink-0"
-                              onClick={() => handleCopyDeploymentEndpoint(msg.deploymentUrl!)}
-                            >
-                              {copiedDeploymentUrl === msg.deploymentUrl ? (
-                                <>
-                                  <Check className="h-3 w-3" />
-                                  Copied
-                                </>
-                              ) : (
-                                <>
-                                  <Copy className="h-3 w-3" />
-                                  Copy
-                                </>
+                            <div className="flex shrink-0 items-center gap-2">
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="xs"
+                                className="shrink-0"
+                                onClick={() => handleCopyDeploymentEndpoint(msg.deploymentUrl!)}
+                              >
+                                {copiedDeploymentUrl === msg.deploymentUrl ? (
+                                  <>
+                                    <Check className="h-3 w-3" />
+                                    Copied
+                                  </>
+                                ) : (
+                                  <>
+                                    <Copy className="h-3 w-3" />
+                                    Copy
+                                  </>
+                                )}
+                              </Button>
+
+                              {msg.deploymentJobId && (
+                                <Button asChild variant="outline" size="xs" className="gap-2">
+                                  <a
+                                    href={`/api/posttraining/jobs/${msg.deploymentJobId}/weights`}
+                                    download
+                                  >
+                                    <Download className="h-3 w-3" />
+                                    Download weights
+                                  </a>
+                                </Button>
                               )}
-                            </Button>
+                            </div>
                           </div>
                         </div>
                       </div>
@@ -1089,7 +1089,9 @@ export default function ChatPage() {
                 placeholder={
                   isResponding && currentStage
                     ? currentStage.label
-                    : "e.g. Build me an AI expert at drafting clinical notes from visit transcripts..."
+                    : activeModel === "finetuned"
+                      ? "Try your post-trained model..."
+                      : "e.g. Build me an AI expert at drafting clinical notes from visit transcripts..."
                 }
                 rows={1}
                 className={cn(

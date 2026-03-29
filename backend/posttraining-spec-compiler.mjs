@@ -62,6 +62,7 @@ export const DEFAULT_COMPILER_OVERRIDES = Object.freeze({
   sft_gpu_type: null,
   sft_max_length: null,
   sft_dataset: null,
+  show_evaluation_component: null,
 });
 
 let dotEnvLoaded = false;
@@ -261,6 +262,19 @@ export function resolveConfiguredSftDataset(overrides = loadCompilerOverrides())
   return normalizeHuggingFaceDatasetOverride(overrides.sft_dataset);
 }
 
+export function resolveConfiguredShowEvaluationComponent(overrides = loadCompilerOverrides()) {
+  const overrideValue = overrides.show_evaluation_component;
+  if (overrideValue === null || overrideValue === undefined) {
+    return null;
+  }
+  if (typeof overrideValue !== "boolean") {
+    throw new Error(
+      "compiler override show_evaluation_component must be null, true, or false.",
+    );
+  }
+  return overrideValue;
+}
+
 function uniqueStrings(values) {
   return [...new Set(values.filter(Boolean))];
 }
@@ -343,7 +357,7 @@ function resolveMergedSftHoldoutFraction(numTrainEpochs) {
   return DEFAULT_MERGED_SFT_HOLDOUT_FRACTION * numericEpochs;
 }
 
-function buildEvaluationPlan(taskRequirements, numTrainEpochs = 1.0) {
+function buildEvaluationPlan(taskRequirements, numTrainEpochs = 1.0, options = {}) {
   if (!taskRequirements) {
     return null;
   }
@@ -353,6 +367,7 @@ function buildEvaluationPlan(taskRequirements, numTrainEpochs = 1.0) {
     holdout_fraction: resolveMergedSftHoldoutFraction(numTrainEpochs),
     deterministic_seed: 42,
     comparison_max_examples: 15,
+    show_evaluation_component: options.showEvaluationComponent ?? true,
     include_test_split_in_source_pool: true,
     split_style:
       taskRequirements.task_family === "classification"
@@ -1494,11 +1509,15 @@ function validateAndFinalizeSpec(
     spec.method === "sft" ? resolveConfiguredSftGpuType(compilerOverrides) : null;
   const overriddenSftMaxLength =
     spec.method === "sft" ? resolveConfiguredSftMaxLength(compilerOverrides) : null;
+  const overriddenShowEvaluationComponent =
+    spec.method === "sft" ? resolveConfiguredShowEvaluationComponent(compilerOverrides) : null;
   const resolvedNumTrainEpochs =
     spec.method === "sft"
       ? resolveConfiguredSftNumTrainEpochs(compilerOverrides)
       : params.num_train_epochs;
-  const resolvedEvaluationPlan = buildEvaluationPlan(taskRequirements, resolvedNumTrainEpochs);
+  const resolvedEvaluationPlan = buildEvaluationPlan(taskRequirements, resolvedNumTrainEpochs, {
+    showEvaluationComponent: overriddenShowEvaluationComponent,
+  });
   const resolvedOutputShapePreference =
     outputKinds.size === 1 ? [...outputKinds][0] : normalizedTaskSpec.output_shape_preference;
   const finalized = {
@@ -1571,6 +1590,17 @@ function validateAndFinalizeSpec(
   ) {
     finalized.notes.push(
       `Compiler override applied: max_length=${finalized.compute_preset.max_length}.`,
+    );
+  }
+
+  if (
+    spec.method === "sft" &&
+    overriddenShowEvaluationComponent !== null &&
+    finalized.evaluation_plan
+  ) {
+    finalized.notes.push(
+      "Compiler override applied: "
+      + `show_evaluation_component=${finalized.evaluation_plan.show_evaluation_component}.`,
     );
   }
 

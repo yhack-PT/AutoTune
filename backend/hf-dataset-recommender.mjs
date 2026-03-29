@@ -451,7 +451,6 @@ async function createPlanFromUserInputs(input, options = {}, planningHints = {})
       },
     },
   };
-  logUiProgress("I'm planning where to search for training data");
   logInfo(`creating search plan with OpenAI model ${model}`);
   logMultiline("openai prompt", prompt);
 
@@ -513,7 +512,6 @@ async function executeRecommendationAttempt(plan, options = {}) {
       : discoverCandidates(context)
   );
   logInfo(`discovered ${discoveredCandidates.length} candidate datasets before enrichment`);
-  logUiProgress("I'm reviewing the most promising dataset options");
   const enrichedCandidates = await (
     typeof options.enrichCandidates === "function"
       ? options.enrichCandidates(discoveredCandidates, context, options)
@@ -1201,7 +1199,6 @@ function buildSearchVariants(searchText) {
 
 async function enrichCandidates(candidates, context, options = {}) {
   logInfo(`starting enrichment for ${candidates.length} candidates`);
-  logUiProgress("I'm checking sample records from a few promising datasets");
   return mapWithConcurrency(candidates, ENRICHMENT_CONCURRENCY, async (candidate) => {
     logInfo(`enriching dataset ${candidate.id}`);
     const warnings = [];

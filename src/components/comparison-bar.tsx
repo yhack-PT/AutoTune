@@ -27,10 +27,6 @@ export function ComparisonBar({
           <h3 className="text-sm font-semibold text-foreground">
             Evaluation Results
           </h3>
-          <p className="text-xs text-muted-foreground">
-            Judged on {data.totalCases} held-out example
-            {data.totalCases !== 1 ? "s" : ""}
-          </p>
         </div>
 
         <div className="space-y-3">
