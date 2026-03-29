@@ -767,7 +767,7 @@ export default function ChatPage() {
                 </DropdownMenuContent>
               </DropdownMenu>
             ) : (
-              <span className="text-sm font-medium text-foreground/80">ChatGPT</span>
+              <span className="text-sm font-medium text-foreground/80">AutoTune</span>
             )}
           </div>
           <div className="flex items-center gap-2" />
@@ -784,7 +784,7 @@ export default function ChatPage() {
               <div className="max-w-2xl w-full space-y-5">
                 <div className="text-center space-y-1">
                   <h2 className="text-2xl font-semibold tracking-tight">
-                    What should your AI do?
+                    What should your AI be an expert at?
                   </h2>
                   <p className="text-sm text-muted-foreground max-w-md mx-auto">
                     Create a custom AI using your documents or example data.
@@ -882,7 +882,7 @@ export default function ChatPage() {
                 placeholder={
                   isResponding && currentStage
                     ? currentStage.label
-                    : "Describe the AI or labeling task you want to build..."
+                    : "e.g. Build me an AI expert at drafting clinical notes from visit transcripts..."
                 }
                 rows={1}
                 className={cn(
