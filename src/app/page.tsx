@@ -62,14 +62,6 @@ const PIPELINE_STAGES: readonly PipelineStage[] = [
   },
 ];
 
-const STAGE_CHAT_MESSAGES: Record<string, string> = {
-  recommending: "Searching for the best training datasets...",
-  compiling: "Datasets found -- compiling the training spec...",
-  training: "Training spec ready -- fine-tuning is underway...",
-  deploying: "Training complete -- deploying the model...",
-  smoke_testing: "Model deployed -- running smoke tests...",
-};
-
 function stageIndexById(id: string): number {
   return PIPELINE_STAGES.findIndex((s) => s.id === id);
 }
@@ -290,16 +282,9 @@ export default function ChatPage() {
           setCompletedStageCount(idx);
         }
 
-        // Post a chat message when the stage changes
+        // Track stage changes (no chat bubbles — ProcessingIndicator handles it)
         if (currentStageId !== lastStageRef.current) {
           lastStageRef.current = currentStageId;
-          const chatMsg = STAGE_CHAT_MESSAGES[currentStageId];
-          if (chatMsg) {
-            setMessages((prev) => [
-              ...prev,
-              { id: crypto.randomUUID(), role: "assistant", content: chatMsg },
-            ]);
-          }
         }
 
         // Terminal states
@@ -675,11 +660,13 @@ export default function ChatPage() {
               ))}
 
               {isResponding && activeStageIndex !== null && (
-                <ProcessingIndicator
-                  activeStageIndex={activeStageIndex}
-                  isSidebarOpen={isProcessSidebarOpen}
-                  onOpenDetails={() => setIsProcessSidebarOpen(true)}
-                />
+                <div className="-mt-6">
+                  <ProcessingIndicator
+                    activeStageIndex={activeStageIndex}
+                    isSidebarOpen={isProcessSidebarOpen}
+                    onOpenDetails={() => setIsProcessSidebarOpen(true)}
+                  />
+                </div>
               )}
 
               <div ref={messagesEndRef} />
