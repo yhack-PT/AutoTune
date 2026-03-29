@@ -1141,7 +1141,7 @@ class ModalTrlNormalizationTests(unittest.TestCase):
         original_load_adapter = MODULE._load_adapter_inference_model
         original_generate = MODULE._predict_generation_response
         original_synthesize = MODULE._synthesize_generation_case
-        original_judge = MODULE._judge_generation_outputs
+        original_score = MODULE._score_generation_output_against_reference
         original_clear = MODULE._clear_inference_model
         MODULE._load_base_model = lambda config: base_model
         MODULE._load_adapter_inference_model = lambda config: candidate_model
@@ -1160,21 +1160,29 @@ class ModalTrlNormalizationTests(unittest.TestCase):
             return f"{prefix} output for {prompt}"
 
         MODULE._predict_generation_response = fake_generate
-        MODULE._judge_generation_outputs = lambda **kwargs: (
-            {
-                "winner": "candidate",
-                "baseline_score": 6.0,
-                "candidate_score": 8.5,
-                "reason": "Candidate is stronger.",
+        captured_scores = []
+
+        def fake_score(**kwargs):
+            captured_scores.append(kwargs)
+            if "First tutoring example." in kwargs["prompt"]:
+                if kwargs["output"].startswith("base output"):
+                    return {
+                        "score": 6.0,
+                        "matches_expected_output": False,
+                        "reason": "Base output misses key details.",
+                    }
+                return {
+                    "score": 8.5,
+                    "matches_expected_output": True,
+                    "reason": "Candidate output matches the expected answer.",
+                }
+            return {
+                "score": 7.0,
+                "matches_expected_output": True,
+                "reason": "The output is good enough to count as a match.",
             }
-            if kwargs["prompt"] == "Prompt for First tutoring example."
-            else {
-                "winner": "tie",
-                "baseline_score": 7.0,
-                "candidate_score": 7.0,
-                "reason": "Both are similar.",
-            }
-        )
+
+        MODULE._score_generation_output_against_reference = fake_score
 
         try:
             comparison = MODULE._evaluate_generation_model_comparison(
@@ -1188,11 +1196,15 @@ class ModalTrlNormalizationTests(unittest.TestCase):
             MODULE._load_adapter_inference_model = original_load_adapter
             MODULE._predict_generation_response = original_generate
             MODULE._synthesize_generation_case = original_synthesize
-            MODULE._judge_generation_outputs = original_judge
+            MODULE._score_generation_output_against_reference = original_score
             MODULE._clear_inference_model = original_clear
 
-        self.assertEqual(comparison["summary"]["candidate_wins"], 1)
-        self.assertEqual(comparison["summary"]["ties"], 1)
+        self.assertEqual(len(captured_scores), 4)
+        self.assertEqual(comparison["summary"]["match_threshold_score"], 7.0)
+        self.assertEqual(comparison["summary"]["baseline_match_count"], 1)
+        self.assertEqual(comparison["summary"]["candidate_match_count"], 2)
+        self.assertEqual(comparison["summary"]["baseline_match_rate"], 0.5)
+        self.assertEqual(comparison["summary"]["candidate_match_rate"], 1.0)
         self.assertEqual(comparison["show_evaluation_component"], False)
         self.assertEqual(comparison["sample_policy"]["sampled_cases"], 2)
         self.assertEqual(comparison["holdout"]["strategy"], "test_holdout")
@@ -1203,6 +1215,8 @@ class ModalTrlNormalizationTests(unittest.TestCase):
         self.assertEqual(comparison["cases"][0]["prompt"], "Prompt for First tutoring example.")
         self.assertIn("Task:\nPrompt for First tutoring example.", comparison["cases"][0]["model_input_preview"])
         self.assertIn("Source text:\nFirst tutoring example.", comparison["cases"][0]["model_input_preview"])
+        self.assertEqual(comparison["cases"][1]["baseline_judgment"]["score"], 7.0)
+        self.assertTrue(comparison["cases"][1]["baseline_judgment"]["matches_expected_output"])
 
     def test_evaluate_generation_model_comparison_uses_source_text_without_known_target_section(self):
         config = MODULE._config_from_mapping(
@@ -1247,7 +1261,7 @@ class ModalTrlNormalizationTests(unittest.TestCase):
         original_load_adapter = MODULE._load_adapter_inference_model
         original_generate = MODULE._predict_generation_response
         original_synthesize = MODULE._synthesize_generation_case
-        original_judge = MODULE._judge_generation_outputs
+        original_score = MODULE._score_generation_output_against_reference
         original_clear = MODULE._clear_inference_model
         captured_prompts = []
         MODULE._load_base_model = lambda config: base_model
@@ -1265,11 +1279,10 @@ class ModalTrlNormalizationTests(unittest.TestCase):
             return "stub output"
 
         MODULE._predict_generation_response = fake_generate
-        MODULE._judge_generation_outputs = lambda **kwargs: {
-            "winner": "tie",
-            "baseline_score": 7.0,
-            "candidate_score": 7.0,
-            "reason": "Both are similar.",
+        MODULE._score_generation_output_against_reference = lambda **kwargs: {
+            "score": 7.0,
+            "matches_expected_output": True,
+            "reason": "The output matches the expected answer.",
         }
 
         try:
@@ -1284,7 +1297,7 @@ class ModalTrlNormalizationTests(unittest.TestCase):
             MODULE._load_adapter_inference_model = original_load_adapter
             MODULE._predict_generation_response = original_generate
             MODULE._synthesize_generation_case = original_synthesize
-            MODULE._judge_generation_outputs = original_judge
+            MODULE._score_generation_output_against_reference = original_score
             MODULE._clear_inference_model = original_clear
 
         self.assertEqual(len(captured_prompts), 2)
@@ -1332,7 +1345,7 @@ class ModalTrlNormalizationTests(unittest.TestCase):
         original_load_adapter = MODULE._load_adapter_inference_model
         original_generate = MODULE._predict_generation_response
         original_synthesize = MODULE._synthesize_generation_case
-        original_judge = MODULE._judge_generation_outputs
+        original_score = MODULE._score_generation_output_against_reference
         original_clear = MODULE._clear_inference_model
         MODULE._load_base_model = lambda config: base_model
         MODULE._load_adapter_inference_model = lambda config: candidate_model
@@ -1351,17 +1364,16 @@ class ModalTrlNormalizationTests(unittest.TestCase):
 
         captured_judgments = []
 
-        def fake_judge(**kwargs):
+        def fake_score(**kwargs):
             captured_judgments.append(kwargs)
             return {
-                "winner": "candidate",
-                "baseline_score": 3.0,
-                "candidate_score": 8.0,
-                "reason": "Candidate is clearer.",
+                "score": 8.0 if kwargs["output"].startswith("Visible candidate") else 3.0,
+                "matches_expected_output": kwargs["output"].startswith("Visible candidate"),
+                "reason": "Checked the cleaned output.",
             }
 
         MODULE._predict_generation_response = fake_generate
-        MODULE._judge_generation_outputs = fake_judge
+        MODULE._score_generation_output_against_reference = fake_score
 
         try:
             comparison = MODULE._evaluate_generation_model_comparison(
@@ -1375,13 +1387,13 @@ class ModalTrlNormalizationTests(unittest.TestCase):
             MODULE._load_adapter_inference_model = original_load_adapter
             MODULE._predict_generation_response = original_generate
             MODULE._synthesize_generation_case = original_synthesize
-            MODULE._judge_generation_outputs = original_judge
+            MODULE._score_generation_output_against_reference = original_score
             MODULE._clear_inference_model = original_clear
 
-        self.assertEqual(len(captured_judgments), 1)
-        self.assertEqual(captured_judgments[0]["baseline_output"], "Visible base answer.")
+        self.assertEqual(len(captured_judgments), 2)
+        self.assertEqual(captured_judgments[0]["output"], "Visible base answer.")
         self.assertEqual(
-            captured_judgments[0]["candidate_output"],
+            captured_judgments[1]["output"],
             "Visible candidate intro.\n\nVisible candidate answer.",
         )
         self.assertEqual(comparison["cases"][0]["baseline_output"], "Visible base answer.")
@@ -1389,6 +1401,8 @@ class ModalTrlNormalizationTests(unittest.TestCase):
             comparison["cases"][0]["candidate_output"],
             "Visible candidate intro.\n\nVisible candidate answer.",
         )
+        self.assertFalse(comparison["cases"][0]["baseline_judgment"]["matches_expected_output"])
+        self.assertTrue(comparison["cases"][0]["candidate_judgment"]["matches_expected_output"])
 
     def test_evaluate_generation_prompt_completion_model_comparison_uses_gold_completions(self):
         config = MODULE._config_from_mapping(
@@ -1424,7 +1438,7 @@ class ModalTrlNormalizationTests(unittest.TestCase):
         original_load_base = MODULE._load_base_model
         original_load_adapter = MODULE._load_adapter_inference_model
         original_generate = MODULE._predict_generation_response
-        original_judge = MODULE._judge_generation_outputs
+        original_score = MODULE._score_generation_output_against_reference
         original_clear = MODULE._clear_inference_model
         MODULE._load_base_model = lambda config: base_model
         MODULE._load_adapter_inference_model = lambda config: candidate_model
@@ -1437,24 +1451,28 @@ class ModalTrlNormalizationTests(unittest.TestCase):
             captured_prompts.append(prompt)
             return ("base" if model is base_model else "candidate") + f" output for {prompt}"
 
-        def fake_judge(**kwargs):
+        def fake_score(**kwargs):
             captured_judgments.append(kwargs)
             if kwargs["prompt"] == "Solve problem 1":
+                if kwargs["output"].startswith("base output"):
+                    return {
+                        "score": 2.0,
+                        "matches_expected_output": False,
+                        "reason": "Base output misses the expected answer.",
+                    }
                 return {
-                    "winner": "candidate",
-                    "baseline_score": 2.0,
-                    "candidate_score": 8.0,
-                    "reason": "Candidate is better.",
+                    "score": 8.0,
+                    "matches_expected_output": True,
+                    "reason": "Candidate output matches the expected answer.",
                 }
             return {
-                "winner": "tie",
-                "baseline_score": 7.0,
-                "candidate_score": 7.0,
-                "reason": "Both are similar.",
+                "score": 7.0,
+                "matches_expected_output": True,
+                "reason": "The output is good enough to count as a match.",
             }
 
         MODULE._predict_generation_response = fake_generate
-        MODULE._judge_generation_outputs = fake_judge
+        MODULE._score_generation_output_against_reference = fake_score
 
         try:
             comparison = MODULE._evaluate_generation_prompt_completion_model_comparison(
@@ -1467,20 +1485,23 @@ class ModalTrlNormalizationTests(unittest.TestCase):
             MODULE._load_base_model = original_load_base
             MODULE._load_adapter_inference_model = original_load_adapter
             MODULE._predict_generation_response = original_generate
-            MODULE._judge_generation_outputs = original_judge
+            MODULE._score_generation_output_against_reference = original_score
             MODULE._clear_inference_model = original_clear
 
         self.assertEqual(len(captured_prompts), 4)
         self.assertEqual(captured_prompts[0], "Solve problem 1")
         self.assertEqual(
             sorted(judgment["reference_answer"] for judgment in captured_judgments),
-            ["Gold answer 1", "Gold answer 2"],
+            ["Gold answer 1", "Gold answer 1", "Gold answer 2", "Gold answer 2"],
         )
         self.assertEqual(comparison["show_evaluation_component"], True)
-        self.assertEqual(comparison["summary"]["candidate_wins"], 1)
-        self.assertEqual(comparison["summary"]["ties"], 1)
+        self.assertEqual(comparison["summary"]["match_threshold_score"], 7.0)
+        self.assertEqual(comparison["summary"]["baseline_match_count"], 1)
+        self.assertEqual(comparison["summary"]["candidate_match_count"], 2)
         self.assertEqual(comparison["cases"][0]["prompt"], "Solve problem 1")
         self.assertEqual(comparison["cases"][0]["reference_answer"], "Gold answer 1")
+        self.assertEqual(comparison["cases"][0]["baseline_judgment"]["score"], 2.0)
+        self.assertTrue(comparison["cases"][0]["candidate_judgment"]["matches_expected_output"])
         self.assertEqual(comparison["holdout"]["strategy"], "test_holdout")
 
 

@@ -36,6 +36,7 @@ Notes:
 """
 
 import json
+import math
 import os
 import random
 import re
@@ -69,6 +70,7 @@ DEFAULT_COMPARISON_MAX_EXAMPLES = 15
 DEFAULT_CLASSIFICATION_EVAL_MAX_EXAMPLES = 256
 DEFAULT_GENERATION_EVAL_MAX_NEW_TOKENS = 256
 DEFAULT_GENERATION_EVAL_OPENAI_MAX_WORKERS = 4
+DEFAULT_GENERATION_MATCH_THRESHOLD_SCORE = 7.0
 DEFAULT_EVAL_JUDGE_MODEL = "gpt-5.4"
 OPENAI_RESPONSES_API_URL = "https://api.openai.com/v1/responses"
 THINK_TAG_BLOCK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
@@ -1821,71 +1823,51 @@ def _synthesize_generation_case(source_text: str, *, judge_model: str) -> dict[s
     }
 
 
-def _judge_generation_outputs(
+def _score_generation_output_against_reference(
     *,
     prompt: str,
     source_text: str,
     reference_answer: str,
     rubric: list[str],
-    baseline_output: str,
-    candidate_output: str,
+    output: str,
     judge_model: str,
-    flip_order: bool,
 ) -> dict[str, Any]:
-    output_a = candidate_output if flip_order else baseline_output
-    output_b = baseline_output if flip_order else candidate_output
     schema = {
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "winner": {
-                "type": "string",
-                "enum": ["output_a", "output_b", "tie"],
-            },
-            "score_output_a": {"type": "number"},
-            "score_output_b": {"type": "number"},
+            "score": {"type": "number"},
             "reason": {"type": "string"},
         },
-        "required": ["winner", "score_output_a", "score_output_b", "reason"],
+        "required": ["score", "reason"],
     }
 
     result = _call_openai_json_response(
         model=judge_model,
-        schema_name="generation_eval_judgment",
+        schema_name="generation_eval_score",
         schema=schema,
         system_prompt=(
-            "You compare two model outputs against a reference answer and rubric. "
-            "Score each from 0 to 10, pick the better output, and return only strict JSON."
+            "You evaluate one model output against a reference answer and rubric. "
+            f"Score it from 0 to 10. Scores greater than or equal to {DEFAULT_GENERATION_MATCH_THRESHOLD_SCORE} "
+            "mean the output matches the expected output. Return only strict JSON."
         ),
         user_prompt=(
             f"Prompt:\n{prompt}\n\n"
             f"Source eval text:\n{_truncate_preview(source_text, 1800)}\n\n"
             f"Reference answer:\n{reference_answer}\n\n"
             f"Rubric:\n- " + "\n- ".join(rubric) + "\n\n"
-            f"Output A:\n{output_a}\n\n"
-            f"Output B:\n{output_b}"
+            f"Model output:\n{output}"
         ),
     )
 
-    winner = str(result.get("winner", "")).strip()
-    score_output_a = float(result.get("score_output_a", 0.0))
-    score_output_b = float(result.get("score_output_b", 0.0))
+    score = float(result.get("score", 0.0))
     reason = str(result.get("reason", "")).strip()
-    if winner not in {"output_a", "output_b", "tie"}:
-        raise RuntimeError(f"Unexpected generation judge winner: {winner}")
+    if not math.isfinite(score) or score < 0.0 or score > 10.0:
+        raise RuntimeError(f"Unexpected generation eval score: {score}")
 
-    mapped_winner = winner
-    if winner == "output_a":
-        mapped_winner = "candidate" if flip_order else "baseline"
-    elif winner == "output_b":
-        mapped_winner = "baseline" if flip_order else "candidate"
-
-    baseline_score = score_output_b if flip_order else score_output_a
-    candidate_score = score_output_a if flip_order else score_output_b
     return {
-        "winner": mapped_winner,
-        "baseline_score": baseline_score,
-        "candidate_score": candidate_score,
+        "score": score,
+        "matches_expected_output": score >= DEFAULT_GENERATION_MATCH_THRESHOLD_SCORE,
         "reason": reason,
     }
 
@@ -1932,6 +1914,36 @@ def _run_generation_eval_openai_tasks_with_progress(
             completed += 1
             _emit_progress_update(f"{progress_prefix} {completed}/{total_items}")
     return results
+
+
+def _score_generation_case_outputs(
+    *,
+    prompt: str,
+    source_text: str,
+    reference_answer: str,
+    rubric: list[str],
+    baseline_output: str,
+    candidate_output: str,
+    judge_model: str,
+) -> dict[str, Any]:
+    return {
+        "baseline_judgment": _score_generation_output_against_reference(
+            prompt=prompt,
+            source_text=source_text,
+            reference_answer=reference_answer,
+            rubric=rubric,
+            output=baseline_output,
+            judge_model=judge_model,
+        ),
+        "candidate_judgment": _score_generation_output_against_reference(
+            prompt=prompt,
+            source_text=source_text,
+            reference_answer=reference_answer,
+            rubric=rubric,
+            output=candidate_output,
+            judge_model=judge_model,
+        ),
+    }
 
 
 def _evaluate_classification_model_comparison(
@@ -2114,29 +2126,30 @@ def _evaluate_generation_model_comparison(
     if owned_candidate_model:
         _clear_inference_model(candidate_model)
 
-    baseline_wins = 0
-    candidate_wins = 0
-    ties = 0
+    baseline_match_count = 0
+    candidate_match_count = 0
     baseline_score_total = 0.0
     candidate_score_total = 0.0
     cases = []
 
     judgment_tasks = [
         {
-            "index": index,
             "source_text": str(source_text),
             "case_spec": case_spec,
             "baseline_output": baseline_output,
             "candidate_output": candidate_output,
         }
-        for index, (source_text, case_spec, baseline_output, candidate_output) in enumerate(
-            zip(sample["text"], case_specs, baseline_outputs, candidate_outputs)
+        for source_text, case_spec, baseline_output, candidate_output in zip(
+            sample["text"],
+            case_specs,
+            baseline_outputs,
+            candidate_outputs,
         )
     ]
     judgments = _run_generation_eval_openai_tasks_with_progress(
         judgment_tasks,
-        progress_prefix="judging_generation_cases",
-        worker=lambda task: _judge_generation_outputs(
+        progress_prefix="scoring_generation_cases",
+        worker=lambda task: _score_generation_case_outputs(
             prompt=task["case_spec"]["prompt"],
             source_text=task["source_text"],
             reference_answer=task["case_spec"]["reference_answer"],
@@ -2144,22 +2157,27 @@ def _evaluate_generation_model_comparison(
             baseline_output=task["baseline_output"],
             candidate_output=task["candidate_output"],
             judge_model=judge_model,
-            flip_order=bool(task["index"] % 2),
         ),
     )
-    for index, (source_text, case_spec, model_input, baseline_output, candidate_output, judgment) in enumerate(
+    for index, (
+        source_text,
+        case_spec,
+        model_input,
+        baseline_output,
+        candidate_output,
+        judgment_bundle,
+    ) in enumerate(
         zip(sample["text"], case_specs, model_inputs, baseline_outputs, candidate_outputs, judgments)
     ):
-        winner = judgment["winner"]
-        if winner == "baseline":
-            baseline_wins += 1
-        elif winner == "candidate":
-            candidate_wins += 1
-        else:
-            ties += 1
+        baseline_judgment = judgment_bundle["baseline_judgment"]
+        candidate_judgment = judgment_bundle["candidate_judgment"]
+        if baseline_judgment["matches_expected_output"]:
+            baseline_match_count += 1
+        if candidate_judgment["matches_expected_output"]:
+            candidate_match_count += 1
 
-        baseline_score_total += float(judgment["baseline_score"])
-        candidate_score_total += float(judgment["candidate_score"])
+        baseline_score_total += float(baseline_judgment["score"])
+        candidate_score_total += float(candidate_judgment["score"])
         cases.append(
             {
                 "case_id": index + 1,
@@ -2171,14 +2189,15 @@ def _evaluate_generation_model_comparison(
                 "rubric": case_spec["rubric"],
                 "baseline_output": baseline_output,
                 "candidate_output": candidate_output,
-                "judgment": judgment,
+                "baseline_judgment": baseline_judgment,
+                "candidate_judgment": candidate_judgment,
             }
         )
 
     total_cases = len(cases)
     comparison = {
         "task_family": "generation",
-        "strategy": "sampled_base_vs_tuned_generation_eval",
+        "strategy": "sampled_independent_generation_reference_eval",
         "gold_available": False,
         "judge_model": judge_model,
         "show_evaluation_component": _resolve_show_evaluation_component(config),
@@ -2198,12 +2217,11 @@ def _evaluate_generation_model_comparison(
             "adapter_path": str(config.final_adapter_dir),
         },
         "summary": {
-            "baseline_wins": baseline_wins,
-            "candidate_wins": candidate_wins,
-            "ties": ties,
-            "baseline_win_rate": (baseline_wins / total_cases) if total_cases else 0.0,
-            "candidate_win_rate": (candidate_wins / total_cases) if total_cases else 0.0,
-            "tie_rate": (ties / total_cases) if total_cases else 0.0,
+            "match_threshold_score": DEFAULT_GENERATION_MATCH_THRESHOLD_SCORE,
+            "baseline_match_count": baseline_match_count,
+            "candidate_match_count": candidate_match_count,
+            "baseline_match_rate": (baseline_match_count / total_cases) if total_cases else 0.0,
+            "candidate_match_rate": (candidate_match_count / total_cases) if total_cases else 0.0,
             "baseline_average_score": (baseline_score_total / total_cases) if total_cases else 0.0,
             "candidate_average_score": (candidate_score_total / total_cases) if total_cases else 0.0,
         },
@@ -2270,9 +2288,8 @@ def _evaluate_generation_prompt_completion_model_comparison(
     if owned_candidate_model:
         _clear_inference_model(candidate_model)
 
-    baseline_wins = 0
-    candidate_wins = 0
-    ties = 0
+    baseline_match_count = 0
+    candidate_match_count = 0
     baseline_score_total = 0.0
     candidate_score_total = 0.0
     cases = []
@@ -2284,20 +2301,22 @@ def _evaluate_generation_prompt_completion_model_comparison(
 
     judgment_tasks = [
         {
-            "index": index,
             "prompt": str(prompt),
             "reference_answer": str(reference_answer),
             "baseline_output": baseline_output,
             "candidate_output": candidate_output,
         }
-        for index, (prompt, reference_answer, baseline_output, candidate_output) in enumerate(
-            zip(sample["prompt"], sample["completion"], baseline_outputs, candidate_outputs)
+        for prompt, reference_answer, baseline_output, candidate_output in zip(
+            sample["prompt"],
+            sample["completion"],
+            baseline_outputs,
+            candidate_outputs,
         )
     ]
     judgments = _run_generation_eval_openai_tasks_with_progress(
         judgment_tasks,
-        progress_prefix="judging_generation_cases",
-        worker=lambda task: _judge_generation_outputs(
+        progress_prefix="scoring_generation_cases",
+        worker=lambda task: _score_generation_case_outputs(
             prompt=task["prompt"],
             source_text=task["prompt"],
             reference_answer=task["reference_answer"],
@@ -2305,26 +2324,26 @@ def _evaluate_generation_prompt_completion_model_comparison(
             baseline_output=task["baseline_output"],
             candidate_output=task["candidate_output"],
             judge_model=judge_model,
-            flip_order=bool(task["index"] % 2),
         ),
     )
-    for prompt, reference_answer, baseline_output, candidate_output, judgment in zip(
-        sample["prompt"],
-        sample["completion"],
-        baseline_outputs,
-        candidate_outputs,
-        judgments,
+    for index, (prompt, reference_answer, baseline_output, candidate_output, judgment_bundle) in enumerate(
+        zip(
+            sample["prompt"],
+            sample["completion"],
+            baseline_outputs,
+            candidate_outputs,
+            judgments,
+        )
     ):
-        winner = judgment["winner"]
-        if winner == "baseline":
-            baseline_wins += 1
-        elif winner == "candidate":
-            candidate_wins += 1
-        else:
-            ties += 1
+        baseline_judgment = judgment_bundle["baseline_judgment"]
+        candidate_judgment = judgment_bundle["candidate_judgment"]
+        if baseline_judgment["matches_expected_output"]:
+            baseline_match_count += 1
+        if candidate_judgment["matches_expected_output"]:
+            candidate_match_count += 1
 
-        baseline_score_total += float(judgment["baseline_score"])
-        candidate_score_total += float(judgment["candidate_score"])
+        baseline_score_total += float(baseline_judgment["score"])
+        candidate_score_total += float(candidate_judgment["score"])
         cases.append(
             {
                 "case_id": index + 1,
@@ -2334,14 +2353,15 @@ def _evaluate_generation_prompt_completion_model_comparison(
                 "rubric": rubric,
                 "baseline_output": baseline_output,
                 "candidate_output": candidate_output,
-                "judgment": judgment,
+                "baseline_judgment": baseline_judgment,
+                "candidate_judgment": candidate_judgment,
             }
         )
 
     total_cases = len(cases)
     comparison = {
         "task_family": "generation",
-        "strategy": "sampled_base_vs_tuned_prompt_completion_generation_eval",
+        "strategy": "sampled_independent_prompt_completion_generation_reference_eval",
         "gold_available": True,
         "judge_model": judge_model,
         "show_evaluation_component": _resolve_show_evaluation_component(config),
@@ -2361,12 +2381,11 @@ def _evaluate_generation_prompt_completion_model_comparison(
             "adapter_path": str(config.final_adapter_dir),
         },
         "summary": {
-            "baseline_wins": baseline_wins,
-            "candidate_wins": candidate_wins,
-            "ties": ties,
-            "baseline_win_rate": (baseline_wins / total_cases) if total_cases else 0.0,
-            "candidate_win_rate": (candidate_wins / total_cases) if total_cases else 0.0,
-            "tie_rate": (ties / total_cases) if total_cases else 0.0,
+            "match_threshold_score": DEFAULT_GENERATION_MATCH_THRESHOLD_SCORE,
+            "baseline_match_count": baseline_match_count,
+            "candidate_match_count": candidate_match_count,
+            "baseline_match_rate": (baseline_match_count / total_cases) if total_cases else 0.0,
+            "candidate_match_rate": (candidate_match_count / total_cases) if total_cases else 0.0,
             "baseline_average_score": (baseline_score_total / total_cases) if total_cases else 0.0,
             "candidate_average_score": (candidate_score_total / total_cases) if total_cases else 0.0,
         },

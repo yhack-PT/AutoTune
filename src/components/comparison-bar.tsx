@@ -1,24 +1,32 @@
-export type ComparisonEvaluationSummary = {
-  candidateWins: number;
-  baselineWins: number;
-  ties: number;
-  totalCases: number;
-  baseModelName: string;
-};
+export type ComparisonEvaluationSummary =
+  | {
+    mode: "match_rate";
+    candidateRate: number;
+    baselineRate: number;
+    totalCases: number;
+    baseModelName: string;
+    matchThresholdScore: number;
+  }
+  | {
+    mode: "legacy_win_rate";
+    candidateRate: number;
+    baselineRate: number;
+    totalCases: number;
+    baseModelName: string;
+    ties: number;
+  };
+
+function formatThresholdScore(score: number) {
+  return Number.isInteger(score) ? String(score) : score.toFixed(1).replace(/\.0$/, "");
+}
 
 export function ComparisonBar({
   data,
 }: {
   data: ComparisonEvaluationSummary;
 }) {
-  const candidatePercent =
-    data.totalCases > 0
-      ? Math.round((data.candidateWins / data.totalCases) * 100)
-      : 0;
-  const baselinePercent =
-    data.totalCases > 0
-      ? Math.round((data.baselineWins / data.totalCases) * 100)
-      : 0;
+  const candidatePercent = Math.round(data.candidateRate * 100);
+  const baselinePercent = Math.round(data.baselineRate * 100);
 
   return (
     <div className="flex justify-start">
@@ -30,10 +38,9 @@ export function ComparisonBar({
         </div>
 
         <div className="space-y-3">
-          {/* Post-trained bar */}
           <div className="space-y-1.5">
             <span className="text-xs font-medium text-foreground">
-              Post-trained — {candidatePercent}%
+              Post-trained{data.mode === "match_rate" ? " match rate" : ""} — {candidatePercent}%
             </span>
             <div className="h-2.5 w-full rounded-full bg-muted">
               <div
@@ -43,10 +50,12 @@ export function ComparisonBar({
             </div>
           </div>
 
-          {/* Base model bar */}
           <div className="space-y-1.5">
-            <span className="text-xs font-medium text-muted-foreground">
-              Base model — {baselinePercent}%
+            <span
+              className="text-xs font-medium text-muted-foreground"
+              title={data.baseModelName}
+            >
+              Base model{data.mode === "match_rate" ? " match rate" : ""} — {baselinePercent}%
             </span>
             <div className="h-2.5 w-full rounded-full bg-muted">
               <div
@@ -57,11 +66,15 @@ export function ComparisonBar({
           </div>
         </div>
 
-        {data.ties > 0 && (
+        {data.mode === "match_rate" ? (
+          <p className="text-xs text-muted-foreground">
+            Match = judge score &gt;= {formatThresholdScore(data.matchThresholdScore)}/10
+          </p>
+        ) : data.ties > 0 ? (
           <p className="text-xs text-muted-foreground">
             {data.ties} tie{data.ties !== 1 ? "s" : ""}
           </p>
-        )}
+        ) : null}
       </div>
     </div>
   );

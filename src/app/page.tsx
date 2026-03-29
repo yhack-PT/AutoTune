@@ -52,6 +52,64 @@ interface StageProgressItem {
   tone: "normal" | "error";
 }
 
+function toFiniteNumber(value: unknown): number | null {
+  const numericValue =
+    typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+  return Number.isFinite(numericValue) ? numericValue : null;
+}
+
+function buildComparisonEvaluationSummary(
+  evaluation: Record<string, unknown> | null | undefined,
+): ComparisonEvaluationSummary | null {
+  const record = evaluation as {
+    summary?: Record<string, unknown>;
+    sample_policy?: Record<string, unknown>;
+    baseline?: Record<string, unknown>;
+  } | null | undefined;
+
+  const totalCases = toFiniteNumber(record?.sample_policy?.sampled_cases);
+  if (totalCases === null) {
+    return null;
+  }
+
+  const baseModelName =
+    typeof record?.baseline?.model_id === "string" && record.baseline.model_id.trim()
+      ? record.baseline.model_id
+      : "Base model";
+  const summary = record?.summary;
+  if (!summary) {
+    return null;
+  }
+
+  const baselineMatchRate = toFiniteNumber(summary.baseline_match_rate);
+  const candidateMatchRate = toFiniteNumber(summary.candidate_match_rate);
+  if (baselineMatchRate !== null && candidateMatchRate !== null) {
+    return {
+      mode: "match_rate",
+      candidateRate: candidateMatchRate,
+      baselineRate: baselineMatchRate,
+      totalCases,
+      baseModelName,
+      matchThresholdScore: toFiniteNumber(summary.match_threshold_score) ?? 7,
+    };
+  }
+
+  const baselineWins = toFiniteNumber(summary.baseline_wins);
+  const candidateWins = toFiniteNumber(summary.candidate_wins);
+  if (baselineWins !== null && candidateWins !== null) {
+    return {
+      mode: "legacy_win_rate",
+      candidateRate: totalCases > 0 ? candidateWins / totalCases : 0,
+      baselineRate: totalCases > 0 ? baselineWins / totalCases : 0,
+      totalCases,
+      baseModelName,
+      ties: toFiniteNumber(summary.ties) ?? 0,
+    };
+  }
+
+  return null;
+}
+
 const getSidebarStageProgressTyped = getSidebarStageProgress as unknown as (input: {
   logs: unknown[];
   activeStageId: string | null;
@@ -597,24 +655,16 @@ export default function ChatPage() {
           job.evaluation?.summary &&
           job.evaluation?.show_evaluation_component !== false
         ) {
-          evalShownRef.current = true;
-          const evalSummary = job.evaluation.summary;
-          const evalCases = job.evaluation.sample_policy?.sampled_cases;
-          if (typeof evalCases === "number") {
+          const comparisonEvaluation = buildComparisonEvaluationSummary(job.evaluation);
+          if (comparisonEvaluation) {
+            evalShownRef.current = true;
             setMessages((prev) => [
               ...prev,
               {
                 id: crypto.randomUUID(),
                 role: "assistant",
                 content: "",
-                comparisonEvaluation: {
-                  candidateWins: evalSummary.candidate_wins ?? 0,
-                  baselineWins: evalSummary.baseline_wins ?? 0,
-                  ties: evalSummary.ties ?? 0,
-                  totalCases: evalCases,
-                  baseModelName:
-                    job.evaluation.baseline?.model_id ?? "Base model",
-                },
+                comparisonEvaluation,
               },
             ]);
           }

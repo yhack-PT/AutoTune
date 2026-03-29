@@ -57,6 +57,10 @@ const PROMPT_COLUMN_CANDIDATES = [
   "prompt",
   "instruction",
   "input",
+  "dialog",
+  "dialogue",
+  "conversation",
+  "transcript",
 ];
 
 const COMPLETION_COLUMN_CANDIDATES = [
@@ -68,8 +72,11 @@ const COMPLETION_COLUMN_CANDIDATES = [
   "soap",
   "soap_summary",
   "clinical_note",
+  "clinical_note_text",
   "note",
   "notes",
+  "note_text",
+  "section_text",
   "target",
 ];
 
@@ -350,6 +357,14 @@ function sampleColumnValues(sampleRows, columnName) {
     .filter((value) => value !== undefined);
 }
 
+function isScalarCompatibleColumn(columnName, sampleRows) {
+  const observedValues = sampleColumnValues(sampleRows, columnName).filter((value) => value !== null);
+  if (observedValues.length === 0) {
+    return true;
+  }
+  return observedValues.every((value) => isScalarValue(value));
+}
+
 function analyzeClassificationTargetColumn(columnName, sampleRows) {
   const observedValues = sampleColumnValues(sampleRows, columnName).filter((value) => value !== null);
   const scalarValues = observedValues.filter((value) => isScalarValue(value));
@@ -518,7 +533,12 @@ export function inferDeterministicNormalization(featureNames, sampleRows) {
 
   const promptColumn = firstMatchingColumn(columnMap, PROMPT_COLUMN_CANDIDATES);
   const completionColumn = firstMatchingColumn(columnMap, COMPLETION_COLUMN_CANDIDATES);
-  if (promptColumn && completionColumn) {
+  if (
+    promptColumn &&
+    completionColumn &&
+    isScalarCompatibleColumn(promptColumn, filteredSampleRows) &&
+    isScalarCompatibleColumn(completionColumn, filteredSampleRows)
+  ) {
     return {
       compatibility_status: "compatible",
       compatibility_reason: `Direct prompt/completion normalization is available via '${promptColumn}' and '${completionColumn}'.`,

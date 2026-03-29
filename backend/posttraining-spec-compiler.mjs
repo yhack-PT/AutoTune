@@ -6,6 +6,7 @@ import { pathToFileURL } from "node:url";
 
 import {
   ensureClassificationPromptSeparator,
+  inferDeterministicNormalization as inferDeterministicNormalizationShared,
   inferOutputKindFromNormalization as inferOutputKindFromNormalizationShared,
   validateNormalizationProposal as validateNormalizationProposalShared,
 } from "./posttraining-normalization.mjs";
@@ -26,6 +27,10 @@ const DEFAULT_BASE_MODEL = {
   model_id: "Qwen/Qwen3-8B-Base",
   revision: "7b8a267e13df1a9427e7dfa2691f69a417c58d94",
 };
+const KNOWN_BASE_MODEL_REVISIONS = Object.freeze({
+  [DEFAULT_BASE_MODEL.model_id]: DEFAULT_BASE_MODEL.revision,
+  "Qwen/Qwen3-14B-Base": "0b0bd3732e2c374d483664439ea334928b65f304",
+});
 
 const DEFAULT_TRAINING_PARAMS = {
   lora_r: 16,
@@ -116,6 +121,28 @@ function normalizeSourceSplitList(value, fallbackSplit = null) {
 
   const fallback = normalizeOptionalString(fallbackSplit);
   return fallback ? [fallback] : [];
+}
+
+function resolveKnownBaseModelRevision(modelId) {
+  const normalizedModelId = normalizeOptionalString(modelId);
+  if (normalizedModelId === null) {
+    return null;
+  }
+  return KNOWN_BASE_MODEL_REVISIONS[normalizedModelId] ?? null;
+}
+
+export function resolveConfiguredBaseModel() {
+  const modelId =
+    normalizeOptionalString(process.env.POSTTRAINING_BASE_MODEL) ?? DEFAULT_BASE_MODEL.model_id;
+  const configuredRevision = normalizeOptionalString(process.env.POSTTRAINING_BASE_MODEL_REVISION);
+
+  return {
+    model_id: modelId,
+    revision:
+      configuredRevision ??
+      resolveKnownBaseModelRevision(modelId) ??
+      (modelId === DEFAULT_BASE_MODEL.model_id ? DEFAULT_BASE_MODEL.revision : null),
+  };
 }
 
 export function getCompilerOverridesConfigPath() {
@@ -741,7 +768,7 @@ function normalizeCandidate(candidate) {
     return null;
   }
 
-  return {
+  const normalizedCandidate = {
     dataset,
     source_url: normalizeOptionalString(candidate.source_url) ?? `https://huggingface.co/datasets/${dataset}`,
     score: Number(candidate.score ?? 0),
@@ -805,6 +832,64 @@ function normalizeCandidate(candidate) {
     ambiguity_warnings: Array.isArray(candidate.ambiguity_warnings)
       ? uniqueStrings(candidate.ambiguity_warnings.map((value) => String(value).trim()))
       : [],
+  };
+
+  if (
+    normalizedCandidate.normalization_proposal ||
+    normalizedCandidate.source_schema.available_columns.length === 0
+  ) {
+    return normalizedCandidate;
+  }
+
+  const inferredNormalization = inferDeterministicNormalizationShared(
+    normalizedCandidate.source_schema.available_columns,
+    normalizedCandidate.source_schema.sample_rows,
+  );
+
+  if (!inferredNormalization?.normalization_proposal) {
+    return normalizedCandidate;
+  }
+
+  return {
+    ...normalizedCandidate,
+    compatibility_reason:
+      normalizeOptionalString(inferredNormalization.compatibility_reason) ??
+      normalizedCandidate.compatibility_reason,
+    normalization_source: normalizedCandidate.normalization_source ?? "deterministic",
+    normalization_proposal: canonicalizeNormalizationProposal(
+      inferredNormalization.normalization_proposal,
+    ),
+    compatible_methods:
+      Array.isArray(inferredNormalization.compatible_methods) &&
+      inferredNormalization.compatible_methods.length > 0
+        ? uniqueStrings(
+          inferredNormalization.compatible_methods.map((value) => String(value).trim()),
+        )
+        : normalizedCandidate.compatible_methods,
+    selected_target_column:
+      normalizeOptionalString(inferredNormalization.selected_target_column) ??
+      normalizedCandidate.selected_target_column,
+    target_selection_reason:
+      normalizeOptionalString(inferredNormalization.target_selection_reason) ??
+      normalizedCandidate.target_selection_reason,
+    target_selection_confidence:
+      typeof inferredNormalization.target_selection_confidence === "number"
+        ? inferredNormalization.target_selection_confidence
+        : normalizedCandidate.target_selection_confidence,
+    target_candidates:
+      Array.isArray(inferredNormalization.target_candidates) &&
+      inferredNormalization.target_candidates.length > 0
+        ? uniqueStrings(
+          inferredNormalization.target_candidates.map((value) => String(value).trim()),
+        )
+        : normalizedCandidate.target_candidates,
+    ambiguity_warnings:
+      Array.isArray(inferredNormalization.ambiguity_warnings) &&
+      inferredNormalization.ambiguity_warnings.length > 0
+        ? uniqueStrings(
+          inferredNormalization.ambiguity_warnings.map((value) => String(value).trim()),
+        )
+        : normalizedCandidate.ambiguity_warnings,
   };
 }
 
@@ -894,6 +979,7 @@ function buildObjectiveSummary(context, args, candidates) {
 
 function buildPlatformConstraints(taskSpec, seedArtifact) {
   const taskRequirements = getTaskRequirements(taskSpec);
+  const configuredBaseModel = resolveConfiguredBaseModel();
 
   return {
     text_only: true,
@@ -904,7 +990,7 @@ function buildPlatformConstraints(taskSpec, seedArtifact) {
     default_artifact_strategy: "adapter",
     allowed_normalization_shapes: ["text", "prompt_completion"],
     allowed_compute_gpus: ALLOWED_GPUS,
-    allowed_base_models: [DEFAULT_BASE_MODEL],
+    allowed_base_models: [configuredBaseModel],
     seed_artifact_available: Boolean(normalizeOptionalString(seedArtifact)),
     seed_artifact: normalizeOptionalString(seedArtifact),
     task_requirements: taskRequirements,
@@ -1515,6 +1601,11 @@ function validateAndFinalizeSpec(
     spec.method === "sft"
       ? resolveConfiguredSftNumTrainEpochs(compilerOverrides)
       : params.num_train_epochs;
+  const configuredBaseModel = resolveConfiguredBaseModel();
+  const resolvedBaseModelRevision =
+    normalizeOptionalString(spec.base_model.revision) ??
+    (spec.base_model.model_id === configuredBaseModel.model_id ? configuredBaseModel.revision : null) ??
+    resolveKnownBaseModelRevision(spec.base_model.model_id);
   const resolvedEvaluationPlan = buildEvaluationPlan(taskRequirements, resolvedNumTrainEpochs, {
     showEvaluationComponent: overriddenShowEvaluationComponent,
   });
@@ -1532,7 +1623,7 @@ function validateAndFinalizeSpec(
     artifact_strategy: spec.artifact_strategy,
     base_model: {
       model_id: spec.base_model.model_id,
-      revision: normalizeOptionalString(spec.base_model.revision) ?? DEFAULT_BASE_MODEL.revision,
+      revision: resolvedBaseModelRevision,
     },
     selected_datasets: normalizeWeights(selectedDatasets),
     compute_preset: {
@@ -1820,7 +1911,7 @@ function buildFallbackSpec(objectiveSummary, jobId, candidateProfiles, seedArtif
     method: "sft",
     adaptation_strategy: "lora",
     artifact_strategy: "adapter",
-    base_model: DEFAULT_BASE_MODEL,
+    base_model: resolveConfiguredBaseModel(),
     selected_datasets: [
       {
         dataset: firstCandidate.dataset,

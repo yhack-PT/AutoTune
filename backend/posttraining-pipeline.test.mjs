@@ -17,6 +17,7 @@ import {
   buildSpecPrompt,
   getSpecSchema,
   getCompilerOverridesConfigPath,
+  resolveConfiguredBaseModel,
   resolveConfiguredShowEvaluationComponent,
   resolveConfiguredSftDataset,
   resolveConfiguredSftGpuType,
@@ -1364,6 +1365,93 @@ test("compiler override can hardcode a specific Hugging Face dataset URL", async
   }
 });
 
+test("compiler recovers deterministic normalization for an overridden dialogue-to-note dataset", async () => {
+  const previousOverridePath = process.env.POSTTRAINING_COMPILER_OVERRIDES_PATH;
+
+  try {
+    await withTempDir(async (tempRoot) => {
+      const overridesPath = path.join(tempRoot, "compiler-overrides.yaml");
+      process.env.POSTTRAINING_COMPILER_OVERRIDES_PATH = overridesPath;
+      await writeFile(
+        overridesPath,
+        "sft_dataset: https://huggingface.co/datasets/har1/MTS_Dialogue-Clinical_Note\n",
+        "utf8",
+      );
+
+      const overrideCandidate = {
+        ...buildPromptCompletionGenerationCandidate(),
+        dataset: "har1/MTS_Dialogue-Clinical_Note",
+        source_url: "https://huggingface.co/datasets/har1/MTS_Dialogue-Clinical_Note",
+        why: "Clinical dialogue and note text provide a direct transcript-to-note supervision path.",
+        schema_signals: ["conversation_ready", "summarization_ready"],
+        compatibility_status: "incompatible",
+        compatibility_reason: "No supported normalization proposal could be inferred for this dataset.",
+        normalization_source: null,
+        normalization_proposal: null,
+        compatible_methods: [],
+        source_schema: {
+          available_columns: ["dialogue", "section_text"],
+          sample_rows: [
+            {
+              dialogue: "Doctor: What brings you in today?\nPatient: I've had chest pain since yesterday.",
+              section_text: "HPI: Patient reports chest pain that began yesterday.",
+            },
+          ],
+        },
+        selected_target_column: null,
+        target_selection_reason: null,
+        target_selection_confidence: null,
+        target_candidates: [],
+        ambiguity_warnings: [],
+      };
+
+      const distractorCandidate = buildPromptCompletionGenerationCandidate();
+      const recommendation = await recommendDatasets(buildGenerationPlan(), {
+        discoverCandidates: async () => [distractorCandidate],
+        enrichCandidates: async () => [distractorCandidate],
+        rankCandidates: async () => [toRecommendedCandidate(distractorCandidate)],
+        skipDebugWrite: true,
+      });
+
+      const inputPath = path.join(tempRoot, "recommendation.json");
+      await writeFile(inputPath, `${JSON.stringify(recommendation, null, 2)}\n`, "utf8");
+
+      const result = await runCompiler(
+        {
+          inputPath,
+          outputRoot: tempRoot,
+          jobId: "dialogue-note-override-job",
+          objectiveSummary: "Draft clinical notes from clinician-patient conversations.",
+        },
+        {
+          specPlanner: async () => ({
+            parsed: buildGenerationSpec(distractorCandidate.dataset),
+            model: "test-model",
+            response_id: "resp_dialogue_note_override",
+          }),
+          datasetOverrideResolver: async () => overrideCandidate,
+        },
+      );
+
+      assert.equal(result.spec.selected_datasets[0].dataset, overrideCandidate.dataset);
+      assert.equal(
+        result.spec.selected_datasets[0].normalization.fields.prompt.source_column,
+        "dialogue",
+      );
+      assert.equal(
+        result.spec.selected_datasets[0].normalization.fields.completion.source_column,
+        "section_text",
+      );
+    });
+  } finally {
+    if (previousOverridePath === undefined) {
+      delete process.env.POSTTRAINING_COMPILER_OVERRIDES_PATH;
+    } else {
+      process.env.POSTTRAINING_COMPILER_OVERRIDES_PATH = previousOverridePath;
+    }
+  }
+});
+
 test("compiler override can force a different SFT epoch count than the planner proposed", async () => {
   const previousOverridePath = process.env.POSTTRAINING_COMPILER_OVERRIDES_PATH;
 
@@ -1860,6 +1948,75 @@ test("compiler override can hide the evaluation component", async () => {
   }
 });
 
+test("compiler resolves the configured Qwen3 14B base model revision from env", async () => {
+  const previousBaseModel = process.env.POSTTRAINING_BASE_MODEL;
+  const previousBaseModelRevision = process.env.POSTTRAINING_BASE_MODEL_REVISION;
+
+  try {
+    process.env.POSTTRAINING_BASE_MODEL = "Qwen/Qwen3-14B-Base";
+    delete process.env.POSTTRAINING_BASE_MODEL_REVISION;
+
+    assert.deepEqual(resolveConfiguredBaseModel(), {
+      model_id: "Qwen/Qwen3-14B-Base",
+      revision: "0b0bd3732e2c374d483664439ea334928b65f304",
+    });
+
+    await withTempDir(async (tempRoot) => {
+      const enrichedCandidate = buildDirectCompatibleCandidate();
+      const recommendation = await recommendDatasets(buildPlan(), {
+        discoverCandidates: async () => [enrichedCandidate],
+        enrichCandidates: async () => [enrichedCandidate],
+        rankCandidates: async () => [toRecommendedCandidate(enrichedCandidate)],
+        skipDebugWrite: true,
+      });
+
+      const inputPath = path.join(tempRoot, "recommendation.json");
+      await writeFile(inputPath, `${JSON.stringify(recommendation, null, 2)}\n`, "utf8");
+
+      const spec = buildSpec("acme/support-ticket-bodies");
+      const result = await runCompilerWithNeutralOverrides(
+        {
+          inputPath,
+          outputRoot: tempRoot,
+          jobId: "base-model-env-job",
+          objectiveSummary: "Classify support tickets.",
+        },
+        {
+          specPlanner: async () => ({
+            parsed: {
+              ...spec,
+              base_model: {
+                model_id: "Qwen/Qwen3-14B-Base",
+                revision: null,
+              },
+            },
+            model: "test-model",
+            response_id: "resp_base_model_env",
+          }),
+        },
+      );
+
+      assert.equal(result.compiled_config.base_model, "Qwen/Qwen3-14B-Base");
+      assert.equal(
+        result.compiled_config.base_model_revision,
+        "0b0bd3732e2c374d483664439ea334928b65f304",
+      );
+    });
+  } finally {
+    if (previousBaseModel === undefined) {
+      delete process.env.POSTTRAINING_BASE_MODEL;
+    } else {
+      process.env.POSTTRAINING_BASE_MODEL = previousBaseModel;
+    }
+
+    if (previousBaseModelRevision === undefined) {
+      delete process.env.POSTTRAINING_BASE_MODEL_REVISION;
+    } else {
+      process.env.POSTTRAINING_BASE_MODEL_REVISION = previousBaseModelRevision;
+    }
+  }
+});
+
 test("deterministic classification normalization omits sampled label constraints", () => {
   const normalization = inferDeterministicNormalization(
     ["body", "priority"],
@@ -1920,6 +2077,23 @@ test("inferDeterministicNormalization recognizes prompt and soap columns as prom
   assert.equal(normalization.normalization_proposal.shape, "prompt_completion");
   assert.equal(normalization.normalization_proposal.fields.prompt.source_column, "prompt");
   assert.equal(normalization.normalization_proposal.fields.completion.source_column, "soap");
+});
+
+test("inferDeterministicNormalization recognizes dialogue and section_text columns as prompt-completion data", () => {
+  const normalization = inferDeterministicNormalization(
+    ["dialogue", "section_text"],
+    [
+      {
+        dialogue: "Doctor: How are you feeling today?\nPatient: I'm still coughing at night.",
+        section_text: "HPI: Patient reports persistent nighttime cough.",
+      },
+    ],
+  );
+
+  assert.equal(normalization.compatibility_status, "compatible");
+  assert.equal(normalization.normalization_proposal.shape, "prompt_completion");
+  assert.equal(normalization.normalization_proposal.fields.prompt.source_column, "dialogue");
+  assert.equal(normalization.normalization_proposal.fields.completion.source_column, "section_text");
 });
 
 test("OpenAI structured-output schema marks every property as required", () => {

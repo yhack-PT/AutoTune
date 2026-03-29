@@ -127,10 +127,10 @@ test("detectTrainingStageUiProgress strips tuned-model and comparison counters f
   );
   assert.equal(
     detectTrainingStageUiProgress(
-      "PT_PROGRESS::judging_generation_cases 11/15",
+      "PT_PROGRESS::scoring_generation_cases 11/15",
       "evaluating",
     ),
-    "I'm comparing the new model with the original model",
+    "I'm scoring each model against the expected outputs",
   );
 });
 

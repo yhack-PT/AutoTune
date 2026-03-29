@@ -143,8 +143,11 @@ export function detectTrainingStageUiProgress(line, stage) {
     return "I'm testing the tuned model";
   }
 
-  if (structuredProgress?.startsWith("judging_generation_cases ")) {
-    return "I'm comparing the new model with the original model";
+  if (
+    structuredProgress?.startsWith("scoring_generation_cases ") ||
+    structuredProgress?.startsWith("judging_generation_cases ")
+  ) {
+    return "I'm scoring each model against the expected outputs";
   }
 
   if (structuredProgress === "preparing_merged_deployment_artifact") {
@@ -1519,7 +1522,7 @@ async function finalizeEvaluationStage(jobId, trainingResult) {
   }
 
   if (comparisonEvaluation) {
-    emitLoggerUiProgress(logger, "I'm comparing the new model with the original model");
+    emitLoggerUiProgress(logger, "I'm scoring each model against the expected outputs");
   }
 
   await completeStage(jobId, "evaluating", "Offline evaluation completed.", (draft) => {

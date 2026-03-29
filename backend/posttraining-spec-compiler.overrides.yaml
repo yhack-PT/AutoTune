@@ -1,12 +1,12 @@
 # Compiler-owned local overrides for posttraining-spec-compiler.mjs.
 # Set to `null` to fall back to the planner prompt default of 1.0 epochs.
-sft_num_train_epochs: .001
+sft_num_train_epochs: null
 # Set to `null` to keep the planner-selected GPU.
-sft_gpu_type: H100
+sft_gpu_type: null
 # Set to `null` to keep the planner-selected max_length.
-sft_max_length: 1024
+sft_max_length: null
 # Accepts either `org/name` or a full `https://huggingface.co/datasets/...` URL.
-sft_dataset: https://huggingface.co/datasets/starmpcc/Asclepius-Synthetic-Clinical-Notes
+sft_dataset: null
 
 show_evaluation_component: null
 
