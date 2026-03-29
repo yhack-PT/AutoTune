@@ -138,7 +138,10 @@ function ProcessingIndicator({
           aria-controls="processing-sidebar"
           className="flex items-center gap-2 text-left text-sm font-medium text-foreground transition-opacity hover:opacity-70"
         >
-          <span className="h-2 w-2 rounded-full bg-foreground motion-safe:animate-pulse" />
+          <span
+            className="h-2 w-2 rounded-full bg-foreground"
+            style={{ animation: "pulse-dot 1.5s ease-in-out infinite" }}
+          />
           <span>{activeStage.label}</span>
         </button>
       </div>
