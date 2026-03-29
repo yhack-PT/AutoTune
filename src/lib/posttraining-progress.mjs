@@ -89,7 +89,7 @@ export function parseUiProgressEvent(event) {
 }
 
 function normalizeMaxItemsPerStage(value) {
-  return Number.isInteger(value) && value > 0 ? value : 6;
+  return Number.isInteger(value) && value > 0 ? value : null;
 }
 
 export function getUiProgressHistoryByStage(logs, options = {}) {
@@ -118,7 +118,7 @@ export function getUiProgressHistoryByStage(logs, options = {}) {
       tone: parsed.tone,
     });
 
-    if (stageHistory.length > maxItemsPerStage) {
+    if (maxItemsPerStage !== null && stageHistory.length > maxItemsPerStage) {
       stageHistory.shift();
     }
 
@@ -149,7 +149,7 @@ export function getSidebarStageProgress({
   completedStageIds = [],
   failedStageId = null,
   jobStatus = null,
-  maxItemsPerStage = 6,
+  maxItemsPerStage = null,
 }) {
   const historyByStage = getUiProgressHistoryByStage(logs, { maxItemsPerStage });
   const completedStageSet = new Set(

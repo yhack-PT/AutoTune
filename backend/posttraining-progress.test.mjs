@@ -213,3 +213,56 @@ test("getSidebarStageProgress preserves the failed stage error line", () => {
     },
   );
 });
+
+test("getSidebarStageProgress does not trim stage history by default", () => {
+  const logs = Array.from({ length: 8 }, (_, index) =>
+    buildUiProgressEvent({
+      stageId: "recommending",
+      text: `progress-${index + 1}`,
+    }),
+  );
+
+  assert.deepEqual(
+    getSidebarStageProgress({
+      logs,
+      activeStageId: "recommending",
+      completedStageIds: [],
+      failedStageId: null,
+      jobStatus: "recommending",
+    }).recommending,
+    [
+      { id: "recommending:0", text: "progress-1", tone: "normal" },
+      { id: "recommending:1", text: "progress-2", tone: "normal" },
+      { id: "recommending:2", text: "progress-3", tone: "normal" },
+      { id: "recommending:3", text: "progress-4", tone: "normal" },
+      { id: "recommending:4", text: "progress-5", tone: "normal" },
+      { id: "recommending:5", text: "progress-6", tone: "normal" },
+      { id: "recommending:6", text: "progress-7", tone: "normal" },
+      { id: "recommending:7", text: "progress-8", tone: "normal" },
+    ],
+  );
+});
+
+test("getSidebarStageProgress still supports an explicit maxItemsPerStage cap", () => {
+  const logs = Array.from({ length: 4 }, (_, index) =>
+    buildUiProgressEvent({
+      stageId: "training",
+      text: `step-${index + 1}`,
+    }),
+  );
+
+  assert.deepEqual(
+    getSidebarStageProgress({
+      logs,
+      activeStageId: "training",
+      completedStageIds: [],
+      failedStageId: null,
+      jobStatus: "training",
+      maxItemsPerStage: 2,
+    }).training,
+    [
+      { id: "training:2", text: "step-3", tone: "normal" },
+      { id: "training:3", text: "step-4", tone: "normal" },
+    ],
+  );
+});

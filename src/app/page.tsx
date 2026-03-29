@@ -287,9 +287,7 @@ function ProcessingSidebar({
             <h2 className="text-base font-semibold text-foreground">
               What&apos;s Happening
             </h2>
-            <p className="mt-1 text-sm text-muted-foreground">
-              A simple view of the steps being completed for this request.
-            </p>
+
           </div>
 
           <Button variant="ghost" size="sm" onClick={onClose}>
