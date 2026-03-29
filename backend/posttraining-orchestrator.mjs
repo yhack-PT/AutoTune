@@ -5,7 +5,6 @@ import { spawn } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { recommendDatasets } from "./hf-dataset-recommender.mjs";
-import { generateSearchPlan } from "./description-to-search-plan.mjs";
 import { runCompiler } from "./posttraining-spec-compiler.mjs";
 
 const backendDir = path.dirname(fileURLToPath(import.meta.url));
@@ -77,6 +76,7 @@ function getJobPaths(jobId) {
     manifestPath: path.join(jobDir, "prepared_dataset_manifest.json"),
     compilerTracePath: path.join(jobDir, "compiler_trace.json"),
     trainingResultPath: path.join(jobDir, "training_result.json"),
+    evaluationPath: path.join(jobDir, "evaluation_result.json"),
     deploymentPath: path.join(jobDir, "deployment.json"),
     smokeTestPath: path.join(jobDir, "smoke_test.json"),
   };
@@ -480,17 +480,15 @@ async function runSmokeTest({ jobId, deploymentUrl, model, logger }) {
 async function runRecommendationStage(jobId, job) {
   const logger = createStageLogger(jobId, "recommending");
   try {
-    const searchPlan = await generateSearchPlan(job.input.description, { logger });
-    await logger.emit({
-      source: "orchestrator",
-      level: "info",
-      message: "Generated search plan from description.",
-      data: { queryCount: searchPlan.search_queries.length },
-    });
-    const recommendation = await recommendDatasets(searchPlan, {
+    const recommendation = await recommendDatasets(
+      {
+        description: job.input.description,
+      },
+      {
       logger,
       skipDebugWrite: true,
-    });
+      },
+    );
     await writeJsonFile(getJobPaths(jobId).recommendationPath, recommendation);
     await completeStage(jobId, "recommending", "Recommendation completed.", (draft) => {
       draft.artifacts.recommendationPath = getJobPaths(jobId).recommendationPath;
@@ -499,9 +497,11 @@ async function runRecommendationStage(jobId, job) {
     await logger.emit({
       source: "orchestrator",
       level: "info",
-      message: "Saved recommendation output.",
+      message: "Generated and saved recommendation output from description.",
       data: {
         path: getJobPaths(jobId).recommendationPath,
+        queryCount: recommendation.search_queries?.length ?? 0,
+        taskSpec: recommendation.task_spec ?? null,
         recommendedDatasets: recommendation.recommended_datasets?.map((item) => item.dataset) ?? [],
       },
     });
@@ -585,6 +585,20 @@ async function runTrainingStage(jobId, compiledConfig) {
     return draft;
   });
 
+  const missingTargetFiltering =
+    trainingResult?.preprocessing_diagnostics?.missing_target_label_filtering ?? null;
+  const droppedMissingTargetRows = Number(missingTargetFiltering?.dropped_rows_missing_target ?? 0);
+  const droppedDatasets = Array.isArray(missingTargetFiltering?.datasets)
+    ? missingTargetFiltering.datasets
+        .filter((entry) => Number(entry?.dropped_rows_missing_target ?? 0) > 0)
+        .map((entry) => ({
+          dataset: entry?.dataset ?? null,
+          split: entry?.split ?? null,
+          selectedTargetColumn: entry?.selected_target_column ?? null,
+          droppedRowsMissingTarget: Number(entry?.dropped_rows_missing_target ?? 0),
+        }))
+    : [];
+
   await logger.emit({
     source: "orchestrator",
     level: "info",
@@ -593,13 +607,74 @@ async function runTrainingStage(jobId, compiledConfig) {
       finalAdapterDir: trainingResult.final_adapter_dir,
       trainerType: trainingResult.trainer_type,
       selectedDatasets: trainingResult.selected_datasets,
+      globalStep: trainingResult.global_step,
+      evalExamples: trainingResult.eval_examples,
+      droppedRowsMissingTargetLabels: droppedMissingTargetRows,
     },
   });
+
+  if (droppedMissingTargetRows > 0) {
+    await logger.emit({
+      source: "orchestrator",
+      level: "warn",
+      message: "Dropped rows with missing selected target labels before training.",
+      data: {
+        droppedRowsMissingTargetLabels: droppedMissingTargetRows,
+        droppedDatasets,
+      },
+    });
+  }
 
   return {
     trainingResult,
     compiledConfig,
   };
+}
+
+function isNonTrivialRun(trainingResult) {
+  return Number(trainingResult?.train_examples ?? 0) >= 1000;
+}
+
+async function runEvaluatingStage(jobId, trainingResult) {
+  const logger = createStageLogger(jobId, "evaluating");
+  const evaluation = trainingResult?.evaluation;
+  if (!evaluation || typeof evaluation !== "object") {
+    throw new Error("Training completed without an evaluation result.");
+  }
+
+  if (isNonTrivialRun(trainingResult) && Number(trainingResult.global_step ?? 0) <= 1) {
+    throw new Error(
+      `Training run is degenerate: global_step=${trainingResult.global_step} for ${trainingResult.train_examples} train examples.`,
+    );
+  }
+
+  const invalidLabelRate = Number(evaluation?.metrics?.invalid_label_rate ?? 1);
+  if (!Number.isFinite(invalidLabelRate) || invalidLabelRate >= 1) {
+    throw new Error(
+      `Evaluation indicates catastrophic label prediction failure (invalid_label_rate=${invalidLabelRate}).`,
+    );
+  }
+
+  await writeJsonFile(getJobPaths(jobId).evaluationPath, evaluation);
+  await completeStage(jobId, "evaluating", "Offline evaluation completed.", (draft) => {
+    draft.artifacts.evaluationPath = getJobPaths(jobId).evaluationPath;
+    draft.evaluation = evaluation;
+    return draft;
+  });
+
+  await logger.emit({
+    source: "orchestrator",
+    level: "info",
+    message: "Evaluation artifact captured.",
+    data: {
+      accuracy: evaluation?.metrics?.accuracy ?? null,
+      macroF1: evaluation?.metrics?.macro_f1 ?? null,
+      invalidLabelRate,
+      sampledExamples: evaluation?.sampled_examples ?? null,
+    },
+  });
+
+  return evaluation;
 }
 
 async function runDeploymentStage(jobId, trainingResult, compiledConfig) {
@@ -686,6 +761,7 @@ async function runOrchestrator(jobId) {
   await startStage(jobId, "recommending", "Starting dataset recommendation.");
   let compiledResult = null;
   let trainingBundle = null;
+  let evaluationResult = null;
   let deployment = null;
 
   try {
@@ -697,6 +773,9 @@ async function runOrchestrator(jobId) {
 
     await startStage(jobId, "training", "Starting Modal training.");
     trainingBundle = await runTrainingStage(jobId, compiledResult.compiled_config);
+
+    await startStage(jobId, "evaluating", "Running offline evaluation.");
+    evaluationResult = await runEvaluatingStage(jobId, trainingBundle.trainingResult);
 
     await startStage(jobId, "deploying", "Starting stable vLLM deployment.");
     deployment = await runDeploymentStage(
@@ -718,8 +797,10 @@ async function runOrchestrator(jobId) {
         ? currentJob.currentStage
         : deployment
           ? "smoke_testing"
-          : trainingBundle
+          : evaluationResult
             ? "deploying"
+          : trainingBundle
+            ? "evaluating"
             : compiledResult
               ? "training"
               : "recommending";

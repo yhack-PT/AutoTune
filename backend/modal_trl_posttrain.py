@@ -37,6 +37,7 @@ Notes:
 
 import json
 import os
+import random
 import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -108,6 +109,9 @@ class TrainConfig:
     dataset_config: str | None = None
     dataset_source_type: str = "huggingface"
     prepared_dataset_manifest: dict[str, Any] | None = None
+    task_spec: dict[str, Any] | None = None
+    evaluation_plan: dict[str, Any] | None = None
+    training_estimate: dict[str, Any] | None = None
     train_split: str = "train"
     eval_split: str | None = None
     seed_artifact: str | None = None
@@ -415,6 +419,14 @@ def _stringify_manifest_value(value: Any, field_name: str) -> str:
     return str(value)
 
 
+def _is_missing_manifest_value(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    return False
+
+
 def _build_label_space_text(label_mapping: dict[str, Any] | None) -> str:
     if not label_mapping:
         return ""
@@ -483,12 +495,29 @@ def _render_normalization_field(
     field_name: str,
     dataset_id: str,
 ) -> str:
-    source_column = field_spec.get("source_column")
-    template = field_spec.get("template")
+    raw_value = _resolve_normalization_raw_value(example, field_spec, field_name)
     value_mapping = field_spec.get("value_mapping")
 
     if value_mapping is not None and not isinstance(value_mapping, dict):
         raise ValueError(f"normalization.fields.{field_name}.value_mapping must be an object when provided.")
+
+    if isinstance(value_mapping, dict):
+        return _resolve_label_mapping_value(
+            raw_value,
+            value_mapping,
+            f"normalization.fields.{field_name}",
+            dataset_id,
+        )
+    return _stringify_manifest_value(raw_value, field_name)
+
+
+def _resolve_normalization_raw_value(
+    example: dict[str, Any],
+    field_spec: dict[str, Any],
+    field_name: str,
+) -> Any:
+    source_column = field_spec.get("source_column")
+    template = field_spec.get("template")
 
     has_source = isinstance(source_column, str) and source_column.strip()
     has_template = isinstance(template, str) and template.strip()
@@ -501,19 +530,74 @@ def _render_normalization_field(
         raw_value = example[source_column.strip()]
     else:
         template_vars = _extract_template_variables(template)
-        raw_value = _render_prompt_template(
+        return _render_prompt_template(
             template,
             {variable: example.get(variable) for variable in template_vars},
         )
 
-    if isinstance(value_mapping, dict):
-        return _resolve_label_mapping_value(
-            raw_value,
-            value_mapping,
-            f"normalization.fields.{field_name}",
-            dataset_id,
-        )
-    return _stringify_manifest_value(raw_value, field_name)
+    return raw_value
+
+
+def _drop_missing_completion_rows(
+    dataset_id: str,
+    dataset: Any,
+    completion_field: dict[str, Any],
+    *,
+    split_name: str,
+    selected_target_column: str | None,
+) -> tuple[Any, dict[str, Any]]:
+    total_rows = len(dataset)
+    kept_indices: list[int] = []
+
+    source_column = completion_field.get("source_column")
+    completion_source_column = source_column.strip() if isinstance(source_column, str) and source_column.strip() else None
+
+    if completion_source_column:
+        raw_values = dataset[completion_source_column]
+        for index, raw_value in enumerate(raw_values):
+            if not _is_missing_manifest_value(raw_value):
+                kept_indices.append(index)
+    else:
+        for index in range(total_rows):
+            raw_value = _resolve_normalization_raw_value(dataset[index], completion_field, "completion")
+            if not _is_missing_manifest_value(raw_value):
+                kept_indices.append(index)
+
+    kept_rows = len(kept_indices)
+    dropped_rows = total_rows - kept_rows
+    diagnostic = {
+        "dataset": dataset_id,
+        "split": split_name,
+        "selected_target_column": selected_target_column or completion_source_column,
+        "total_rows": total_rows,
+        "kept_rows": kept_rows,
+        "dropped_rows_missing_target": dropped_rows,
+        "dropped_fraction": (dropped_rows / total_rows) if total_rows else 0.0,
+    }
+
+    if dropped_rows <= 0:
+        return dataset, diagnostic
+    return dataset.select(kept_indices), diagnostic
+
+
+def _summarize_preprocessing_diagnostics(entries: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not entries:
+        return None
+
+    total_rows = sum(int(entry.get("total_rows", 0)) for entry in entries)
+    kept_rows = sum(int(entry.get("kept_rows", 0)) for entry in entries)
+    dropped_rows = sum(int(entry.get("dropped_rows_missing_target", 0)) for entry in entries)
+
+    return {
+        "missing_target_label_filtering": {
+            "policy": "drop_missing_selected_target_labels",
+            "total_rows": total_rows,
+            "kept_rows": kept_rows,
+            "dropped_rows_missing_target": dropped_rows,
+            "dropped_fraction": (dropped_rows / total_rows) if total_rows else 0.0,
+            "datasets": entries,
+        }
+    }
 
 
 def _transform_dataset_with_normalization(dataset_id: str, dataset: Any, entry: dict[str, Any]) -> Any:
@@ -571,8 +655,12 @@ def _transform_dataset_with_normalization(dataset_id: str, dataset: Any, entry: 
         f"Prepared dataset `{dataset_id}` normalization.shape `{shape}` is not supported."
     )
 
-
-def _transform_prepared_dataset_entry(config: TrainConfig, dataset: Any, entry: dict[str, Any]) -> Any:
+def _prepare_prepared_dataset_entry(
+    dataset: Any,
+    entry: dict[str, Any],
+    *,
+    split_name: str,
+) -> tuple[Any, dict[str, Any] | None]:
     dataset_id = _require_manifest_string(entry, "dataset", entry.get("dataset", "dataset"))
     normalization = entry.get("normalization")
     if normalization is None:
@@ -580,8 +668,24 @@ def _transform_prepared_dataset_entry(config: TrainConfig, dataset: Any, entry: 
             f"Prepared dataset `{dataset_id}` must define `normalization`. "
             "Legacy transform_preset manifests are no longer supported."
         )
+    if not isinstance(normalization, dict):
+        raise ValueError(f"Prepared dataset `{dataset_id}` normalization must be an object.")
 
-    return _transform_dataset_with_normalization(dataset_id, dataset, entry)
+    diagnostics = None
+    filtered_dataset = dataset
+    shape = _require_manifest_string(normalization, "shape", dataset_id)
+    if shape == "prompt_completion":
+        fields = _require_manifest_mapping(normalization, "fields")
+        completion_field = _require_normalization_field(fields, "completion", dataset_id)
+        filtered_dataset, diagnostics = _drop_missing_completion_rows(
+            dataset_id,
+            dataset,
+            completion_field,
+            split_name=split_name,
+            selected_target_column=_maybe_none(entry.get("selected_target_column")),
+        )
+
+    return _transform_dataset_with_normalization(dataset_id, filtered_dataset, entry), diagnostics
 
 
 def _dataset_column_signature(dataset: Any) -> tuple[str, ...]:
@@ -609,7 +713,7 @@ def _concat_datasets(datasets_to_concat: list[Any]) -> Any:
     return concatenate_datasets(datasets_to_concat)
 
 
-def _load_prepared_manifest_datasets(config: TrainConfig) -> tuple[Any, Any]:
+def _load_prepared_manifest_datasets(config: TrainConfig) -> tuple[Any, Any, dict[str, Any] | None]:
     manifest = config.prepared_dataset_manifest or {}
     selected_datasets = manifest.get("selected_datasets")
     if not isinstance(selected_datasets, list) or not selected_datasets:
@@ -622,6 +726,7 @@ def _load_prepared_manifest_datasets(config: TrainConfig) -> tuple[Any, Any]:
     eval_datasets: list[Any] = []
     expected_signature: tuple[str, ...] | None = None
     eval_signature: tuple[str, ...] | None = None
+    preprocessing_entries: list[dict[str, Any]] = []
 
     for raw_entry in selected_datasets:
         if not isinstance(raw_entry, dict):
@@ -647,7 +752,21 @@ def _load_prepared_manifest_datasets(config: TrainConfig) -> tuple[Any, Any]:
             dataset_config=dataset_config,
             split=train_split,
         )
-        prepared_train = _transform_prepared_dataset_entry(config, train_dataset, raw_entry)
+        prepared_train, train_diagnostics = _prepare_prepared_dataset_entry(
+            train_dataset,
+            raw_entry,
+            split_name=train_split,
+        )
+        if train_diagnostics is not None:
+            preprocessing_entries.append(train_diagnostics)
+        if len(prepared_train) <= 0:
+            selected_target_column = (
+                train_diagnostics.get("selected_target_column") if isinstance(train_diagnostics, dict) else None
+            )
+            raise ValueError(
+                f"Prepared dataset `{dataset_id}` split `{train_split}` has no usable rows after dropping "
+                f"examples with missing target labels{f' for `{selected_target_column}`' if selected_target_column else ''}."
+            )
         signature = _dataset_column_signature(prepared_train)
         if expected_signature is None:
             expected_signature = signature
@@ -667,7 +786,15 @@ def _load_prepared_manifest_datasets(config: TrainConfig) -> tuple[Any, Any]:
                 dataset_config=dataset_config,
                 split=eval_split,
             )
-            prepared_eval = _transform_prepared_dataset_entry(config, eval_dataset, raw_entry)
+            prepared_eval, eval_diagnostics = _prepare_prepared_dataset_entry(
+                eval_dataset,
+                raw_entry,
+                split_name=eval_split,
+            )
+            if eval_diagnostics is not None:
+                preprocessing_entries.append(eval_diagnostics)
+            if len(prepared_eval) <= 0:
+                continue
             current_eval_signature = _dataset_column_signature(prepared_eval)
             if eval_signature is None:
                 eval_signature = current_eval_signature
@@ -680,10 +807,10 @@ def _load_prepared_manifest_datasets(config: TrainConfig) -> tuple[Any, Any]:
 
     mixed_train = _mix_datasets(train_datasets, train_weights)
     mixed_eval = _concat_datasets(eval_datasets) if eval_datasets else None
-    return mixed_train, mixed_eval
+    return mixed_train, mixed_eval, _summarize_preprocessing_diagnostics(preprocessing_entries)
 
 
-def _load_datasets(config: TrainConfig) -> tuple[Any, Any]:
+def _load_datasets(config: TrainConfig) -> tuple[Any, Any, dict[str, Any] | None]:
     if config.dataset_source_type == "prepared_manifest":
         return _load_prepared_manifest_datasets(config)
 
@@ -701,7 +828,212 @@ def _load_datasets(config: TrainConfig) -> tuple[Any, Any]:
             split=config.eval_split,
         )
 
-    return train_dataset, eval_dataset
+    return train_dataset, eval_dataset, None
+
+
+def _label_distribution(dataset: Any) -> dict[str, int]:
+    if dataset is None or "completion" not in set(dataset.column_names):
+        return {}
+    counts: dict[str, int] = {}
+    for value in dataset["completion"]:
+        label = str(value).strip()
+        counts[label] = counts.get(label, 0) + 1
+    return dict(sorted(counts.items(), key=lambda item: item[0]))
+
+
+def _create_stratified_holdout(
+    dataset: Any,
+    *,
+    fraction: float,
+    seed: int,
+) -> tuple[Any, Any, dict[str, Any]]:
+    if "completion" not in set(dataset.column_names):
+        raise ValueError("Cannot create a classification holdout without a `completion` column.")
+
+    label_to_indices: dict[str, list[int]] = {}
+    for index, label in enumerate(dataset["completion"]):
+        label_to_indices.setdefault(str(label).strip(), []).append(index)
+
+    rng = random.Random(seed)
+    train_indices: list[int] = []
+    eval_indices: list[int] = []
+
+    for indices in label_to_indices.values():
+        shuffled = list(indices)
+        rng.shuffle(shuffled)
+        if len(shuffled) < 2:
+            train_indices.extend(shuffled)
+            continue
+        eval_count = max(1, round(len(shuffled) * fraction))
+        eval_count = min(eval_count, len(shuffled) - 1)
+        eval_indices.extend(shuffled[:eval_count])
+        train_indices.extend(shuffled[eval_count:])
+
+    if not eval_indices and len(dataset) > 1:
+        all_indices = list(range(len(dataset)))
+        rng.shuffle(all_indices)
+        eval_indices.append(all_indices[0])
+        train_index_set = set(all_indices[1:])
+        train_indices = [index for index in train_indices if index in train_index_set]
+        if not train_indices:
+            train_indices = all_indices[1:]
+
+    train_indices = sorted(dict.fromkeys(train_indices))
+    eval_indices = sorted(dict.fromkeys(eval_indices))
+    train_dataset = dataset.select(train_indices)
+    eval_dataset = dataset.select(eval_indices)
+
+    return train_dataset, eval_dataset, {
+        "created_holdout": True,
+        "strategy": "stratified_completion_holdout",
+        "fraction": fraction,
+        "seed": seed,
+        "train_examples": len(train_dataset),
+        "eval_examples": len(eval_dataset),
+        "train_label_distribution": _label_distribution(train_dataset),
+        "eval_label_distribution": _label_distribution(eval_dataset),
+    }
+
+
+def _normalized_label(value: Any) -> str:
+    text = str(value).strip()
+    if not text:
+        return ""
+    text = text.splitlines()[0].strip()
+    text = re.sub(r"^[\"'`\s]+|[\"'`\s]+$", "", text)
+    return text.casefold()
+
+
+def _sample_eval_dataset(dataset: Any, *, max_examples: int, seed: int) -> Any:
+    if len(dataset) <= max_examples:
+        return dataset
+    rng = random.Random(seed)
+    indices = list(range(len(dataset)))
+    rng.shuffle(indices)
+    return dataset.select(sorted(indices[:max_examples]))
+
+
+def _predict_completion_label(model: Any, tokenizer: Any, prompt: str, max_new_tokens: int = 16) -> str:
+    import torch
+
+    encoded = tokenizer(prompt, return_tensors="pt")
+    device = getattr(model, "device", None)
+    if device is None:
+        device = next(model.parameters()).device
+    encoded = {key: value.to(device) for key, value in encoded.items()}
+
+    with torch.inference_mode():
+        generated = model.generate(
+            **encoded,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            temperature=0.0,
+            pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+
+    prompt_length = encoded["input_ids"].shape[1]
+    completion_ids = generated[0][prompt_length:]
+    return tokenizer.decode(completion_ids, skip_special_tokens=True).strip()
+
+
+def _macro_f1(labels: list[str], gold: list[str], predicted: list[str]) -> float:
+    scores = []
+    for label in labels:
+        true_positive = sum(1 for expected, actual in zip(gold, predicted) if expected == label and actual == label)
+        false_positive = sum(1 for expected, actual in zip(gold, predicted) if expected != label and actual == label)
+        false_negative = sum(1 for expected, actual in zip(gold, predicted) if expected == label and actual != label)
+        precision = true_positive / (true_positive + false_positive) if (true_positive + false_positive) else 0.0
+        recall = true_positive / (true_positive + false_negative) if (true_positive + false_negative) else 0.0
+        if precision + recall == 0:
+            scores.append(0.0)
+        else:
+            scores.append((2 * precision * recall) / (precision + recall))
+    return sum(scores) / len(scores) if scores else 0.0
+
+
+def _evaluate_classification_dataset(
+    model: Any,
+    tokenizer: Any,
+    eval_dataset: Any,
+    *,
+    max_examples: int,
+    seed: int,
+) -> dict[str, Any]:
+    sampled_eval = _sample_eval_dataset(eval_dataset, max_examples=max_examples, seed=seed)
+    gold_labels = [str(value).strip() for value in sampled_eval["completion"]]
+    normalized_to_label = {}
+    for label in gold_labels:
+        normalized = _normalized_label(label)
+        if normalized and normalized not in normalized_to_label:
+            normalized_to_label[normalized] = label
+
+    predictions: list[str | None] = []
+    raw_predictions: list[str] = []
+    for prompt in sampled_eval["prompt"]:
+        raw_prediction = _predict_completion_label(model, tokenizer, str(prompt))
+        raw_predictions.append(raw_prediction)
+        canonical = normalized_to_label.get(_normalized_label(raw_prediction))
+        predictions.append(canonical)
+
+    total = len(gold_labels)
+    invalid_predictions = sum(1 for prediction in predictions if prediction is None)
+    valid_predictions = [prediction if prediction is not None else "__invalid__" for prediction in predictions]
+    accuracy = (
+        sum(1 for expected, actual in zip(gold_labels, predictions) if expected == actual) / total
+        if total
+        else 0.0
+    )
+    labels = sorted(set(gold_labels))
+    macro_f1 = _macro_f1(labels, gold_labels, valid_predictions)
+    coverage = len({prediction for prediction in predictions if prediction in labels}) / len(labels) if labels else 0.0
+
+    confusion_matrix: dict[str, dict[str, int]] = {}
+    for expected, actual in zip(gold_labels, valid_predictions):
+        row = confusion_matrix.setdefault(expected, {})
+        row[actual] = row.get(actual, 0) + 1
+
+    return {
+        "task_family": "classification",
+        "strategy": "offline_prompt_completion_eval",
+        "sampled_examples": total,
+        "metrics": {
+            "accuracy": accuracy,
+            "macro_f1": macro_f1,
+            "invalid_label_rate": (invalid_predictions / total) if total else 1.0,
+            "label_coverage": coverage,
+        },
+        "label_distributions": {
+            "gold": _label_distribution(sampled_eval),
+            "predicted": dict(
+                sorted(
+                    (
+                        (
+                            label,
+                            sum(1 for prediction in predictions if prediction == label),
+                        )
+                        for label in labels
+                    ),
+                    key=lambda item: item[0],
+                )
+            ),
+        },
+        "confusion_matrix": confusion_matrix,
+        "sample_predictions": [
+            {
+                "prompt_preview": str(prompt)[:160],
+                "gold": gold,
+                "prediction": prediction,
+                "raw_prediction": raw_prediction[:80],
+            }
+            for prompt, gold, prediction, raw_prediction in zip(
+                sampled_eval["prompt"][:10],
+                gold_labels[:10],
+                predictions[:10],
+                raw_predictions[:10],
+            )
+        ],
+    }
 
 
 def _normalize_sft_dataset(dataset: Any, tokenizer: Any, apply_chat_template: Any) -> tuple[Any, str]:
@@ -1184,11 +1516,25 @@ def _train_impl(config: TrainConfig) -> dict[str, Any]:
     tokenizer = _load_tokenizer(config)
     tokenizer.padding_side = "right" if config.trainer_type == "sft" else "left"
 
-    train_dataset, eval_dataset = _load_datasets(config)
+    train_dataset, eval_dataset, preprocessing_diagnostics = _load_datasets(config)
     normalized_train_dataset, sft_dataset_style = _normalize_for_trainer(config, tokenizer, train_dataset)
     normalized_eval_dataset = None
     if eval_dataset is not None:
         normalized_eval_dataset, _ = _normalize_for_trainer(config, tokenizer, eval_dataset)
+
+    evaluation_plan = config.evaluation_plan or {}
+    holdout_metadata = None
+    if (
+        config.trainer_type == "sft"
+        and (config.task_spec or {}).get("task_family") == "classification"
+        and sft_dataset_style == "prompt_completion"
+        and normalized_eval_dataset is None
+    ):
+        normalized_train_dataset, normalized_eval_dataset, holdout_metadata = _create_stratified_holdout(
+            normalized_train_dataset,
+            fraction=float(evaluation_plan.get("holdout_fraction", 0.1)),
+            seed=int(evaluation_plan.get("deterministic_seed", 42)),
+        )
 
     trainer, trainer_meta = _build_trainer_bundle(
         config,
@@ -1205,6 +1551,24 @@ def _train_impl(config: TrainConfig) -> dict[str, Any]:
 
     if config.merge_after_train:
         _merge_adapter_into_base(config, tokenizer)
+
+    evaluation_result = None
+    if (
+        config.trainer_type == "sft"
+        and (config.task_spec or {}).get("task_family") == "classification"
+        and sft_dataset_style == "prompt_completion"
+        and normalized_eval_dataset is not None
+    ):
+        trainer.model.eval()
+        evaluation_result = _evaluate_classification_dataset(
+            trainer.model,
+            tokenizer,
+            normalized_eval_dataset,
+            max_examples=int(evaluation_plan.get("max_examples", 256)),
+            seed=int(evaluation_plan.get("deterministic_seed", 42)),
+        )
+        if holdout_metadata is not None:
+            evaluation_result["holdout"] = holdout_metadata
 
     _commit_all_volumes()
 
@@ -1226,6 +1590,9 @@ def _train_impl(config: TrainConfig) -> dict[str, Any]:
         "output_name": config.output_name,
         "gpu_type": config.gpu_type,
         "learning_rate": config.resolved_learning_rate,
+        "task_spec": config.task_spec,
+        "training_estimate": config.training_estimate,
+        "preprocessing_diagnostics": preprocessing_diagnostics,
         "train_examples": len(normalized_train_dataset),
         "eval_examples": len(normalized_eval_dataset) if normalized_eval_dataset is not None else 0,
         "checkpoint_dir": str(config.checkpoints_dir),
@@ -1234,6 +1601,8 @@ def _train_impl(config: TrainConfig) -> dict[str, Any]:
         "resumed_from_checkpoint": resume_from_checkpoint,
         "global_step": int(getattr(training_output, "global_step", 0)),
         "training_loss": float(getattr(training_output, "training_loss", 0.0)),
+        "evaluation": evaluation_result,
+        "holdout": holdout_metadata,
         "notes": [
             "Use final_adapter_dir for vLLM LoRA serving with --enable-lora.",
             "Use merged_dir for direct vLLM base-model serving when merge_after_train=True.",

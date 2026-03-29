@@ -2,6 +2,21 @@ export const ALLOWED_NORMALIZATION_SHAPES = ["text", "prompt_completion"];
 export const SFT_COMPATIBLE_METHODS = ["sft"];
 export const NORMALIZATION_VERSION = 1;
 
+const IDENTIFIER_COLUMN_PATTERNS = [
+  /(^|_)(id|uuid|guid)(_|$)/i,
+  /ticket[_-]?id/i,
+  /customer[_-]?id/i,
+  /conversation[_-]?id/i,
+  /phone/i,
+  /email/i,
+];
+
+const IDENTIFIER_VALUE_PATTERNS = [
+  /^[0-9]{6,}$/,
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+  /^[^\s@]+@[^\s@]+\.[^\s@]+$/,
+];
+
 const TEXT_COLUMN_CANDIDATES = [
   "text",
   "body",
@@ -72,6 +87,19 @@ export function normalizeOptionalString(value) {
     return value.trim();
   }
   return null;
+}
+
+export function ensureClassificationPromptSeparator(template) {
+  const normalized = normalizeOptionalString(template);
+  if (!normalized) {
+    return normalized;
+  }
+
+  if (/(?:^|\n)Label:\s*$/i.test(normalized)) {
+    return normalized.replace(/Label:\s*$/i, "Label:\n");
+  }
+
+  return `${normalized}\n\nLabel:\n`;
 }
 
 export function truncateText(value, maxLength = 240) {
@@ -215,6 +243,66 @@ function buildPromptCompletionNormalization({
       completion: completionField,
     },
   };
+}
+
+function isScalarValue(value) {
+  return value === null || ["string", "number", "boolean"].includes(typeof value);
+}
+
+function looksIdentifierLikeColumn(columnName) {
+  return IDENTIFIER_COLUMN_PATTERNS.some((pattern) => pattern.test(String(columnName ?? "")));
+}
+
+function looksIdentifierLikeValue(value) {
+  const text = String(value ?? "").trim();
+  if (!text) {
+    return false;
+  }
+  return IDENTIFIER_VALUE_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+function sampleColumnValues(sampleRows, columnName) {
+  return (sampleRows ?? [])
+    .map((row) =>
+      row && Object.prototype.hasOwnProperty.call(row, columnName) ? row[columnName] : undefined,
+    )
+    .filter((value) => value !== undefined);
+}
+
+function analyzeClassificationTargetColumn(columnName, sampleRows) {
+  const observedValues = sampleColumnValues(sampleRows, columnName).filter((value) => value !== null);
+  const scalarValues = observedValues.filter((value) => isScalarValue(value));
+  const scalar = scalarValues.length === observedValues.length;
+  const identifierLikeValues =
+    scalarValues.length > 0 && scalarValues.every((value) => looksIdentifierLikeValue(value));
+  const identifierLike = looksIdentifierLikeColumn(columnName) || identifierLikeValues;
+
+  return {
+    column: columnName,
+    scalar,
+    identifier_like: identifierLike,
+    observed_values: scalarValues.map((value) => String(value)),
+  };
+}
+
+export function inferClassificationTargetCandidates(featureNames, sampleRows) {
+  const availableColumns = uniqueStrings(featureNames ?? []);
+  const columnMap = new Map(availableColumns.map((name) => [normalizeKey(name), name]));
+  const candidates = [];
+
+  for (const candidateName of LABEL_COLUMN_CANDIDATES) {
+    const columnName = firstMatchingColumn(columnMap, [candidateName]);
+    if (!columnName || candidates.some((candidate) => candidate.column === columnName)) {
+      continue;
+    }
+    const analysis = analyzeClassificationTargetColumn(columnName, sampleRows);
+    if (!analysis.scalar || analysis.identifier_like) {
+      continue;
+    }
+    candidates.push(analysis);
+  }
+
+  return candidates;
 }
 
 export function extractTemplateVariables(template) {
@@ -382,12 +470,31 @@ export function inferDeterministicNormalization(featureNames, sampleRows) {
   }
 
   const inputColumn = firstMatchingColumn(columnMap, TEXT_COLUMN_CANDIDATES);
-  const labelColumn = firstMatchingColumn(columnMap, LABEL_COLUMN_CANDIDATES);
+  const targetCandidates = inferClassificationTargetCandidates(availableColumns, sampleRows);
+  const labelColumn = targetCandidates[0]?.column ?? null;
   if (inputColumn && labelColumn) {
-    const promptTemplate = `Classify the following example. Return only the label.\n\nInput:\n{${inputColumn}}\n\nLabel:`;
+    const ambiguityWarnings =
+      targetCandidates.length > 1
+        ? [
+            `Multiple plausible target columns were detected (${targetCandidates
+              .map((candidate) => `'${candidate.column}'`)
+              .join(", ")}); using '${labelColumn}' as the provisional target.`,
+          ]
+        : [];
+    const promptTemplate = ensureClassificationPromptSeparator(
+      `Classify the following example. Return only the label.\n\nInput:\n{${inputColumn}}\n\nLabel:`,
+    );
     return {
       compatibility_status: "compatible",
       compatibility_reason: `Classification-style normalization is available via '${inputColumn}' and '${labelColumn}'.`,
+      selected_target_column: labelColumn,
+      target_selection_reason:
+        targetCandidates.length > 1
+          ? `Selected '${labelColumn}' from multiple plausible native label columns.`
+          : `Selected '${labelColumn}' as the sole plausible native label column.`,
+      target_selection_confidence: targetCandidates.length > 1 ? 0.6 : 0.95,
+      target_candidates: targetCandidates.map((candidate) => candidate.column),
+      ambiguity_warnings: ambiguityWarnings,
       normalization_proposal: buildPromptCompletionNormalization({
         strategy: "classification_template",
         sourceColumns: [inputColumn, labelColumn],
@@ -406,6 +513,11 @@ export function inferDeterministicNormalization(featureNames, sampleRows) {
     return {
       compatibility_status: "compatible",
       compatibility_reason: `Direct text normalization is available via '${inputColumn}'.`,
+      selected_target_column: null,
+      target_selection_reason: null,
+      target_selection_confidence: null,
+      target_candidates: [],
+      ambiguity_warnings: [],
       normalization_proposal: buildTextNormalization(inputColumn),
       compatible_methods: [...SFT_COMPATIBLE_METHODS],
     };
@@ -424,6 +536,11 @@ export function inferDeterministicNormalization(featureNames, sampleRows) {
       compatibility_status: "incompatible",
       compatibility_reason:
         "Conversational message arrays are only supported through the legacy preset path today.",
+      selected_target_column: null,
+      target_selection_reason: null,
+      target_selection_confidence: null,
+      target_candidates: [],
+      ambiguity_warnings: [],
       normalization_proposal: null,
       compatible_methods: [],
     };
@@ -433,6 +550,11 @@ export function inferDeterministicNormalization(featureNames, sampleRows) {
     compatibility_status: "incompatible",
     compatibility_reason:
       "No deterministic SFT normalization could be inferred from the available native dataset fields.",
+    selected_target_column: null,
+    target_selection_reason: null,
+    target_selection_confidence: null,
+    target_candidates: targetCandidates.map((candidate) => candidate.column),
+    ambiguity_warnings: [],
     normalization_proposal: null,
     compatible_methods: [],
   };

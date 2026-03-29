@@ -5,6 +5,7 @@ import { pathToFileURL } from "node:url";
 import {
   extractRowsFromPreview,
   inferCompatibleMethodsFromNormalization,
+  inferClassificationTargetCandidates,
   inferDeterministicNormalization,
   normalizeOptionalString,
   selectPreferredEvalSplit,
@@ -34,6 +35,19 @@ const DEFAULT_ANALYSIS = {
   mapped_task_types: [],
   data_format_needed: "mixed",
   quality_tier_strategy: "",
+};
+
+const DEFAULT_TASK_SPEC = {
+  supported: false,
+  task_family: "unsupported",
+  target_policy: "unsupported",
+  output_shape_preference: "unsupported",
+  objective_summary: "",
+  selected_target_focus: null,
+  requested_targets: [],
+  task_warnings: [],
+  target_selection_reason: null,
+  unsupported_reason: "Task spec was not provided.",
 };
 
 const DEFAULT_GUIDANCE = {
@@ -111,17 +125,47 @@ export class RecommendationFailure extends Error {
 
 export async function recommendDatasets(input, options = {}) {
   return withLoggerContext(options.logger, async () => {
-    logInfo("starting recommendDatasets");
+    logInfo(
+      `starting recommendDatasets in ${isSearchPlanInput(input) ? "search-plan" : "text"} mode`,
+    );
     logJson("input", input);
 
-    if (!input || typeof input !== "object" || !Array.isArray(input.search_queries)) {
-      throw new Error("Input must contain a `search_queries` array.");
+    const normalizedPlan = isSearchPlanInput(input)
+      ? validatePlan(input)
+      : await createPlanFromUserInputs(input, options);
+
+    if (!normalizedPlan.task_spec.supported) {
+      const recommendation = {
+        analysis: normalizedPlan.analysis,
+        task_spec: normalizedPlan.task_spec,
+        search_queries: normalizedPlan.search_queries,
+        ranking_criteria: normalizedPlan.ranking_criteria,
+        recommendation_guidance: normalizedPlan.recommendation_guidance,
+        compatibility_summary: {
+          total_candidates: 0,
+          compatible_candidates: 0,
+          incompatible_candidates: 0,
+        },
+        ranked_datasets: [],
+        recommended_datasets: [],
+        fatal_error: {
+          code: "unsupported_task",
+          message:
+            normalizedPlan.task_spec.unsupported_reason ||
+            "Only single-target classification SFT jobs are supported right now.",
+        },
+      };
+      if (!options.skipDebugWrite) {
+        await writeRankedDatasetsDebugFile(recommendation, options.debugOutputPath);
+      }
+      throw new RecommendationFailure(recommendation.fatal_error.message, recommendation);
     }
-    const normalizedPlan = validatePlan(input);
 
     logJson("normalized plan", normalizedPlan);
     const context = buildContext(normalizedPlan);
-    logInfo(`running ${context.search_queries.length} HF searches`);
+    logInfo(
+      `running ${context.search_queries.length} HF searches with min row floor ${context.min_rows_floor || 0}`,
+    );
     const discoveredCandidates = await (
       typeof options.discoverCandidates === "function"
         ? options.discoverCandidates(context)
@@ -141,6 +185,7 @@ export async function recommendDatasets(input, options = {}) {
     if (compatibleCandidates.length === 0) {
       const recommendation = {
         analysis: normalizedPlan.analysis,
+        task_spec: normalizedPlan.task_spec,
         search_queries: normalizedPlan.search_queries,
         ranking_criteria: normalizedPlan.ranking_criteria,
         recommendation_guidance: buildRecommendationGuidance([], normalizedPlan),
@@ -170,6 +215,7 @@ export async function recommendDatasets(input, options = {}) {
 
     const result = {
       analysis: normalizedPlan.analysis,
+      task_spec: normalizedPlan.task_spec,
       search_queries: normalizedPlan.search_queries,
       ranking_criteria: normalizedPlan.ranking_criteria,
       recommendation_guidance: buildRecommendationGuidance(recommendedDatasets, normalizedPlan),
@@ -210,6 +256,10 @@ function buildCompatibilitySummary(candidates) {
   };
 }
 
+function isSearchPlanInput(input) {
+  return Boolean(input && typeof input === "object" && Array.isArray(input.search_queries));
+}
+
 function validatePlan(plan) {
   if (!plan || typeof plan !== "object") {
     throw new Error("Input must be an object containing `search_queries`.");
@@ -217,8 +267,8 @@ function validatePlan(plan) {
 
   const searchQueries = Array.isArray(plan.search_queries)
     ? plan.search_queries
-        .map((query) => normalizeSearchQuery(query))
-        .filter((query) => query.search)
+      .map((query) => normalizeSearchQuery(query))
+      .filter((query) => query.search)
     : [];
 
   if (searchQueries.length === 0) {
@@ -239,6 +289,31 @@ function validatePlan(plan) {
   analysis.data_format_needed = normalizeOptionalString(analysis.data_format_needed) ?? "mixed";
   analysis.quality_tier_strategy = String(analysis.quality_tier_strategy ?? "").trim();
 
+  const taskSpec = {
+    ...DEFAULT_TASK_SPEC,
+    ...(plan.task_spec && typeof plan.task_spec === "object" ? plan.task_spec : {}),
+  };
+
+  taskSpec.supported = Boolean(taskSpec.supported);
+  taskSpec.task_family = normalizeOptionalString(taskSpec.task_family) ?? "unsupported";
+  taskSpec.target_policy = normalizeOptionalString(taskSpec.target_policy) ?? "unsupported";
+  taskSpec.output_shape_preference =
+    normalizeOptionalString(taskSpec.output_shape_preference) ?? "unsupported";
+  taskSpec.objective_summary = String(taskSpec.objective_summary ?? "").trim();
+  taskSpec.selected_target_focus = normalizeOptionalString(taskSpec.selected_target_focus);
+  taskSpec.requested_targets = uniqueStrings(
+    Array.isArray(taskSpec.requested_targets)
+      ? taskSpec.requested_targets.map((target) => String(target).trim()).filter(Boolean)
+      : [],
+  );
+  taskSpec.task_warnings = uniqueStrings(
+    Array.isArray(taskSpec.task_warnings)
+      ? taskSpec.task_warnings.map((warning) => String(warning).trim()).filter(Boolean)
+      : [],
+  );
+  taskSpec.target_selection_reason = normalizeOptionalString(taskSpec.target_selection_reason);
+  taskSpec.unsupported_reason = normalizeOptionalString(taskSpec.unsupported_reason);
+
   const guidance = {
     ...DEFAULT_GUIDANCE,
     ...(plan.recommendation_guidance && typeof plan.recommendation_guidance === "object"
@@ -258,15 +333,176 @@ function validatePlan(plan) {
   const rankingCriteria =
     Array.isArray(plan.ranking_criteria) && plan.ranking_criteria.length > 0
       ? plan.ranking_criteria
-          .map((criterion) => normalizeCriterion(criterion))
-          .filter((criterion) => criterion.criterion)
+        .map((criterion) => normalizeCriterion(criterion))
+        .filter((criterion) => criterion.criterion)
       : DEFAULT_RANKING_CRITERIA;
 
   return {
     analysis,
+    task_spec: taskSpec,
     search_queries: searchQueries,
     ranking_criteria: rankingCriteria,
     recommendation_guidance: guidance,
+  };
+}
+
+async function createPlanFromUserInputs(input, options = {}) {
+  const normalizedInput = validateUserInputs(input);
+  if (typeof options.planGenerator === "function") {
+    const generatedPlan = await options.planGenerator(normalizedInput);
+    return coerceTaskSpecForRawInput(validatePlan(generatedPlan), normalizedInput);
+  }
+
+  await ensureDotEnvLoaded();
+  logJson("validated text input", normalizedInput);
+
+  const apiKey = normalizeOptionalString(process.env.OPENAI_API_KEY);
+  if (!apiKey) {
+    throw new Error(
+      "OPENAI_API_KEY is required to generate a search plan from a text description.",
+    );
+  }
+
+  const model = normalizeOptionalString(process.env.OPENAI_MODEL) ?? DEFAULT_OPENAI_MODEL;
+  const prompt = buildOpenAIPlanningPrompt(normalizedInput);
+  const openAIRequestBody = {
+    model,
+    store: false,
+    input: [
+      {
+        role: "system",
+        content:
+          "You generate search plans for finding Hugging Face datasets for language-model post-training. Return only the requested JSON structure.",
+      },
+      {
+        role: "user",
+        content: prompt,
+      },
+    ],
+    text: {
+      format: {
+        type: "json_schema",
+        name: "hf_dataset_search_plan",
+        schema: getOpenAIPlanSchema(),
+        strict: true,
+      },
+    },
+  };
+  logInfo(`creating search plan with OpenAI model ${model}`);
+  logMultiline("openai prompt", prompt);
+
+  const response = await fetchJson(OPENAI_RESPONSES_API_URL, {
+    method: "POST",
+    timeoutMs: 60_000,
+    maxRetries: 3,
+    requestLabel: "OpenAI planning request",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(openAIRequestBody),
+  });
+
+  logJson("openai response metadata", {
+    id: response.id ?? null,
+    status: response.status ?? null,
+    model: response.model ?? null,
+    usage: response.usage ?? null,
+  });
+
+  const outputText = extractOpenAIOutputText(response);
+  let plan;
+  let parseError = null;
+  if (outputText) {
+    logMultiline("openai output text", outputText);
+  }
+
+  try {
+    if (outputText) {
+      plan = JSON.parse(outputText);
+    }
+  } catch (error) {
+    parseError =
+      error instanceof Error ? error.message : "unknown parse error";
+  }
+
+  if (!outputText) {
+    throw new Error("OpenAI returned an empty planning response.");
+  }
+  if (parseError) {
+    throw new Error(`OpenAI returned invalid JSON for the search plan: ${parseError}`);
+  }
+
+  logJson("openai parsed plan", plan);
+
+  return coerceTaskSpecForRawInput(validatePlan(plan), normalizedInput);
+}
+
+function extractRequestedTargetsFromText(inputText) {
+  const text = String(inputText ?? "").trim().replace(/[.?!]+$/, "");
+  if (!text) {
+    return [];
+  }
+
+  const byMatch = text.match(/\bby\s+(.+)$/i);
+  const targetClause = byMatch ? byMatch[1] : text;
+  const parts = targetClause
+    .split(/\s*(?:,|\/|&|\band\b|\bplus\b)\s*/i)
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((part) => part.replace(/^(the|a|an)\s+/i, "").trim())
+    .filter(Boolean);
+
+  return uniqueStrings(parts);
+}
+
+function looksLikeClassificationRequest(inputText) {
+  return /\bclassif(?:y|ication|ies|ied)\b/i.test(String(inputText ?? ""));
+}
+
+function buildObjectiveSummary(rawInput, selectedTargetFocus) {
+  const domain = normalizeOptionalString(rawInput?.domain);
+  if (domain) {
+    return `Classify ${domain} examples by ${selectedTargetFocus}.`;
+  }
+  return `Classify examples by ${selectedTargetFocus}.`;
+}
+
+export function coerceTaskSpecForRawInput(plan, rawInput) {
+  if (plan.task_spec.supported) {
+    return plan;
+  }
+
+  const normalizedInput = validateUserInputs(rawInput);
+  const requestText = normalizedInput.useCase ?? normalizedInput.description;
+  const requestedTargets = extractRequestedTargetsFromText(requestText);
+  if (!looksLikeClassificationRequest(requestText) || requestedTargets.length < 2) {
+    return plan;
+  }
+
+  const selectedTargetFocus = requestedTargets[0];
+  const warning =
+    `Requested multiple targets (${requestedTargets.join(", ")}); continuing with '${selectedTargetFocus}' as the single-target focus for this run.`;
+
+  return {
+    ...plan,
+    task_spec: {
+      supported: true,
+      task_family: "classification",
+      target_policy: "single_target",
+      output_shape_preference: "prompt_completion",
+      objective_summary: buildObjectiveSummary(normalizedInput, selectedTargetFocus),
+      selected_target_focus: selectedTargetFocus,
+      requested_targets: requestedTargets,
+      task_warnings: uniqueStrings([...(plan.task_spec.task_warnings ?? []), warning]),
+      target_selection_reason:
+        `Defaulted to the first requested target '${selectedTargetFocus}' so the single-target backend can continue.`,
+      unsupported_reason: null,
+    },
+    recommendation_guidance: {
+      ...plan.recommendation_guidance,
+      warnings: uniqueStrings([...(plan.recommendation_guidance.warnings ?? []), warning]),
+    },
   };
 }
 
@@ -292,6 +528,255 @@ function extractOpenAIOutputText(response) {
   return null;
 }
 
+function validateUserInputs(input) {
+  if (typeof input === "string") {
+    const description = input.trim();
+    if (!description) {
+      throw new Error("Input text must be a non-empty string.");
+    }
+    return {
+      description,
+      domain: null,
+      qualityTier: null,
+      useCase: null,
+    };
+  }
+
+  if (!input || typeof input !== "object") {
+    throw new Error(
+      "Input must either include `search_queries` or a single text field such as `description`.",
+    );
+  }
+
+  const description =
+    normalizeOptionalString(input.description) ??
+    normalizeOptionalString(input.text) ??
+    normalizeOptionalString(input.prompt) ??
+    null;
+  if (description) {
+    const qualityTier = normalizeQualityTier(input.qualityTier);
+    return {
+      description,
+      domain: normalizeOptionalString(input.domain),
+      qualityTier,
+      useCase: normalizeOptionalString(input.useCase),
+    };
+  }
+
+  const domain = normalizeOptionalString(input.domain);
+  const useCase = normalizeOptionalString(input.useCase);
+  const qualityTier = normalizeQualityTier(input.qualityTier);
+
+  if (!domain) {
+    throw new Error("Legacy raw input requires `domain`, or provide a single `description` field.");
+  }
+  if (!useCase) {
+    throw new Error("Legacy raw input requires `useCase`, or provide a single `description` field.");
+  }
+
+  return {
+    description: buildLegacyDescription({ domain, qualityTier, useCase }),
+    domain,
+    qualityTier,
+    useCase,
+  };
+}
+
+function buildLegacyDescription(input) {
+  const lines = [`Domain: ${input.domain}`, `Use case: ${input.useCase}`];
+  if (input.qualityTier != null) {
+    lines.splice(1, 0, `Quality tier: ${input.qualityTier}`);
+  }
+  return lines.join("\n");
+}
+
+function normalizeQualityTier(value) {
+  if (value == null || value === "") {
+    return null;
+  }
+
+  const qualityTier = Number(value);
+  if (!Number.isInteger(qualityTier) || qualityTier < 1 || qualityTier > 5) {
+    throw new Error("`qualityTier` must be an integer between 1 and 5 when provided.");
+  }
+  return qualityTier;
+}
+
+function buildOpenAIPlanningPrompt(input) {
+  const promptLines = [
+    "Create a Hugging Face dataset search plan for post-training a language model.",
+    "This backend v1 supports only single-target classification SFT jobs.",
+    `User request: ${input.description}`,
+    "Quality tier definitions:",
+    "1 = Fastest: under 10K rows, one tightly matched dataset, optimize for minutes to a few hours.",
+    "2 = Fast: 10K-50K rows, 1-2 complementary datasets, moderate filtering.",
+    "3 = Balanced: 50K-500K rows, 2-3 datasets, core use case plus edge cases.",
+    "4 = Quality: 500K-2M rows, 3-5 diverse high-quality datasets.",
+    "5 = Maximum Quality: 2M+ rows, 4-6+ datasets, broad foundational and domain-specialized coverage.",
+    input.qualityTier == null
+      ? "If the request does not specify a desired data volume or quality tier, default to a balanced tier-3 plan."
+      : `The user explicitly requested quality tier ${input.qualityTier}; set min_rows and guidance accordingly.`,
+    "Return task_spec, analysis, search_queries, ranking_criteria, and recommendation_guidance.",
+    "search_queries must contain concise Hugging Face search strings, usually 2-6 words, like something typed directly into the Hugging Face search bar.",
+    "Use task_filter values only from: text-classification, question-answering, summarization, text-generation, translation, conversational, token-classification, or null.",
+    "Use sort values only from: downloads, likes, trending, created.",
+    "Set min_rows based on the explicit or inferred quality tier.",
+    "Set data_format_needed to exactly one of: instruction, completion, preference, raw_text, mixed.",
+    "Keep mapped_task_types narrowly focused on the main fine-tuning objective, usually 1-2 task types.",
+    "Keep warnings focused on practical dataset-selection risks.",
+    "If the request mentions multiple classification targets, choose one primary target to optimize for, keep task_spec.supported=true, and record a warning plus the selected_target_focus.",
+    "Set task_spec.supported=false only when the request is non-classification or otherwise cannot be reduced to a single-target classification SFT job.",
+  ];
+
+  return promptLines.filter(Boolean).join("\n");
+}
+
+function getOpenAIPlanSchema() {
+  return {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      task_spec: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          supported: { type: "boolean" },
+          task_family: {
+            type: "string",
+            enum: ["classification", "unsupported"],
+          },
+          target_policy: {
+            type: "string",
+            enum: ["single_target", "unsupported"],
+          },
+          output_shape_preference: {
+            type: "string",
+            enum: ["prompt_completion", "unsupported"],
+          },
+          objective_summary: { type: "string" },
+          selected_target_focus: { type: ["string", "null"] },
+          requested_targets: {
+            type: "array",
+            items: { type: "string" },
+          },
+          task_warnings: {
+            type: "array",
+            items: { type: "string" },
+          },
+          target_selection_reason: { type: ["string", "null"] },
+          unsupported_reason: { type: ["string", "null"] },
+        },
+        required: [
+          "supported",
+          "task_family",
+          "target_policy",
+          "output_shape_preference",
+          "objective_summary",
+          "selected_target_focus",
+          "requested_targets",
+          "task_warnings",
+          "target_selection_reason",
+          "unsupported_reason",
+        ],
+      },
+      analysis: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          domain_summary: { type: "string" },
+          mapped_task_types: {
+            type: "array",
+            maxItems: 3,
+            items: {
+              type: "string",
+              enum: [
+                "text-classification",
+                "question-answering",
+                "summarization",
+                "text-generation",
+                "translation",
+                "conversational",
+                "token-classification",
+              ],
+            },
+          },
+          data_format_needed: {
+            type: "string",
+            enum: ["instruction", "completion", "preference", "raw_text", "mixed"],
+          },
+          quality_tier_strategy: { type: "string" },
+        },
+        required: [
+          "domain_summary",
+          "mapped_task_types",
+          "data_format_needed",
+          "quality_tier_strategy",
+        ],
+      },
+      search_queries: {
+        type: "array",
+        minItems: 1,
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            search: { type: "string" },
+            task_filter: {
+              type: ["string", "null"],
+            },
+            sort: {
+              type: "string",
+              enum: ["downloads", "likes", "trending", "created"],
+            },
+            min_rows: { type: "integer", minimum: 0 },
+            intent: { type: "string" },
+          },
+          required: ["search", "task_filter", "sort", "min_rows", "intent"],
+        },
+      },
+      ranking_criteria: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            criterion: { type: "string" },
+            weight: { type: "string", enum: ["high", "medium", "low"] },
+            description: { type: "string" },
+          },
+          required: ["criterion", "weight", "description"],
+        },
+      },
+      recommendation_guidance: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          ideal_dataset_count: { type: "integer", minimum: 1 },
+          target_total_rows: { type: "string" },
+          mixing_strategy: { type: "string" },
+          warnings: {
+            type: "array",
+            items: { type: "string" },
+          },
+        },
+        required: [
+          "ideal_dataset_count",
+          "target_total_rows",
+          "mixing_strategy",
+          "warnings",
+        ],
+      },
+    },
+    required: [
+      "task_spec",
+      "analysis",
+      "search_queries",
+      "ranking_criteria",
+      "recommendation_guidance",
+    ],
+  };
+}
+
 function normalizeSearchQuery(query) {
   if (!query || typeof query !== "object") {
     return {
@@ -311,6 +796,7 @@ function normalizeSearchQuery(query) {
     search: String(query.search ?? "").trim(),
     task_filter: normalizeOptionalString(query.task_filter),
     sort,
+    min_rows: normalizeNonNegativeInt(query.min_rows) ?? 0,
     intent: String(query.intent ?? "").trim(),
   };
 }
@@ -327,10 +813,14 @@ function buildContext(plan) {
   const queryTokens = uniqueStrings(
     plan.search_queries.flatMap((query) => tokenize([query.search, query.intent].join(" "))),
   );
+  const rowFloors = plan.search_queries
+    .map((query) => query.min_rows)
+    .filter((value) => Number.isFinite(value) && value > 0);
 
   return {
     ...plan,
     query_tokens: queryTokens,
+    min_rows_floor: rowFloors.length > 0 ? Math.min(...rowFloors) : 0,
     target_row_band: parseTargetRowBand(plan.recommendation_guidance.target_total_rows),
   };
 }
@@ -501,13 +991,28 @@ async function enrichCandidates(candidates, context, options = {}) {
       sample_rows: sampleRows.map((row) => summarizeRow(row)),
     };
     const directCompatibility = inferDeterministicNormalization(availableColumns, sampleRows);
+    const directTargetCandidates = inferClassificationTargetCandidates(availableColumns, sampleRows);
 
     let compatibilityStatus = directCompatibility.compatibility_status;
     let compatibilityReason = directCompatibility.compatibility_reason;
     let normalizationProposal = directCompatibility.normalization_proposal;
     let normalizationSource = normalizationProposal ? "deterministic" : null;
+    let selectedTargetColumn = directCompatibility.selected_target_column ?? null;
+    let targetSelectionReason = directCompatibility.target_selection_reason ?? null;
+    let targetSelectionConfidence = directCompatibility.target_selection_confidence ?? null;
+    let targetCandidates = Array.isArray(directCompatibility.target_candidates)
+      ? directCompatibility.target_candidates
+      : [];
+    let ambiguityWarnings = Array.isArray(directCompatibility.ambiguity_warnings)
+      ? directCompatibility.ambiguity_warnings
+      : [];
 
-    if (!normalizationProposal && viewerAccessible && availableColumns.length > 0) {
+    const needsTargetDisambiguation =
+      context.task_spec?.task_family === "classification" &&
+      directTargetCandidates.length > 1 &&
+      normalizationProposal?.strategy === "classification_template";
+
+    if ((!normalizationProposal || needsTargetDisambiguation) && viewerAccessible && availableColumns.length > 0) {
       const gptNormalization = await inferNormalizationProposal(candidate, context, {
         ...options,
         sourceSchema,
@@ -527,6 +1032,18 @@ async function enrichCandidates(candidates, context, options = {}) {
         compatibilityStatus = "compatible";
         compatibilityReason = gptNormalization.compatibility_reason;
         normalizationSource = "openai";
+        selectedTargetColumn = normalizeOptionalString(gptNormalization.selected_target_column);
+        targetSelectionReason = normalizeOptionalString(gptNormalization.target_selection_reason);
+        targetSelectionConfidence =
+          typeof gptNormalization.target_selection_confidence === "number"
+            ? gptNormalization.target_selection_confidence
+            : null;
+        targetCandidates = Array.isArray(gptNormalization.target_candidates)
+          ? uniqueStrings(gptNormalization.target_candidates.map((value) => String(value).trim()))
+          : targetCandidates;
+        ambiguityWarnings = Array.isArray(gptNormalization.ambiguity_warnings)
+          ? uniqueStrings(gptNormalization.ambiguity_warnings.map((value) => String(value).trim()))
+          : ambiguityWarnings;
       } else if (gptNormalization?.normalization_proposal) {
         warnings.push(
           `Discarded invalid normalization proposal: ${proposalErrors.join(" ")}`,
@@ -537,6 +1054,10 @@ async function enrichCandidates(candidates, context, options = {}) {
     }
 
     const compatibleMethods = inferCompatibleMethodsFromNormalization(normalizationProposal);
+    const classificationCompatible =
+      context.task_spec?.task_family === "classification" &&
+      normalizationProposal?.shape === "prompt_completion" &&
+      normalizeOptionalString(selectedTargetColumn);
     const license = extractLicense(candidate);
 
     if (!license) {
@@ -555,18 +1076,26 @@ async function enrichCandidates(candidates, context, options = {}) {
       schema_signals: schemaSignals.signals,
       schema_details: { feature_names: availableColumns },
       source_schema: sourceSchema,
+      selected_target_column: selectedTargetColumn,
+      target_selection_reason: targetSelectionReason,
+      target_selection_confidence: targetSelectionConfidence,
+      target_candidates: targetCandidates,
+      ambiguity_warnings: ambiguityWarnings,
       preferred_dataset_config: normalizeOptionalString(preferredTrainSplit?.config) ?? null,
       preferred_train_split: normalizeOptionalString(preferredTrainSplit?.split) ?? "train",
       preferred_eval_split: normalizeOptionalString(preferredEvalSplit?.split),
-      compatibility_status: compatibleMethods.length > 0 ? "compatible" : compatibilityStatus,
+      compatibility_status:
+        compatibleMethods.length > 0 && classificationCompatible ? "compatible" : "incompatible",
       compatibility_reason:
-        compatibleMethods.length > 0
+        compatibleMethods.length > 0 && classificationCompatible
           ? compatibilityReason
-          : compatibilityReason ||
+          : context.task_spec?.task_family === "classification"
+            ? "Candidate is not compatible with single-target classification SFT requirements."
+            : compatibilityReason ||
             "No supported normalization proposal could be inferred for this dataset.",
       normalization_source: normalizationSource,
       normalization_proposal: normalizationProposal,
-      compatible_methods: compatibleMethods,
+      compatible_methods: classificationCompatible ? compatibleMethods : [],
       license,
       warnings,
     };
@@ -692,6 +1221,17 @@ function getNormalizationProposalSchema() {
     properties: {
       usable: { type: "boolean" },
       compatibility_reason: { type: "string" },
+      selected_target_column: { type: ["string", "null"] },
+      target_selection_reason: { type: ["string", "null"] },
+      target_selection_confidence: { type: ["number", "null"] },
+      target_candidates: {
+        type: "array",
+        items: { type: "string" },
+      },
+      ambiguity_warnings: {
+        type: "array",
+        items: { type: "string" },
+      },
       normalization_proposal: {
         anyOf: [
           { type: "null" },
@@ -732,19 +1272,31 @@ function getNormalizationProposalSchema() {
         ],
       },
     },
-    required: ["usable", "compatibility_reason", "normalization_proposal"],
+    required: [
+      "usable",
+      "compatibility_reason",
+      "selected_target_column",
+      "target_selection_reason",
+      "target_selection_confidence",
+      "target_candidates",
+      "ambiguity_warnings",
+      "normalization_proposal",
+    ],
   };
 }
 
 function buildOpenAINormalizationPrompt(candidate, context, sourceSchema) {
   return [
     "Infer a deterministic normalization recipe for a single Hugging Face dataset so a text-only SFT backend can train on it.",
+    "This backend v1 supports only single-target classification SFT jobs.",
     "Do not invent columns.",
     "Use the native dataset field names exactly as provided.",
     "Return usable=false when the schema cannot support a meaningful deterministic text or prompt/completion normalization.",
     "Use template_synthesis only when direct column mapping is impossible.",
     "Avoid likely identifier columns such as ticket ids, customer ids, phone numbers, and other obvious PII unless they are essential.",
+    "When multiple plausible label columns exist, choose one target column and record ambiguity_warnings instead of failing.",
     `Objective: ${context.analysis?.domain_summary || ""}`,
+    `Task spec: ${JSON.stringify(context.task_spec ?? {})}`,
     `Mapped task types: ${JSON.stringify(context.analysis?.mapped_task_types ?? [])}`,
     `Dataset id: ${candidate.id}`,
     `Description: ${candidate.description ?? ""}`,
@@ -809,8 +1361,7 @@ async function callOpenAINormalizationPlanner(candidate, context, sourceSchema) 
     return JSON.parse(outputText);
   } catch (error) {
     throw new Error(
-      `OpenAI returned invalid JSON for dataset normalization: ${
-        error instanceof Error ? error.message : "unknown parse error"
+      `OpenAI returned invalid JSON for dataset normalization: ${error instanceof Error ? error.message : "unknown parse error"
       }`,
     );
   }
@@ -885,8 +1436,7 @@ async function rankCandidatesWithOpenAI(candidates, context) {
     ranking = JSON.parse(outputText);
   } catch (error) {
     throw new Error(
-      `OpenAI returned invalid JSON for dataset selection: ${
-        error instanceof Error ? error.message : "unknown parse error"
+      `OpenAI returned invalid JSON for dataset selection: ${error instanceof Error ? error.message : "unknown parse error"
       }`,
     );
   }
@@ -929,6 +1479,11 @@ function buildOpenAIRankingInput(candidates, context) {
     normalization_shape: candidate.normalization_proposal?.shape ?? null,
     normalization_strategy: candidate.normalization_proposal?.strategy ?? null,
     source_columns: candidate.normalization_proposal?.source_columns ?? [],
+    selected_target_column: candidate.selected_target_column ?? null,
+    target_selection_reason: candidate.target_selection_reason ?? null,
+    target_selection_confidence: candidate.target_selection_confidence ?? null,
+    target_candidates: candidate.target_candidates ?? [],
+    ambiguity_warnings: candidate.ambiguity_warnings ?? [],
     warnings: candidate.warnings ?? [],
     tags: (candidate.tags ?? []).slice(0, 12),
     feature_names: candidate.source_schema?.available_columns?.slice(0, 20) ?? [],
@@ -945,12 +1500,15 @@ function buildOpenAIRankingPrompt(context, rankingInput) {
     "Do not return more than 3 datasets.",
     "Prefer domain relevance, task/schema fit, target row-band fit, public usability, license clarity, and overall data usefulness.",
     "Only choose candidates whose compatibility_status is compatible.",
+    "Prefer candidates with an explicit selected_target_column and lower ambiguity.",
     "Prefer deterministic direct normalization over template_synthesis when task fit is otherwise similar.",
     "The candidates have already been fetched from Hugging Face; you are only choosing the recommended set.",
+    `Task spec: ${JSON.stringify(context.task_spec)}`,
     `Analysis: ${JSON.stringify(context.analysis)}`,
     `Search queries: ${JSON.stringify(context.search_queries)}`,
     `Recommendation guidance: ${JSON.stringify(context.recommendation_guidance)}`,
     `Target row band: ${JSON.stringify(context.target_row_band)}`,
+    `Minimum row floor: ${context.min_rows_floor}`,
     `Candidates: ${JSON.stringify(rankingInput)}`,
   ].join("\n");
 }
@@ -1014,6 +1572,11 @@ function mergeOpenAIRanking(candidates, ranking, context) {
       normalization_source: candidate.normalization_source,
       normalization_proposal: candidate.normalization_proposal,
       compatible_methods: candidate.compatible_methods,
+      selected_target_column: candidate.selected_target_column ?? null,
+      target_selection_reason: candidate.target_selection_reason ?? null,
+      target_selection_confidence: candidate.target_selection_confidence ?? null,
+      target_candidates: candidate.target_candidates ?? [],
+      ambiguity_warnings: candidate.ambiguity_warnings ?? [],
       source_schema: candidate.source_schema,
       preferred_dataset_config: candidate.preferred_dataset_config ?? null,
       preferred_train_split: candidate.preferred_train_split ?? "train",
@@ -1350,6 +1913,11 @@ function normalizePositiveInt(value) {
   return Number.isInteger(number) && number > 0 ? number : null;
 }
 
+function normalizeNonNegativeInt(value) {
+  const number = Number(value);
+  return Number.isInteger(number) && number >= 0 ? number : null;
+}
+
 function toNumber(value) {
   const number = Number(value);
   return Number.isFinite(number) && number > 0 ? number : 0;
@@ -1395,8 +1963,7 @@ async function writeRankedDatasetsDebugFile(recommendedDatasets, debugOutputPath
   const targetPath = debugOutputPath ?? RANKED_DATASETS_DEBUG_PATH;
   await writeFile(targetPath, JSON.stringify(recommendedDatasets, null, 2));
   logInfo(
-    `wrote recommended datasets JSON to ${
-      typeof targetPath === "string" ? targetPath : targetPath.pathname
+    `wrote recommended datasets JSON to ${typeof targetPath === "string" ? targetPath : targetPath.pathname
     }`,
   );
 }
@@ -1487,7 +2054,7 @@ async function loadCliInput(args) {
     return JSON.parse(fileContents);
   }
   throw new Error(
-    "Usage: node backend/hf-dataset-recommender.mjs --input plan.json or --json '{\"search_queries\":[...]}'",
+    "Usage: node backend/hf-dataset-recommender.mjs --input input.json or --json '{\"description\":\"...\"}' or --json '{\"search_queries\":[...]}'",
   );
 }
 

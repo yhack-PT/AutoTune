@@ -4,16 +4,33 @@ import path from "node:path";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 
-import { recommendDatasets, RecommendationFailure } from "./hf-dataset-recommender.mjs";
+import {
+  coerceTaskSpecForRawInput,
+  recommendDatasets,
+  RecommendationFailure,
+} from "./hf-dataset-recommender.mjs";
 import { inferDeterministicNormalization } from "./posttraining-normalization.mjs";
-import { runCompiler } from "./posttraining-spec-compiler.mjs";
+import {
+  buildSpecPrompt,
+  getCompilerOverridesConfigPath,
+  resolveConfiguredSftNumTrainEpochs,
+  runCompiler,
+} from "./posttraining-spec-compiler.mjs";
 
 function buildPlan() {
   return {
+    task_spec: {
+      supported: true,
+      task_family: "classification",
+      target_policy: "single_target",
+      output_shape_preference: "prompt_completion",
+      objective_summary: "Classify support tickets by priority.",
+      unsupported_reason: null,
+    },
     analysis: {
-      domain_summary: "Customer support ticket routing and issue classification.",
+      domain_summary: "Customer support ticket priority classification.",
       mapped_task_types: ["text-classification"],
-      data_format_needed: "raw_text",
+      data_format_needed: "completion",
       quality_tier_strategy: "Prefer one strong dataset.",
     },
     search_queries: [
@@ -39,7 +56,7 @@ function buildDirectCompatibleCandidate() {
   return {
     id: "acme/support-ticket-bodies",
     source_url: "https://huggingface.co/datasets/acme/support-ticket-bodies",
-    description: "Support tickets with message bodies.",
+    description: "Support tickets with priority labels.",
     matched_queries: ["customer support tickets"],
     matched_tasks: ["text-classification"],
     downloads: 100,
@@ -52,29 +69,38 @@ function buildDirectCompatibleCandidate() {
     size_partial: false,
     warnings: [],
     compatibility_status: "compatible",
-    compatibility_reason: "Direct text normalization is available via 'body'.",
+    compatibility_reason: "Classification-style normalization is available via 'body' and 'priority'.",
     normalization_source: "deterministic",
     compatible_methods: ["sft"],
     source_schema: {
-      available_columns: ["body", "issue_type"],
-      sample_rows: [{ body: "My router is offline", issue_type: "technical" }],
+      available_columns: ["body", "priority"],
+      sample_rows: [{ body: "My router is offline", priority: "high" }],
     },
+    selected_target_column: "priority",
+    target_selection_reason: "Selected 'priority' as the sole plausible native label column.",
+    target_selection_confidence: 0.95,
+    target_candidates: ["priority"],
+    ambiguity_warnings: [],
     preferred_dataset_config: "default",
     preferred_train_split: "train",
     preferred_eval_split: null,
     normalization_proposal: {
       version: 1,
-      shape: "text",
-      strategy: "copy_column",
-      source_columns: ["body"],
+      shape: "prompt_completion",
+      strategy: "classification_template",
+      source_columns: ["body", "priority"],
       fields: {
-        text: {
-          source_column: "body",
+        text: null,
+        prompt: {
+          source_column: null,
+          template: "Classify the following example. Return only the label.\n\nInput:\n{body}\n\nLabel:",
+          value_mapping: null,
+        },
+        completion: {
+          source_column: "priority",
           template: null,
           value_mapping: null,
         },
-        prompt: null,
-        completion: null,
       },
     },
   };
@@ -85,7 +111,7 @@ function buildStructuredCompatibleCandidate() {
     dataset: "acme/structured-ticket-metadata",
     source_url: "https://huggingface.co/datasets/acme/structured-ticket-metadata",
     score: 91,
-    why: "Structured ticket metadata can be serialized into domain text.",
+    why: "Structured ticket metadata can be serialized into a classification prompt.",
     matched_queries: ["customer support tickets"],
     mapped_task_types: ["text-classification"],
     downloads: 80,
@@ -95,7 +121,7 @@ function buildStructuredCompatibleCandidate() {
     splits: ["train"],
     schema_signals: ["classification_ready"],
     compatibility_status: "compatible",
-    compatibility_reason: "Template synthesis can serialize the structured row into text.",
+    compatibility_reason: "Template synthesis can serialize the structured row into a classification prompt.",
     normalization_source: "openai",
     compatible_methods: ["sft"],
     source_schema: {
@@ -114,20 +140,31 @@ function buildStructuredCompatibleCandidate() {
     preferred_train_split: "train",
     preferred_eval_split: null,
     warnings: [],
+    selected_target_column: "issue_type",
+    target_selection_reason: "Selected 'issue_type' from the available native label columns for this dataset.",
+    target_selection_confidence: 0.7,
+    target_candidates: ["issue_type", "priority"],
+    ambiguity_warnings: [
+      "Multiple plausible target columns were detected ('issue_type', 'priority'); using 'issue_type' as the selected target.",
+    ],
     normalization_proposal: {
       version: 1,
-      shape: "text",
-      strategy: "template_synthesis",
+      shape: "prompt_completion",
+      strategy: "classification_template",
       source_columns: ["operator", "issue_type", "priority", "status", "channel"],
       fields: {
-        text: {
+        text: null,
+        prompt: {
           source_column: null,
           template:
-            "Operator: {operator}\nChannel: {channel}\nStatus: {status}\nIssue type: {issue_type}\nPriority: {priority}",
+            "Classify the following example. Return only the label.\n\nOperator: {operator}\nChannel: {channel}\nStatus: {status}\nPriority: {priority}\n\nLabel:",
           value_mapping: null,
         },
-        prompt: null,
-        completion: null,
+        completion: {
+          source_column: "issue_type",
+          template: null,
+          value_mapping: null,
+        },
       },
     },
   };
@@ -162,6 +199,11 @@ function buildIdentityMappedClassificationCandidate() {
     preferred_train_split: "train",
     preferred_eval_split: null,
     warnings: [],
+    selected_target_column: "priority",
+    target_selection_reason: "Selected 'priority' as the sole plausible native label column.",
+    target_selection_confidence: 0.95,
+    target_candidates: ["priority"],
+    ambiguity_warnings: [],
     normalization_proposal: {
       version: 1,
       shape: "prompt_completion",
@@ -207,6 +249,11 @@ function toRecommendedCandidate(candidate) {
     normalization_source: candidate.normalization_source,
     normalization_proposal: candidate.normalization_proposal,
     compatible_methods: candidate.compatible_methods,
+    selected_target_column: candidate.selected_target_column,
+    target_selection_reason: candidate.target_selection_reason,
+    target_selection_confidence: candidate.target_selection_confidence,
+    target_candidates: candidate.target_candidates,
+    ambiguity_warnings: candidate.ambiguity_warnings,
     source_schema: candidate.source_schema,
     preferred_dataset_config: candidate.preferred_dataset_config,
     preferred_train_split: candidate.preferred_train_split,
@@ -247,7 +294,6 @@ function buildSpec(datasetId) {
       learning_rate: 0.0001,
       num_train_epochs: 1,
       max_steps: 20,
-      beta: 0.1,
       lora_r: 16,
       lora_alpha: 32,
       lora_dropout: 0.05,
@@ -291,6 +337,11 @@ test("recommendation fails early with diagnostics when all candidates are incomp
     normalization_source: null,
     normalization_proposal: null,
     compatible_methods: [],
+    selected_target_column: null,
+    target_selection_reason: null,
+    target_selection_confidence: null,
+    target_candidates: ["issue_type", "priority"],
+    ambiguity_warnings: [],
     source_schema: {
       available_columns: ["issue_type", "priority"],
       sample_rows: [{ issue_type: "billing", priority: "high" }],
@@ -317,6 +368,167 @@ test("recommendation fails early with diagnostics when all candidates are incomp
   );
 });
 
+test("multi-target classification requests are coerced to a single target with warning", () => {
+  const coerced = coerceTaskSpecForRawInput(
+    {
+      ...buildPlan(),
+      task_spec: {
+        supported: false,
+        task_family: "unsupported",
+        target_policy: "unsupported",
+        output_shape_preference: "unsupported",
+        objective_summary: "",
+        selected_target_focus: null,
+        requested_targets: [],
+        task_warnings: [],
+        target_selection_reason: null,
+        unsupported_reason: "Request asks for two classification targets.",
+      },
+    },
+    {
+      domain: "customer support",
+      qualityTier: 3,
+      useCase: "Classify support tickets by issue type and urgency.",
+    },
+  );
+
+  assert.equal(coerced.task_spec.supported, true);
+  assert.equal(coerced.task_spec.task_family, "classification");
+  assert.equal(coerced.task_spec.target_policy, "single_target");
+  assert.equal(coerced.task_spec.selected_target_focus, "issue type");
+  assert.deepEqual(coerced.task_spec.requested_targets, ["issue type", "urgency"]);
+  assert.match(coerced.task_spec.task_warnings[0], /continuing with 'issue type'/i);
+  assert.match(coerced.recommendation_guidance.warnings[0], /continuing with 'issue type'/i);
+});
+
+test("single-text requests are also coerced to a single target with warning", () => {
+  const coerced = coerceTaskSpecForRawInput(
+    {
+      ...buildPlan(),
+      task_spec: {
+        supported: false,
+        task_family: "unsupported",
+        target_policy: "unsupported",
+        output_shape_preference: "unsupported",
+        objective_summary: "",
+        selected_target_focus: null,
+        requested_targets: [],
+        task_warnings: [],
+        target_selection_reason: null,
+        unsupported_reason: "Request asks for two classification targets.",
+      },
+    },
+    {
+      description: "Classify support tickets by issue type and urgency.",
+    },
+  );
+
+  assert.equal(coerced.task_spec.supported, true);
+  assert.equal(coerced.task_spec.selected_target_focus, "issue type");
+  assert.deepEqual(coerced.task_spec.requested_targets, ["issue type", "urgency"]);
+  assert.match(coerced.task_spec.task_warnings[0], /continuing with 'issue type'/i);
+});
+
+test("recommendDatasets accepts a single-text payload when a plan generator is provided", async () => {
+  const recommendation = await recommendDatasets(
+    {
+      description: "Classify customer support tickets by priority.",
+    },
+    {
+      planGenerator: async () => buildPlan(),
+      discoverCandidates: async () => [buildDirectCompatibleCandidate()],
+      enrichCandidates: async () => [buildDirectCompatibleCandidate()],
+      rankCandidates: async () => [buildIdentityMappedClassificationCandidate()],
+      skipDebugWrite: true,
+    },
+  );
+
+  assert.equal(recommendation.recommended_datasets.length, 1);
+  assert.equal(recommendation.recommended_datasets[0].dataset, "acme/priority-classification");
+  assert.equal(recommendation.search_queries.length, 1);
+});
+
+test("spec planner prompt hardcodes one training epoch for backend SFT jobs", () => {
+  const prompt = buildSpecPrompt({
+    objectiveSummary: "Classify support tickets.",
+    context: {
+      task_spec: buildPlan().task_spec,
+      analysis: buildPlan().analysis,
+      recommendation_guidance: buildPlan().recommendation_guidance,
+      search_queries: buildPlan().search_queries,
+    },
+    candidateProfiles: [buildDirectCompatibleCandidate()],
+    platformConstraints: {
+      supported_methods: ["sft"],
+      supported_task_families: ["classification"],
+      supported_target_policies: ["single_target"],
+      allowed_base_models: [{ model_id: "Qwen/Qwen3-8B-Base", revision: null }],
+      allowed_compute_gpus: ["A10", "L40S", "H100"],
+    },
+    jobId: "prompt-test-job",
+  });
+
+  assert.match(prompt, /training_params\.num_train_epochs to 1\.0/i);
+});
+
+test("compiler override can force a different SFT epoch count than the planner proposed", async () => {
+  const previousOverridePath = process.env.POSTTRAINING_COMPILER_OVERRIDES_PATH;
+
+  try {
+    await withTempDir(async (tempRoot) => {
+      const overridesPath = path.join(tempRoot, "compiler-overrides.yaml");
+      process.env.POSTTRAINING_COMPILER_OVERRIDES_PATH = overridesPath;
+      await writeFile(overridesPath, "sft_num_train_epochs: 2.0\n", "utf8");
+
+      assert.equal(getCompilerOverridesConfigPath(), overridesPath);
+      assert.equal(resolveConfiguredSftNumTrainEpochs(), 2.0);
+
+      const enrichedCandidate = buildDirectCompatibleCandidate();
+      const recommendation = await recommendDatasets(buildPlan(), {
+        discoverCandidates: async () => [enrichedCandidate],
+        enrichCandidates: async () => [enrichedCandidate],
+        rankCandidates: async () => [toRecommendedCandidate(enrichedCandidate)],
+        skipDebugWrite: true,
+      });
+
+      const inputPath = path.join(tempRoot, "recommendation.json");
+      await writeFile(inputPath, `${JSON.stringify(recommendation, null, 2)}\n`, "utf8");
+
+      const spec = buildSpec("acme/support-ticket-bodies");
+      const result = await runCompiler(
+        {
+          inputPath,
+          outputRoot: tempRoot,
+          jobId: "epoch-override-job",
+          objectiveSummary: "Classify support tickets.",
+        },
+        {
+          specPlanner: async () => ({
+            parsed: {
+              ...spec,
+              training_params: {
+                ...spec.training_params,
+                num_train_epochs: 3,
+              },
+            },
+            model: "test-model",
+            response_id: "resp_epoch_override",
+          }),
+        },
+      );
+
+      assert.equal(result.compiled_config.num_train_epochs, 2);
+      assert.match(result.spec.notes.at(-1) ?? "", /Compiler override applied: num_train_epochs=2/);
+    });
+  } finally {
+    if (previousOverridePath === undefined) {
+      delete process.env.POSTTRAINING_COMPILER_OVERRIDES_PATH;
+    } else {
+      process.env.POSTTRAINING_COMPILER_OVERRIDES_PATH = previousOverridePath;
+    }
+  }
+});
+
 test("deterministic classification normalization omits sampled label constraints", () => {
   const normalization = inferDeterministicNormalization(
     ["body", "priority"],
@@ -333,6 +545,10 @@ test("deterministic classification normalization omits sampled label constraints
     normalization.normalization_proposal.fields.prompt.template,
     /Available labels:/,
   );
+  assert.match(
+    normalization.normalization_proposal.fields.prompt.template,
+    /Label:\n$/,
+  );
 });
 
 test("a direct-compatible dataset survives recommendation and compiles", async () => {
@@ -345,7 +561,8 @@ test("a direct-compatible dataset survives recommendation and compiles", async (
   });
 
   assert.equal(recommendation.recommended_datasets.length, 1);
-  assert.equal(recommendation.recommended_datasets[0].normalization_proposal.shape, "text");
+  assert.equal(recommendation.recommended_datasets[0].normalization_proposal.shape, "prompt_completion");
+  assert.equal(recommendation.recommended_datasets[0].selected_target_column, "priority");
 
   await withTempDir(async (tempRoot) => {
     const inputPath = path.join(tempRoot, "recommendation.json");
@@ -367,15 +584,17 @@ test("a direct-compatible dataset survives recommendation and compiles", async (
       },
     );
 
-    assert.equal(result.selected_datasets[0].normalization_shape, "text");
+    assert.equal(result.selected_datasets[0].normalization_shape, "prompt_completion");
     const manifest = JSON.parse(await readFile(result.manifest_path, "utf8"));
-    assert.equal(manifest.selected_datasets[0].normalization.shape, "text");
-    assert.ok(!("transform_preset" in manifest.selected_datasets[0]));
+    assert.equal(manifest.selected_datasets[0].normalization.shape, "prompt_completion");
+    assert.equal(manifest.selected_datasets[0].selected_target_column, "priority");
+    assert.equal(result.compiled_config.max_steps, -1);
   });
 });
 
-test("a structured ticket dataset can compile with a synthesized text normalization recipe", async () => {
+test("a structured ticket dataset can compile with a synthesized classification recipe", async () => {
   const recommendation = {
+    task_spec: buildPlan().task_spec,
     analysis: buildPlan().analysis,
     search_queries: buildPlan().search_queries,
     ranking_criteria: [],
@@ -410,11 +629,16 @@ test("a structured ticket dataset can compile with a synthesized text normalizat
     );
 
     const manifest = JSON.parse(await readFile(result.manifest_path, "utf8"));
-    assert.equal(manifest.selected_datasets[0].normalization.shape, "text");
+    assert.equal(manifest.selected_datasets[0].normalization.shape, "prompt_completion");
     assert.match(
-      manifest.selected_datasets[0].normalization.fields.text.template,
-      /Issue type: \{issue_type\}/,
+      manifest.selected_datasets[0].normalization.fields.prompt.template,
+      /Operator: \{operator\}/,
     );
+    assert.match(
+      manifest.selected_datasets[0].normalization.fields.prompt.template,
+      /Label:\n$/,
+    );
+    assert.equal(manifest.selected_datasets[0].selected_target_column, "issue_type");
   });
 });
 
@@ -440,6 +664,7 @@ test("invalid normalization proposals are rejected during compilation", async ()
   };
 
   const recommendation = {
+    task_spec: buildPlan().task_spec,
     analysis: buildPlan().analysis,
     search_queries: buildPlan().search_queries,
     ranking_criteria: [],
@@ -481,6 +706,7 @@ test("invalid normalization proposals are rejected during compilation", async ()
 test("compiler strips identity value_mapping on direct label-column completions", async () => {
   const candidate = buildIdentityMappedClassificationCandidate();
   const recommendation = {
+    task_spec: buildPlan().task_spec,
     analysis: buildPlan().analysis,
     search_queries: buildPlan().search_queries,
     ranking_criteria: [],
