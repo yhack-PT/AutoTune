@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { ArrowUp, Sparkles, Plus } from "lucide-react";
 import { cn } from "@/lib/utils";
+import ReactMarkdown from "react-markdown";
 
 // =============================================================================
 // Types
@@ -109,10 +110,8 @@ function MessageBubble({ message }: { message: ChatMessage }) {
 
   return (
     <div className="flex justify-start">
-      <div className="max-w-[80%] px-1">
-        <p className="text-sm leading-relaxed text-foreground whitespace-pre-wrap">
-          {message.content}
-        </p>
+      <div className="max-w-[80%] px-1 prose prose-sm prose-neutral dark:prose-invert prose-p:leading-relaxed prose-p:my-1 prose-headings:my-2 prose-ul:my-1 prose-ol:my-1 prose-li:my-0.5 max-w-none">
+        <ReactMarkdown>{message.content}</ReactMarkdown>
       </div>
     </div>
   );
