@@ -3,9 +3,15 @@
 import { useState, useCallback, useRef, useEffect } from "react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
-import { ArrowUp, Sparkles, Plus } from "lucide-react";
+import { ArrowUp, Sparkles, Plus, Play, Rewind, ChevronDown } from "lucide-react";
 import { cn } from "@/lib/utils";
 import ReactMarkdown from "react-markdown";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 
 // =============================================================================
 // Types
@@ -15,6 +21,7 @@ interface ChatMessage {
   id: string;
   role: "user" | "assistant";
   content: string;
+  deploymentUrl?: string;
 }
 
 interface PipelineStage {
@@ -243,6 +250,8 @@ export default function ChatPage() {
   const [completedStageCount, setCompletedStageCount] = useState(0);
   const [isProcessSidebarOpen, setIsProcessSidebarOpen] = useState(false);
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
+  const [fineTunedEndpoint, setFineTunedEndpoint] = useState<string | null>(null);
+  const [activeModel, setActiveModel] = useState<"openai" | "finetuned">("openai");
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const lastStageRef = useRef<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -299,15 +308,17 @@ export default function ChatPage() {
             job.deployment && typeof job.deployment.url === "string"
               ? job.deployment.url
               : null;
+          if (deploymentUrl) {
+            setFineTunedEndpoint(deploymentUrl);
+          }
           setCompletedStageCount(PIPELINE_STAGES.length);
           setMessages((prev) => [
             ...prev,
             {
               id: crypto.randomUUID(),
               role: "assistant",
-              content: deploymentUrl
-                ? `Your model is ready! It's deployed at: ${deploymentUrl}`
-                : "Your model is ready and deployed!",
+              content: "Your model is ready!",
+              ...(deploymentUrl ? { deploymentUrl } : {}),
             },
           ]);
           stopPolling();
@@ -364,6 +375,9 @@ export default function ChatPage() {
               role: m.role,
               content: m.content,
             })),
+            ...(activeModel === "finetuned" && fineTunedEndpoint
+              ? { customEndpoint: fineTunedEndpoint }
+              : {}),
           }),
           signal: controller.signal,
         });
@@ -487,7 +501,7 @@ export default function ChatPage() {
         setIsResponding(false);
       }
     },
-    [],
+    [activeModel, fineTunedEndpoint],
   );
 
   const handleSubmit = useCallback(
@@ -532,6 +546,8 @@ export default function ChatPage() {
     setCompletedStageCount(0);
     setIsProcessSidebarOpen(false);
     setActiveJobId(null);
+    setActiveModel("openai");
+    setFineTunedEndpoint(null);
     lastStageRef.current = null;
     inputRef.current?.focus();
   }, []);
@@ -541,7 +557,7 @@ export default function ChatPage() {
     activeStageIndex === null ? null : PIPELINE_STAGES[activeStageIndex];
 
   return (
-    <div className="flex h-screen overflow-hidden bg-background">
+    <div className="flex h-screen overflow-hidden bg-background transition-colors duration-300" data-model-mode={activeModel}>
       <div className="relative flex min-w-0 flex-1 flex-col">
         {/* Top bar */}
         <header className="shrink-0 flex items-center justify-between px-5 py-3 border-b border-border/50">
@@ -554,9 +570,24 @@ export default function ChatPage() {
             >
               <Plus className="h-4 w-4" />
             </Button>
-            <span className="text-sm font-medium text-foreground/80">
-              ChatGPT
-            </span>
+            <DropdownMenu>
+              <DropdownMenuTrigger className="flex items-center gap-1 text-sm font-medium text-foreground/80 hover:text-foreground outline-hidden">
+                {activeModel === "finetuned" ? "Fine-tuned Model" : "ChatGPT"}
+                <ChevronDown className="h-4 w-4 text-muted-foreground" />
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="center" style={{ borderRadius: '16px', padding: '6px' }} className="bg-white border border-border/50 text-foreground shadow-lg min-w-[13rem] z-50">
+                {activeModel !== "openai" && (
+                  <DropdownMenuItem onClick={() => setActiveModel("openai")} style={{ borderRadius: '10px', padding: '8px 10px' }} className="flex justify-between items-center w-full cursor-pointer hover:bg-black/5 transition-colors text-sm font-medium">
+                    ChatGPT
+                  </DropdownMenuItem>
+                )}
+                {activeModel !== "finetuned" && (
+                  <DropdownMenuItem onClick={() => setActiveModel("finetuned")} style={{ borderRadius: '10px', padding: '8px 10px' }} className="flex justify-between items-center w-full cursor-pointer hover:bg-black/5 transition-colors text-sm font-medium">
+                    Fine-tuned Model
+                  </DropdownMenuItem>
+                )}
+              </DropdownMenuContent>
+            </DropdownMenu>
           </div>
           <div className="flex items-center gap-2" />
         </header>
@@ -600,7 +631,43 @@ export default function ChatPage() {
             /* Message list */
             <div className="max-w-3xl mx-auto px-4 pt-6 pb-36 space-y-6">
               {messages.map((msg) => (
-                <MessageBubble key={msg.id} message={msg} />
+                <div key={msg.id}>
+                  <MessageBubble message={msg} />
+                  {msg.deploymentUrl && (
+                    <div className="flex justify-start pl-1 pt-3">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className={cn(
+                          "gap-2",
+                          activeModel === "finetuned"
+                            ? "border-transparent bg-white text-black hover:bg-white/80"
+                            : "border-green-300 bg-green-50 text-green-700 hover:bg-green-100 hover:text-green-800",
+                        )}
+                        onClick={() => {
+                          if (activeModel === "finetuned") {
+                            setActiveModel("openai");
+                          } else {
+                            setFineTunedEndpoint(msg.deploymentUrl!);
+                            setActiveModel("finetuned");
+                          }
+                        }}
+                      >
+                        {activeModel === "finetuned" ? (
+                          <>
+                            <Rewind className="h-3 w-3" />
+                            Switch to ChatGPT
+                          </>
+                        ) : (
+                          <>
+                            <Play className="h-3 w-3" />
+                            Try this model now
+                          </>
+                        )}
+                      </Button>
+                    </div>
+                  )}
+                </div>
               ))}
 
               {isResponding && activeStageIndex !== null && (

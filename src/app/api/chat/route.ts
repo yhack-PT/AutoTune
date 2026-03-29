@@ -42,6 +42,11 @@ type ChatMessage = {
   content: string;
 };
 
+type RequestBody = {
+  messages: ChatMessage[];
+  customEndpoint?: string;
+};
+
 export async function POST(request: Request) {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
@@ -51,7 +56,7 @@ export async function POST(request: Request) {
     });
   }
 
-  let body: { messages: ChatMessage[] };
+  let body: RequestBody;
   try {
     body = await request.json();
   } catch {
@@ -65,6 +70,50 @@ export async function POST(request: Request) {
     return new Response(JSON.stringify({ error: "messages must be a non-empty array." }), {
       status: 400,
       headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  // If a custom vLLM endpoint is provided, proxy to it instead of OpenAI
+  if (body.customEndpoint) {
+    if (
+      !body.customEndpoint.startsWith("https://") ||
+      !body.customEndpoint.includes("modal.run")
+    ) {
+      return new Response(
+        JSON.stringify({ error: "Invalid custom endpoint. Must be a modal.run HTTPS URL." }),
+        { status: 400, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    const endpoint = body.customEndpoint;
+    const stream = new ReadableStream({
+      async start(controller) {
+        const encoder = new TextEncoder();
+        function send(event: Record<string, unknown>) {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+        }
+        try {
+          await streamVLLM(
+            endpoint,
+            body.messages.map((m) => ({ role: m.role, content: m.content })),
+            send,
+          );
+          send({ type: "done" });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "Unknown error";
+          send({ type: "error", message });
+        } finally {
+          controller.close();
+        }
+      },
+    });
+
+    return new Response(stream, {
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+      },
     });
   }
 
@@ -256,4 +305,65 @@ async function streamOpenAI(
     : null;
 
   return { responseId, toolCall };
+}
+
+/**
+ * Streams a vLLM Chat Completions API call. The Modal-deployed vLLM endpoint
+ * is OpenAI-compatible, so we use the standard chat completions streaming format.
+ */
+async function streamVLLM(
+  endpointUrl: string,
+  messages: Array<{ role: string; content: string }>,
+  send: (event: Record<string, unknown>) => void,
+): Promise<void> {
+  const url = `${endpointUrl.replace(/\/+$/, "")}/v1/chat/completions`;
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "default",
+      messages,
+      stream: true,
+    }),
+  });
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(`vLLM API error ${response.status}: ${text.slice(0, 500)}`);
+  }
+
+  if (!response.body) {
+    throw new Error("vLLM returned no response body.");
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("data: ")) continue;
+      const data = trimmed.slice(6);
+      if (!data || data === "[DONE]") continue;
+
+      try {
+        const chunk = JSON.parse(data);
+        const delta = chunk.choices?.[0]?.delta?.content;
+        if (delta) {
+          send({ type: "text_delta", content: delta });
+        }
+      } catch {
+        // Skip malformed SSE lines
+      }
+    }
+  }
 }
