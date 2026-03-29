@@ -570,24 +570,28 @@ export default function ChatPage() {
             >
               <Plus className="h-4 w-4" />
             </Button>
-            <DropdownMenu>
-              <DropdownMenuTrigger className="flex items-center gap-1 text-sm font-medium text-foreground/80 hover:text-foreground outline-hidden">
-                {activeModel === "finetuned" ? "Fine-tuned Model" : "ChatGPT"}
-                <ChevronDown className="h-4 w-4 text-muted-foreground" />
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="center" style={{ borderRadius: '16px', padding: '6px' }} className="bg-white border border-border/50 text-foreground shadow-lg min-w-[13rem] z-50">
-                {activeModel !== "openai" && (
-                  <DropdownMenuItem onClick={() => setActiveModel("openai")} style={{ borderRadius: '10px', padding: '8px 10px' }} className="flex justify-between items-center w-full cursor-pointer hover:bg-black/5 transition-colors text-sm font-medium">
-                    ChatGPT
-                  </DropdownMenuItem>
-                )}
-                {activeModel !== "finetuned" && (
-                  <DropdownMenuItem onClick={() => setActiveModel("finetuned")} style={{ borderRadius: '10px', padding: '8px 10px' }} className="flex justify-between items-center w-full cursor-pointer hover:bg-black/5 transition-colors text-sm font-medium">
-                    Fine-tuned Model
-                  </DropdownMenuItem>
-                )}
-              </DropdownMenuContent>
-            </DropdownMenu>
+            {fineTunedEndpoint ? (
+              <DropdownMenu>
+                <DropdownMenuTrigger className="flex items-center gap-1 text-sm font-medium text-foreground/80 hover:text-foreground outline-hidden">
+                  {activeModel === "finetuned" ? "Fine-tuned Model" : "ChatGPT"}
+                  <ChevronDown className="h-4 w-4 text-muted-foreground" />
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="center" style={{ borderRadius: '16px', padding: '6px' }} className="bg-white border border-border/50 text-foreground shadow-lg min-w-[13rem] z-50">
+                  {activeModel !== "openai" && (
+                    <DropdownMenuItem onClick={() => setActiveModel("openai")} style={{ borderRadius: '10px', padding: '8px 10px' }} className="flex justify-between items-center w-full cursor-pointer hover:bg-black/5 transition-colors text-sm font-medium">
+                      ChatGPT
+                    </DropdownMenuItem>
+                  )}
+                  {activeModel !== "finetuned" && (
+                    <DropdownMenuItem onClick={() => setActiveModel("finetuned")} style={{ borderRadius: '10px', padding: '8px 10px' }} className="flex justify-between items-center w-full cursor-pointer hover:bg-black/5 transition-colors text-sm font-medium">
+                      Fine-tuned Model
+                    </DropdownMenuItem>
+                  )}
+                </DropdownMenuContent>
+              </DropdownMenu>
+            ) : (
+              <span className="text-sm font-medium text-foreground/80">ChatGPT</span>
+            )}
           </div>
           <div className="flex items-center gap-2" />
         </header>
