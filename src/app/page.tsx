@@ -16,77 +16,55 @@ interface ChatMessage {
   content: string;
 }
 
-interface ProcessStage {
+interface PipelineStage {
   id: string;
   label: string;
   detail: string;
-  sidebarInfo: string;
-  durationMs: number;
 }
 
 // =============================================================================
-// Dummy responses (no API wired up yet)
+// Pipeline stages (mapped to real backend stages)
 // =============================================================================
 
-const DUMMY_RESPONSES = [
-  "I'm a placeholder response — no model is connected yet! Once an API is wired up, you'll see real answers here.",
-  "This is a static demo of the chat interface. Everything you see is running locally with no backend.",
-  "Great question! Unfortunately I'm just a dummy response for now. The real magic comes when we connect a model.",
-  "Hey! I'm not ChatGPT (yet). This is a UI prototype to nail the look and feel first.",
-  "Roger that. I've noted your message but can't actually process it — I'm just a mock response.",
+const PIPELINE_STAGES: readonly PipelineStage[] = [
+  {
+    id: "recommending",
+    label: "Finding datasets...",
+    detail: "Searching Hugging Face for relevant training data.",
+  },
+  {
+    id: "compiling",
+    label: "Compiling training spec...",
+    detail: "Building the training configuration from recommended datasets.",
+  },
+  {
+    id: "training",
+    label: "Training the model...",
+    detail: "Fine-tuning the model on Modal GPUs.",
+  },
+  {
+    id: "deploying",
+    label: "Deploying the model...",
+    detail: "Spinning up a vLLM inference server on Modal.",
+  },
+  {
+    id: "smoke_testing",
+    label: "Running smoke tests...",
+    detail: "Verifying the deployed model responds correctly.",
+  },
 ];
 
-function getDummyResponse(): string {
-  return DUMMY_RESPONSES[Math.floor(Math.random() * DUMMY_RESPONSES.length)]!;
+const STAGE_CHAT_MESSAGES: Record<string, string> = {
+  recommending: "Searching for the best training datasets...",
+  compiling: "Datasets found -- compiling the training spec...",
+  training: "Training spec ready -- fine-tuning is underway...",
+  deploying: "Training complete -- deploying the model...",
+  smoke_testing: "Model deployed -- running smoke tests...",
+};
+
+function stageIndexById(id: string): number {
+  return PIPELINE_STAGES.findIndex((s) => s.id === id);
 }
-
-const FAKE_PROCESS_STAGES: readonly ProcessStage[] = [
-  {
-    id: "thinking",
-    label: "Reading your request...",
-    detail: "We are figuring out what you want this AI to do.",
-    sidebarInfo:
-      "This placeholder step stands in for the first pass over your request. Later, the backend can use this area to explain how it understood your goal, what kind of assistant you are asking for, and any assumptions it is making before moving on.",
-    durationMs: 2800,
-  },
-  {
-    id: "planning",
-    label: "Gathering examples...",
-    detail: "We are deciding what kind of examples this AI should learn from.",
-    sidebarInfo:
-      "This filler text represents the step where the system chooses the kinds of examples, topics, and edge cases that should shape the AI's behavior. In the future, this section can show sample content, categories, or sources being considered.",
-    durationMs: 3000,
-  },
-  {
-    id: "tuning",
-    label: "Teaching the AI...",
-    detail: "We are shaping the AI so it responds in the way you want.",
-    sidebarInfo:
-      "This is a stand-in for the part where the system applies the examples and instructions to steer the model. Once the backend is connected, this panel can show more useful progress details about how the AI is being adapted.",
-    durationMs: 3600,
-  },
-  {
-    id: "evaluating",
-    label: "Checking the results...",
-    detail: "We are making sure the AI's answers look accurate and consistent.",
-    sidebarInfo:
-      "This placeholder section represents the review step. Later, it can show example outputs, quality checks, and simple summaries of whether the current setup is meeting the expected standard before the response is returned.",
-    durationMs: 2800,
-  },
-  {
-    id: "finalizing",
-    label: "Getting your reply ready...",
-    detail: "We are wrapping things up before showing the response in chat.",
-    sidebarInfo:
-      "This filler copy stands in for the last cleanup step before the answer appears. In a real version, this area could explain any final formatting, packaging, or response preparation that happens just before the reply is shown.",
-    durationMs: 2800,
-  },
-];
-
-const TOTAL_FAKE_PROCESS_MS = FAKE_PROCESS_STAGES.reduce(
-  (total, stage) => total + stage.durationMs,
-  0,
-);
 
 // =============================================================================
 // Suggestions (empty state)
@@ -149,7 +127,8 @@ function ProcessingIndicator({
   isSidebarOpen: boolean;
   onOpenDetails: () => void;
 }) {
-  const activeStage = FAKE_PROCESS_STAGES[activeStageIndex]!;
+  const activeStage = PIPELINE_STAGES[activeStageIndex];
+  if (!activeStage) return null;
 
   return (
     <div className="flex justify-start">
@@ -214,7 +193,7 @@ function ProcessingSidebar({
         <div className="flex-1 overflow-y-auto px-5 py-5">
           <div className="space-y-8">
             {isOpen &&
-              FAKE_PROCESS_STAGES.slice(0, visibleStageCount).map((stage, index) => {
+              PIPELINE_STAGES.slice(0, visibleStageCount).map((stage, index) => {
                 const isComplete = index < completedStageCount;
                 const isActive = index === activeStageIndex;
                 const status = isComplete ? "Done" : "Working on this now";
@@ -240,9 +219,6 @@ function ProcessingSidebar({
                     <p className="text-sm leading-relaxed text-muted-foreground">
                       {stage.detail}
                     </p>
-                    <p className="text-sm leading-relaxed text-muted-foreground">
-                      {stage.sidebarInfo}
-                    </p>
                   </section>
                 );
               })}
@@ -267,8 +243,10 @@ export default function ChatPage() {
   const [activeStageIndex, setActiveStageIndex] = useState<number | null>(null);
   const [completedStageCount, setCompletedStageCount] = useState(0);
   const [isProcessSidebarOpen, setIsProcessSidebarOpen] = useState(false);
-  const responseTimeoutsRef = useRef<number[]>([]);
-  const activeResponseRunRef = useRef(0);
+  const [activeJobId, setActiveJobId] = useState<string | null>(null);
+  const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const lastStageRef = useRef<string | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
 
   // Scroll to bottom when new messages appear
   useEffect(() => {
@@ -285,94 +263,202 @@ export default function ChatPage() {
     }
   }, [input]);
 
-  const clearResponseTimers = useCallback(() => {
-    responseTimeoutsRef.current.forEach((timeoutId) => {
-      window.clearTimeout(timeoutId);
-    });
-    responseTimeoutsRef.current = [];
-  }, []);
+  // Job polling
+  useEffect(() => {
+    if (!activeJobId) return;
 
-  const cancelActiveResponse = useCallback(
-    (resetState = true) => {
-      activeResponseRunRef.current += 1;
-      clearResponseTimers();
+    const poll = async () => {
+      try {
+        const res = await fetch(`/api/posttraining/jobs/${activeJobId}`);
+        if (!res.ok) return;
+        const job = await res.json();
 
-      if (resetState) {
+        const currentStageId: string = job.currentStage;
+        const idx = stageIndexById(currentStageId);
+
+        // Update sidebar
+        if (idx >= 0) {
+          setActiveStageIndex(idx);
+          setCompletedStageCount(idx);
+        }
+
+        // Post a chat message when the stage changes
+        if (currentStageId !== lastStageRef.current) {
+          lastStageRef.current = currentStageId;
+          const chatMsg = STAGE_CHAT_MESSAGES[currentStageId];
+          if (chatMsg) {
+            setMessages((prev) => [
+              ...prev,
+              { id: crypto.randomUUID(), role: "assistant", content: chatMsg },
+            ]);
+          }
+        }
+
+        // Terminal states
+        if (job.status === "ready") {
+          const deploymentUrl =
+            job.deployment && typeof job.deployment.url === "string"
+              ? job.deployment.url
+              : null;
+          setCompletedStageCount(PIPELINE_STAGES.length);
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: crypto.randomUUID(),
+              role: "assistant",
+              content: deploymentUrl
+                ? `Your model is ready! It's deployed at: ${deploymentUrl}`
+                : "Your model is ready and deployed!",
+            },
+          ]);
+          stopPolling();
+        } else if (job.status === "failed") {
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: crypto.randomUUID(),
+              role: "assistant",
+              content: `The training job failed: ${job.errorSummary || "Unknown error."}`,
+            },
+          ]);
+          stopPolling();
+        }
+      } catch {
+        // Ignore transient polling errors
+      }
+    };
+
+    pollingRef.current = setInterval(poll, 3000);
+    poll(); // immediate first poll
+
+    return () => {
+      if (pollingRef.current) clearInterval(pollingRef.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeJobId]);
+
+  function stopPolling() {
+    if (pollingRef.current) {
+      clearInterval(pollingRef.current);
+      pollingRef.current = null;
+    }
+    setActiveJobId(null);
+    setIsResponding(false);
+    setActiveStageIndex(null);
+    inputRef.current?.focus();
+  }
+
+  const sendToChat = useCallback(
+    async (chatMessages: ChatMessage[]) => {
+      setIsResponding(true);
+
+      abortRef.current?.abort();
+      const controller = new AbortController();
+      abortRef.current = controller;
+
+      try {
+        const res = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            messages: chatMessages.map((m) => ({
+              role: m.role,
+              content: m.content,
+            })),
+          }),
+          signal: controller.signal,
+        });
+
+        if (!res.ok || !res.body) {
+          const errorText = await res.text().catch(() => "Unknown error");
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: crypto.randomUUID(),
+              role: "assistant",
+              content: `Something went wrong: ${errorText}`,
+            },
+          ]);
+          setIsResponding(false);
+          return;
+        }
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let assistantContent = "";
+        let jobStarted = false;
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() || "";
+
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed.startsWith("data: ")) continue;
+            const json = trimmed.slice(6);
+            if (!json) continue;
+
+            try {
+              const event = JSON.parse(json);
+
+              if (event.type === "text_delta" && event.content) {
+                assistantContent += event.content;
+              } else if (event.type === "job_started" && event.jobId) {
+                jobStarted = true;
+                setActiveJobId(event.jobId);
+                setActiveStageIndex(0);
+                setCompletedStageCount(0);
+                setIsProcessSidebarOpen(true);
+                lastStageRef.current = null;
+              } else if (event.type === "error") {
+                assistantContent += event.message || "An error occurred.";
+              }
+            } catch {
+              // Skip malformed SSE events
+            }
+          }
+        }
+
+        if (assistantContent) {
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: crypto.randomUUID(),
+              role: "assistant",
+              content: assistantContent,
+            },
+          ]);
+        }
+
+        // If no job was started, we're done responding
+        if (!jobStarted) {
+          setIsResponding(false);
+        }
+      } catch (err) {
+        if (err instanceof DOMException && err.name === "AbortError") return;
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: crypto.randomUUID(),
+            role: "assistant",
+            content: "Failed to reach the server. Please try again.",
+          },
+        ]);
         setIsResponding(false);
-        setActiveStageIndex(null);
-        setCompletedStageCount(0);
-        setIsProcessSidebarOpen(false);
       }
     },
-    [clearResponseTimers],
+    [],
   );
-
-  const startFakeResponseProcess = useCallback(() => {
-    const runId = activeResponseRunRef.current + 1;
-
-    activeResponseRunRef.current = runId;
-    setIsResponding(true);
-    setActiveStageIndex(0);
-    setCompletedStageCount(0);
-    setIsProcessSidebarOpen(false);
-
-    let elapsedBeforeStage = 0;
-
-    for (let index = 1; index < FAKE_PROCESS_STAGES.length; index += 1) {
-      elapsedBeforeStage += FAKE_PROCESS_STAGES[index - 1]!.durationMs;
-
-      const timeoutId = window.setTimeout(() => {
-        if (activeResponseRunRef.current !== runId) return;
-
-        setActiveStageIndex(index);
-        setCompletedStageCount(index);
-      }, elapsedBeforeStage);
-
-      responseTimeoutsRef.current.push(timeoutId);
-    }
-
-    const completeTimeoutId = window.setTimeout(() => {
-      if (activeResponseRunRef.current !== runId) return;
-
-      setCompletedStageCount(FAKE_PROCESS_STAGES.length);
-    }, TOTAL_FAKE_PROCESS_MS);
-
-    const finishTimeoutId = window.setTimeout(() => {
-      if (activeResponseRunRef.current !== runId) return;
-
-      clearResponseTimers();
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: crypto.randomUUID(),
-          role: "assistant",
-          content: getDummyResponse(),
-        },
-      ]);
-      setIsResponding(false);
-      setActiveStageIndex(null);
-      setCompletedStageCount(0);
-      setIsProcessSidebarOpen(false);
-      inputRef.current?.focus();
-    }, TOTAL_FAKE_PROCESS_MS + 220);
-
-    responseTimeoutsRef.current.push(completeTimeoutId);
-    responseTimeoutsRef.current.push(finishTimeoutId);
-  }, [clearResponseTimers]);
-
-  useEffect(() => {
-    return () => {
-      activeResponseRunRef.current += 1;
-      clearResponseTimers();
-    };
-  }, [clearResponseTimers]);
 
   const handleSubmit = useCallback(
     (text?: string) => {
       const message = (text || input).trim();
-      if (!message || isResponding || responseTimeoutsRef.current.length > 0) {
-        return;
-      }
+      if (!message || isResponding) return;
 
       const userMsg: ChatMessage = {
         id: crypto.randomUUID(),
@@ -380,11 +466,12 @@ export default function ChatPage() {
         content: message,
       };
 
-      setMessages((prev) => [...prev, userMsg]);
+      const updatedMessages = [...messages, userMsg];
+      setMessages(updatedMessages);
       setInput("");
-      startFakeResponseProcess();
+      sendToChat(updatedMessages);
     },
-    [input, isResponding, startFakeResponseProcess],
+    [input, isResponding, messages, sendToChat],
   );
 
   const handleKeyDown = useCallback(
@@ -394,19 +481,29 @@ export default function ChatPage() {
         handleSubmit();
       }
     },
-    [handleSubmit]
+    [handleSubmit],
   );
 
   const handleNewChat = useCallback(() => {
-    cancelActiveResponse();
+    abortRef.current?.abort();
+    if (pollingRef.current) {
+      clearInterval(pollingRef.current);
+      pollingRef.current = null;
+    }
     setMessages([]);
     setInput("");
+    setIsResponding(false);
+    setActiveStageIndex(null);
+    setCompletedStageCount(0);
+    setIsProcessSidebarOpen(false);
+    setActiveJobId(null);
+    lastStageRef.current = null;
     inputRef.current?.focus();
-  }, [cancelActiveResponse]);
+  }, []);
 
   const isEmpty = messages.length === 0;
   const currentStage =
-    activeStageIndex === null ? null : FAKE_PROCESS_STAGES[activeStageIndex];
+    activeStageIndex === null ? null : PIPELINE_STAGES[activeStageIndex];
 
   return (
     <div className="flex h-screen overflow-hidden bg-background">
@@ -496,12 +593,12 @@ export default function ChatPage() {
                 placeholder={
                   isResponding && currentStage
                     ? currentStage.label
-                    : "Message ChatGPT..."
+                    : "Describe the AI you want to build..."
                 }
                 rows={1}
                 className={cn(
                   "resize-none shadow-lg border-border/60 focus-visible:ring-0 focus-visible:border-border min-h-0 pr-12 bg-card text-sm",
-                  isResponding && "opacity-70"
+                  isResponding && "opacity-70",
                 )}
                 style={{
                   minHeight: "52px",
@@ -533,7 +630,7 @@ export default function ChatPage() {
       </div>
 
       <ProcessingSidebar
-        isOpen={isResponding && isProcessSidebarOpen}
+        isOpen={isProcessSidebarOpen && activeStageIndex !== null}
         activeStageIndex={activeStageIndex}
         completedStageCount={completedStageCount}
         onClose={() => setIsProcessSidebarOpen(false)}

@@ -28,9 +28,7 @@ export type PostTrainingJobRecord = {
   createdAt: string;
   updatedAt: string;
   input: {
-    domain: string;
-    task: string;
-    qualityTier: number;
+    description: string;
     seedArtifact: string | null;
   };
   method: string | null;
@@ -43,9 +41,7 @@ export type PostTrainingJobRecord = {
 };
 
 type CreateJobInput = {
-  domain: string;
-  task: string;
-  qualityTier: number;
+  description: string;
   seedArtifact?: string | null;
 };
 
@@ -73,8 +69,8 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
-function buildJobId(domain: string, task: string): string {
-  const base = slugify(`${domain}-${task}`) || "posttraining-job";
+function buildJobId(description: string): string {
+  const base = slugify(description) || "posttraining-job";
   return `${base}-${randomUUID().slice(0, 8)}`;
 }
 
@@ -139,14 +135,6 @@ function assertString(value: unknown, fieldName: string): string {
   return value.trim();
 }
 
-function assertQualityTier(value: unknown): number {
-  const parsed = Number(value);
-  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 5) {
-    throw new Error("qualityTier must be an integer between 1 and 5.");
-  }
-  return parsed;
-}
-
 function normalizeSeedArtifact(value: unknown): string | null {
   if (value == null) {
     return null;
@@ -165,9 +153,7 @@ export function validateCreateJobInput(body: unknown): CreateJobInput {
 
   const payload = body as Record<string, unknown>;
   return {
-    domain: assertString(payload.domain, "domain"),
-    task: assertString(payload.task, "task"),
-    qualityTier: assertQualityTier(payload.qualityTier),
+    description: assertString(payload.description, "description"),
     seedArtifact: normalizeSeedArtifact(payload.seedArtifact),
   };
 }
@@ -176,7 +162,7 @@ export async function createPostTrainingJob(input: CreateJobInput): Promise<Post
   await mkdir(JOBS_ROOT, { recursive: true });
 
   const createdAt = nowIso();
-  const jobId = buildJobId(input.domain, input.task);
+  const jobId = buildJobId(input.description);
   const jobDir = getJobDir(jobId);
   await mkdir(jobDir, { recursive: true });
 
@@ -187,9 +173,7 @@ export async function createPostTrainingJob(input: CreateJobInput): Promise<Post
     createdAt,
     updatedAt: createdAt,
     input: {
-      domain: input.domain,
-      task: input.task,
-      qualityTier: input.qualityTier,
+      description: input.description,
       seedArtifact: input.seedArtifact ?? null,
     },
     method: null,
@@ -230,8 +214,7 @@ export async function createPostTrainingJob(input: CreateJobInput): Promise<Post
       source: "api",
       message: "Job created and queued.",
       data: {
-        domain: input.domain,
-        qualityTier: input.qualityTier,
+        description: input.description,
       },
     }) + "\n",
     "utf8",

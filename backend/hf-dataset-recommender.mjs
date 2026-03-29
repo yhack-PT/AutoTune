@@ -111,20 +111,17 @@ export class RecommendationFailure extends Error {
 
 export async function recommendDatasets(input, options = {}) {
   return withLoggerContext(options.logger, async () => {
-    logInfo(
-      `starting recommendDatasets in ${isSearchPlanInput(input) ? "search-plan" : "raw-input"} mode`,
-    );
+    logInfo("starting recommendDatasets");
     logJson("input", input);
 
-    const normalizedPlan = isSearchPlanInput(input)
-      ? validatePlan(input)
-      : await createPlanFromUserInputs(input);
+    if (!input || typeof input !== "object" || !Array.isArray(input.search_queries)) {
+      throw new Error("Input must contain a `search_queries` array.");
+    }
+    const normalizedPlan = validatePlan(input);
 
     logJson("normalized plan", normalizedPlan);
     const context = buildContext(normalizedPlan);
-    logInfo(
-      `running ${context.search_queries.length} HF searches with min row floor ${context.min_rows_floor || 0}`,
-    );
+    logInfo(`running ${context.search_queries.length} HF searches`);
     const discoveredCandidates = await (
       typeof options.discoverCandidates === "function"
         ? options.discoverCandidates(context)
@@ -213,10 +210,6 @@ function buildCompatibilitySummary(candidates) {
   };
 }
 
-function isSearchPlanInput(input) {
-  return Boolean(input && typeof input === "object" && Array.isArray(input.search_queries));
-}
-
 function validatePlan(plan) {
   if (!plan || typeof plan !== "object") {
     throw new Error("Input must be an object containing `search_queries`.");
@@ -277,93 +270,6 @@ function validatePlan(plan) {
   };
 }
 
-async function createPlanFromUserInputs(input) {
-  const normalizedInput = validateUserInputs(input);
-  await ensureDotEnvLoaded();
-  logJson("validated raw inputs", normalizedInput);
-
-  const apiKey = normalizeOptionalString(process.env.OPENAI_API_KEY);
-  if (!apiKey) {
-    throw new Error(
-      "OPENAI_API_KEY is required to generate search queries from `domain`, `qualityTier`, and `useCase`.",
-    );
-  }
-
-  const model = normalizeOptionalString(process.env.OPENAI_MODEL) ?? DEFAULT_OPENAI_MODEL;
-  const prompt = buildOpenAIPlanningPrompt(normalizedInput);
-  const openAIRequestBody = {
-    model,
-    store: false,
-    input: [
-      {
-        role: "system",
-        content:
-          "You generate search plans for finding Hugging Face datasets for language-model post-training. Return only the requested JSON structure.",
-      },
-      {
-        role: "user",
-        content: prompt,
-      },
-    ],
-    text: {
-      format: {
-        type: "json_schema",
-        name: "hf_dataset_search_plan",
-        schema: getOpenAIPlanSchema(),
-        strict: true,
-      },
-    },
-  };
-  logInfo(`creating search plan with OpenAI model ${model}`);
-  logMultiline("openai prompt", prompt);
-
-  const response = await fetchJson(OPENAI_RESPONSES_API_URL, {
-    method: "POST",
-    timeoutMs: 60_000,
-    maxRetries: 3,
-    requestLabel: "OpenAI planning request",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(openAIRequestBody),
-  });
-
-  logJson("openai response metadata", {
-    id: response.id ?? null,
-    status: response.status ?? null,
-    model: response.model ?? null,
-    usage: response.usage ?? null,
-  });
-
-  const outputText = extractOpenAIOutputText(response);
-  let plan;
-  let parseError = null;
-  if (outputText) {
-    logMultiline("openai output text", outputText);
-  }
-
-  try {
-    if (outputText) {
-      plan = JSON.parse(outputText);
-    }
-  } catch (error) {
-    parseError =
-      error instanceof Error ? error.message : "unknown parse error";
-  }
-
-  if (!outputText) {
-    throw new Error("OpenAI returned an empty planning response.");
-  }
-  if (parseError) {
-    throw new Error(`OpenAI returned invalid JSON for the search plan: ${parseError}`);
-  }
-
-  logJson("openai parsed plan", plan);
-
-  return validatePlan(plan);
-}
-
 function extractOpenAIOutputText(response) {
   const topLevelText = normalizeOptionalString(response?.output_text);
   if (topLevelText) {
@@ -386,155 +292,6 @@ function extractOpenAIOutputText(response) {
   return null;
 }
 
-function validateUserInputs(input) {
-  if (!input || typeof input !== "object") {
-    throw new Error(
-      "Input must either include `search_queries` or the raw fields `domain`, `qualityTier`, and `useCase`.",
-    );
-  }
-
-  const domain = String(input.domain ?? "").trim();
-  const useCase = String(input.useCase ?? "").trim();
-  const qualityTier = Number(input.qualityTier);
-
-  if (!domain) {
-    throw new Error("`domain` must be a non-empty string.");
-  }
-  if (!useCase) {
-    throw new Error("`useCase` must be a non-empty string.");
-  }
-  if (!Number.isInteger(qualityTier) || qualityTier < 1 || qualityTier > 5) {
-    throw new Error("`qualityTier` must be an integer between 1 and 5.");
-  }
-
-  return { domain, qualityTier, useCase };
-}
-
-function buildOpenAIPlanningPrompt(input) {
-  return [
-    "Create a Hugging Face dataset search plan for post-training a language model.",
-    `Domain: ${input.domain}`,
-    `Quality tier: ${input.qualityTier}`,
-    `Use case: ${input.useCase}`,
-    "Quality tier definitions:",
-    "1 = Fastest: under 10K rows, one tightly matched dataset, optimize for minutes to a few hours.",
-    "2 = Fast: 10K-50K rows, 1-2 complementary datasets, moderate filtering.",
-    "3 = Balanced: 50K-500K rows, 2-3 datasets, core use case plus edge cases.",
-    "4 = Quality: 500K-2M rows, 3-5 diverse high-quality datasets.",
-    "5 = Maximum Quality: 2M+ rows, 4-6+ datasets, broad foundational and domain-specialized coverage.",
-    "Return analysis, search_queries, ranking_criteria, and recommendation_guidance.",
-    "search_queries must contain concise Hugging Face search strings, usually 2-6 words, like something typed directly into the Hugging Face search bar.",
-    "Use task_filter values only from: text-classification, question-answering, summarization, text-generation, translation, conversational, token-classification, or null.",
-    "Use sort values only from: downloads, likes, trending, created.",
-    "Set min_rows based on the quality tier.",
-    "Set data_format_needed to exactly one of: instruction, completion, preference, raw_text, mixed.",
-    "Keep mapped_task_types narrowly focused on the main fine-tuning objective, usually 1-2 task types.",
-    "Keep warnings focused on practical dataset-selection risks.",
-  ].join("\n");
-}
-
-function getOpenAIPlanSchema() {
-  return {
-    type: "object",
-    additionalProperties: false,
-    properties: {
-      analysis: {
-        type: "object",
-        additionalProperties: false,
-        properties: {
-          domain_summary: { type: "string" },
-          mapped_task_types: {
-            type: "array",
-            maxItems: 3,
-            items: {
-              type: "string",
-              enum: [
-                "text-classification",
-                "question-answering",
-                "summarization",
-                "text-generation",
-                "translation",
-                "conversational",
-                "token-classification",
-              ],
-            },
-          },
-          data_format_needed: {
-            type: "string",
-            enum: ["instruction", "completion", "preference", "raw_text", "mixed"],
-          },
-          quality_tier_strategy: { type: "string" },
-        },
-        required: [
-          "domain_summary",
-          "mapped_task_types",
-          "data_format_needed",
-          "quality_tier_strategy",
-        ],
-      },
-      search_queries: {
-        type: "array",
-        minItems: 1,
-        items: {
-          type: "object",
-          additionalProperties: false,
-          properties: {
-            search: { type: "string" },
-            task_filter: {
-              type: ["string", "null"],
-            },
-            sort: {
-              type: "string",
-              enum: ["downloads", "likes", "trending", "created"],
-            },
-            min_rows: { type: "integer", minimum: 0 },
-            intent: { type: "string" },
-          },
-          required: ["search", "task_filter", "sort", "min_rows", "intent"],
-        },
-      },
-      ranking_criteria: {
-        type: "array",
-        items: {
-          type: "object",
-          additionalProperties: false,
-          properties: {
-            criterion: { type: "string" },
-            weight: { type: "string", enum: ["high", "medium", "low"] },
-            description: { type: "string" },
-          },
-          required: ["criterion", "weight", "description"],
-        },
-      },
-      recommendation_guidance: {
-        type: "object",
-        additionalProperties: false,
-        properties: {
-          ideal_dataset_count: { type: "integer", minimum: 1 },
-          target_total_rows: { type: "string" },
-          mixing_strategy: { type: "string" },
-          warnings: {
-            type: "array",
-            items: { type: "string" },
-          },
-        },
-        required: [
-          "ideal_dataset_count",
-          "target_total_rows",
-          "mixing_strategy",
-          "warnings",
-        ],
-      },
-    },
-    required: [
-      "analysis",
-      "search_queries",
-      "ranking_criteria",
-      "recommendation_guidance",
-    ],
-  };
-}
-
 function normalizeSearchQuery(query) {
   if (!query || typeof query !== "object") {
     return {
@@ -554,7 +311,6 @@ function normalizeSearchQuery(query) {
     search: String(query.search ?? "").trim(),
     task_filter: normalizeOptionalString(query.task_filter),
     sort,
-    min_rows: normalizeNonNegativeInt(query.min_rows) ?? 0,
     intent: String(query.intent ?? "").trim(),
   };
 }
@@ -571,17 +327,10 @@ function buildContext(plan) {
   const queryTokens = uniqueStrings(
     plan.search_queries.flatMap((query) => tokenize([query.search, query.intent].join(" "))),
   );
-  const minRowsFloor = Math.min(
-    ...plan.search_queries
-      .map((query) => query.min_rows)
-      .filter((value) => Number.isFinite(value) && value > 0),
-    Number.POSITIVE_INFINITY,
-  );
 
   return {
     ...plan,
     query_tokens: queryTokens,
-    min_rows_floor: Number.isFinite(minRowsFloor) ? minRowsFloor : 0,
     target_row_band: parseTargetRowBand(plan.recommendation_guidance.target_total_rows),
   };
 }
@@ -1202,7 +951,6 @@ function buildOpenAIRankingPrompt(context, rankingInput) {
     `Search queries: ${JSON.stringify(context.search_queries)}`,
     `Recommendation guidance: ${JSON.stringify(context.recommendation_guidance)}`,
     `Target row band: ${JSON.stringify(context.target_row_band)}`,
-    `Minimum row floor: ${context.min_rows_floor}`,
     `Candidates: ${JSON.stringify(rankingInput)}`,
   ].join("\n");
 }
@@ -1602,11 +1350,6 @@ function normalizePositiveInt(value) {
   return Number.isInteger(number) && number > 0 ? number : null;
 }
 
-function normalizeNonNegativeInt(value) {
-  const number = Number(value);
-  return Number.isInteger(number) && number >= 0 ? number : null;
-}
-
 function toNumber(value) {
   const number = Number(value);
   return Number.isFinite(number) && number > 0 ? number : 0;
@@ -1729,15 +1472,6 @@ function parseCliArgs(argv) {
     } else if (current === "--json") {
       parsed.inlineJson = next;
       index += 1;
-    } else if (current === "--domain") {
-      parsed.domain = next;
-      index += 1;
-    } else if (current === "--quality-tier") {
-      parsed.qualityTier = next;
-      index += 1;
-    } else if (current === "--use-case") {
-      parsed.useCase = next;
-      index += 1;
     }
   }
 
@@ -1752,15 +1486,8 @@ async function loadCliInput(args) {
     const fileContents = await readFile(args.inputPath, "utf8");
     return JSON.parse(fileContents);
   }
-  if (args.domain || args.qualityTier || args.useCase) {
-    return {
-      domain: args.domain,
-      qualityTier: Number(args.qualityTier),
-      useCase: args.useCase,
-    };
-  }
   throw new Error(
-    "Usage: node backend/hf-dataset-recommender.mjs --input plan.json, --json '{\"search_queries\":[...]}' or --domain \"...\" --quality-tier 3 --use-case \"...\"",
+    "Usage: node backend/hf-dataset-recommender.mjs --input plan.json or --json '{\"search_queries\":[...]}'",
   );
 }
 

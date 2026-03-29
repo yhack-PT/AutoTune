@@ -5,6 +5,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { recommendDatasets } from "./hf-dataset-recommender.mjs";
+import { generateSearchPlan } from "./description-to-search-plan.mjs";
 import { runCompiler } from "./posttraining-spec-compiler.mjs";
 
 const backendDir = path.dirname(fileURLToPath(import.meta.url));
@@ -479,17 +480,17 @@ async function runSmokeTest({ jobId, deploymentUrl, model, logger }) {
 async function runRecommendationStage(jobId, job) {
   const logger = createStageLogger(jobId, "recommending");
   try {
-    const recommendation = await recommendDatasets(
-      {
-        domain: job.input.domain,
-        qualityTier: job.input.qualityTier,
-        useCase: job.input.task,
-      },
-      {
-        logger,
-        skipDebugWrite: true,
-      },
-    );
+    const searchPlan = await generateSearchPlan(job.input.description, { logger });
+    await logger.emit({
+      source: "orchestrator",
+      level: "info",
+      message: "Generated search plan from description.",
+      data: { queryCount: searchPlan.search_queries.length },
+    });
+    const recommendation = await recommendDatasets(searchPlan, {
+      logger,
+      skipDebugWrite: true,
+    });
     await writeJsonFile(getJobPaths(jobId).recommendationPath, recommendation);
     await completeStage(jobId, "recommending", "Recommendation completed.", (draft) => {
       draft.artifacts.recommendationPath = getJobPaths(jobId).recommendationPath;
@@ -527,7 +528,7 @@ async function runCompilerStage(jobId, job) {
       inputPath: getJobPaths(jobId).recommendationPath,
       outputRoot: jobsRoot,
       jobId,
-      objectiveSummary: job.input.task,
+      objectiveSummary: job.input.description,
       seedArtifact: job.input.seedArtifact ?? undefined,
     },
     { logger },
