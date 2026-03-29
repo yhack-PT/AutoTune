@@ -17,6 +17,7 @@ import {
   buildSpecPrompt,
   getSpecSchema,
   getCompilerOverridesConfigPath,
+  resolveConfiguredSftDataset,
   resolveConfiguredSftGpuType,
   resolveConfiguredSftMaxLength,
   resolveConfiguredSftNumTrainEpochs,
@@ -523,7 +524,7 @@ async function withTempDir(callback) {
 }
 
 const NEUTRAL_COMPILER_OVERRIDES_YAML =
-  "sft_num_train_epochs: null\nsft_gpu_type: null\nsft_max_length: null\n";
+  "sft_num_train_epochs: null\nsft_gpu_type: null\nsft_max_length: null\nsft_dataset: null\n";
 
 async function withCompilerOverrides(contents, callback) {
   const previousOverridePath = process.env.POSTTRAINING_COMPILER_OVERRIDES_PATH;
@@ -1284,6 +1285,76 @@ test("spec planner prompt hardcodes one training epoch and sane learning-rate gu
   assert.match(prompt, /training_params\.num_train_epochs to 1\.0/i);
   assert.match(prompt, /leave training_params\.learning_rate null/i);
   assert.match(prompt, /never above 1e-3/i);
+});
+
+test("compiler override can hardcode a specific Hugging Face dataset URL", async () => {
+  const previousOverridePath = process.env.POSTTRAINING_COMPILER_OVERRIDES_PATH;
+
+  try {
+    await withTempDir(async (tempRoot) => {
+      const overridesPath = path.join(tempRoot, "compiler-overrides.yaml");
+      process.env.POSTTRAINING_COMPILER_OVERRIDES_PATH = overridesPath;
+      await writeFile(
+        overridesPath,
+        "sft_dataset: https://huggingface.co/datasets/starmpcc/Asclepius-Synthetic-Clinical-Notes\n",
+        "utf8",
+      );
+
+      assert.equal(getCompilerOverridesConfigPath(), overridesPath);
+      assert.equal(resolveConfiguredSftDataset(), "starmpcc/Asclepius-Synthetic-Clinical-Notes");
+
+      const hardcodedCandidate = {
+        ...buildPromptCompletionGenerationCandidate(),
+        dataset: "starmpcc/Asclepius-Synthetic-Clinical-Notes",
+        source_url: "https://huggingface.co/datasets/starmpcc/Asclepius-Synthetic-Clinical-Notes",
+        why: "Clinical transcript-to-note pairs directly match the requested note-drafting task.",
+      };
+      const distractorCandidate = buildPromptCompletionGenerationCandidate();
+      const recommendation = await recommendDatasets(buildGenerationPlan(), {
+        discoverCandidates: async () => [distractorCandidate],
+        enrichCandidates: async () => [distractorCandidate],
+        rankCandidates: async () => [toRecommendedCandidate(distractorCandidate)],
+        skipDebugWrite: true,
+      });
+
+      const inputPath = path.join(tempRoot, "recommendation.json");
+      await writeFile(inputPath, `${JSON.stringify(recommendation, null, 2)}\n`, "utf8");
+
+      const result = await runCompiler(
+        {
+          inputPath,
+          outputRoot: tempRoot,
+          jobId: "dataset-override-job",
+          objectiveSummary: "Draft clinical notes from clinician-patient conversations.",
+        },
+        {
+          specPlanner: async () => ({
+            parsed: buildGenerationSpec(distractorCandidate.dataset),
+            model: "test-model",
+            response_id: "resp_dataset_override",
+          }),
+          datasetOverrideResolver: async (datasetId, context) => {
+            assert.equal(datasetId, "starmpcc/Asclepius-Synthetic-Clinical-Notes");
+            assert.equal(context.task_spec?.task_family, "generation");
+            return hardcodedCandidate;
+          },
+        },
+      );
+
+      assert.equal(result.spec.selected_datasets.length, 1);
+      assert.equal(result.spec.selected_datasets[0].dataset, hardcodedCandidate.dataset);
+      assert.match(
+        result.spec.notes.join("\n"),
+        /Compiler override applied: dataset=starmpcc\/Asclepius-Synthetic-Clinical-Notes\./,
+      );
+    });
+  } finally {
+    if (previousOverridePath === undefined) {
+      delete process.env.POSTTRAINING_COMPILER_OVERRIDES_PATH;
+    } else {
+      process.env.POSTTRAINING_COMPILER_OVERRIDES_PATH = previousOverridePath;
+    }
+  }
 });
 
 test("compiler override can force a different SFT epoch count than the planner proposed", async () => {

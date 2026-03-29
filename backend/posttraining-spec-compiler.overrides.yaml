@@ -5,5 +5,6 @@ sft_num_train_epochs: .001
 sft_gpu_type: H100
 # Set to `null` to keep the planner-selected max_length.
 sft_max_length: 1024
-
+# Accepts either `org/name` or a full `https://huggingface.co/datasets/...` URL.
+sft_dataset: https://huggingface.co/datasets/starmpcc/Asclepius-Synthetic-Clinical-Notes
 

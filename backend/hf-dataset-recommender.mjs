@@ -1004,21 +1004,10 @@ async function discoverCandidates(context) {
           continue;
         }
 
-        const metadata = {
-          id,
-          source_url: `https://huggingface.co/datasets/${id}`,
-          description:
-            dataset.description ??
-            dataset.cardData?.description ??
-            dataset.cardData?.pretty_name ??
-            "",
-          downloads: toNumber(dataset.downloads),
-          likes: toNumber(dataset.likes),
-          gated: Boolean(dataset.gated),
-          private: Boolean(dataset.private),
-          tags: Array.isArray(dataset.tags) ? dataset.tags : [],
-          cardData: dataset.cardData ?? {},
-        };
+        const metadata = buildDiscoveredCandidateSeed(dataset, {
+          matchedQueries: [query.search],
+          matchedTasks: query.task_filter ? [query.task_filter] : [],
+        });
 
         const existing = candidateMap.get(id);
         if (existing) {
@@ -1033,16 +1022,125 @@ async function discoverCandidates(context) {
           continue;
         }
 
-        candidateMap.set(id, {
-          ...metadata,
-          matched_queries: [query.search],
-          matched_tasks: query.task_filter ? [query.task_filter] : [],
-        });
+        candidateMap.set(id, metadata);
       }
     }),
   );
 
   return [...candidateMap.values()].slice(0, SHORTLIST_LIMIT);
+}
+
+function buildDiscoveredCandidateSeed(dataset, options = {}) {
+  const id = dataset?.id ?? dataset?._id ?? dataset?.name;
+  if (!id) {
+    return null;
+  }
+
+  return {
+    id,
+    source_url: `https://huggingface.co/datasets/${id}`,
+    description:
+      dataset?.description ??
+      dataset?.cardData?.description ??
+      dataset?.cardData?.pretty_name ??
+      "",
+    downloads: toNumber(dataset?.downloads),
+    likes: toNumber(dataset?.likes),
+    gated: Boolean(dataset?.gated),
+    private: Boolean(dataset?.private),
+    tags: Array.isArray(dataset?.tags) ? dataset.tags : [],
+    cardData: dataset?.cardData ?? {},
+    matched_queries: uniqueStrings(
+      Array.isArray(options.matchedQueries) ? options.matchedQueries.map((value) => String(value).trim()).filter(Boolean) : [],
+    ),
+    matched_tasks: uniqueStrings(
+      Array.isArray(options.matchedTasks) ? options.matchedTasks.map((value) => String(value).trim()).filter(Boolean) : [],
+    ),
+  };
+}
+
+export async function resolveDatasetOverrideCandidate(datasetId, planLikeContext, options = {}) {
+  const normalizedDatasetId = normalizeOptionalString(datasetId);
+  if (!normalizedDatasetId) {
+    throw new Error("dataset override id must be a non-empty string.");
+  }
+
+  const normalizedPlan = {
+    analysis: {
+      ...DEFAULT_ANALYSIS,
+      ...(planLikeContext?.analysis && typeof planLikeContext.analysis === "object" ? planLikeContext.analysis : {}),
+    },
+    task_spec: {
+      ...DEFAULT_TASK_SPEC,
+      ...(planLikeContext?.task_spec && typeof planLikeContext.task_spec === "object" ? planLikeContext.task_spec : {}),
+    },
+    search_queries:
+      Array.isArray(planLikeContext?.search_queries) && planLikeContext.search_queries.length > 0
+        ? planLikeContext.search_queries.map((query) => normalizeSearchQuery(query)).filter((query) => query.search)
+        : [
+          normalizeSearchQuery({
+            search: normalizedDatasetId,
+            task_filter: null,
+            sort: "downloads",
+            min_rows: 0,
+            intent: "Resolve an explicitly overridden dataset.",
+          }),
+        ],
+    ranking_criteria:
+      Array.isArray(planLikeContext?.ranking_criteria) && planLikeContext.ranking_criteria.length > 0
+        ? planLikeContext.ranking_criteria.map((criterion) => normalizeCriterion(criterion))
+        : DEFAULT_RANKING_CRITERIA,
+    recommendation_guidance: {
+      ...DEFAULT_GUIDANCE,
+      ...(planLikeContext?.recommendation_guidance && typeof planLikeContext.recommendation_guidance === "object"
+        ? planLikeContext.recommendation_guidance
+        : {}),
+    },
+  };
+  const context = buildContext(normalizedPlan);
+
+  const matchedQueries = uniqueStrings(
+    normalizedPlan.search_queries.map((query) => normalizeOptionalString(query.search)).filter(Boolean),
+  );
+  const matchedTasks = uniqueStrings(
+    Array.isArray(normalizedPlan.analysis.mapped_task_types)
+      ? normalizedPlan.analysis.mapped_task_types.map((value) => String(value).trim()).filter(Boolean)
+      : [],
+  );
+
+  let candidateSeed = {
+    id: normalizedDatasetId,
+    source_url: `https://huggingface.co/datasets/${normalizedDatasetId}`,
+    description: "",
+    downloads: 0,
+    likes: 0,
+    gated: false,
+    private: false,
+    tags: [],
+    cardData: {},
+    matched_queries: matchedQueries,
+    matched_tasks: matchedTasks,
+  };
+
+  const exactMatch = await searchHubDatasets({
+    search: normalizedDatasetId,
+    task_filter: null,
+    sort: "downloads",
+    min_rows: 0,
+    intent: "Resolve an explicitly overridden dataset.",
+  })
+    .then((results) => results.find((dataset) => (dataset.id ?? dataset._id ?? dataset.name) === normalizedDatasetId) ?? null)
+    .catch(() => null);
+
+  if (exactMatch) {
+    candidateSeed = buildDiscoveredCandidateSeed(exactMatch, {
+      matchedQueries,
+      matchedTasks,
+    }) ?? candidateSeed;
+  }
+
+  const [enrichedCandidate] = await enrichCandidates([candidateSeed], context, options);
+  return enrichedCandidate ?? null;
 }
 
 async function searchHubDatasets(query) {

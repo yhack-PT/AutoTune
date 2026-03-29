@@ -9,6 +9,7 @@ import {
   inferOutputKindFromNormalization as inferOutputKindFromNormalizationShared,
   validateNormalizationProposal as validateNormalizationProposalShared,
 } from "./posttraining-normalization.mjs";
+import { resolveDatasetOverrideCandidate } from "./hf-dataset-recommender.mjs";
 import { emitUiProgress } from "../src/lib/posttraining-progress.mjs";
 
 const OPENAI_RESPONSES_API_URL = "https://api.openai.com/v1/responses";
@@ -60,6 +61,7 @@ export const DEFAULT_COMPILER_OVERRIDES = Object.freeze({
   sft_num_train_epochs: null,
   sft_gpu_type: null,
   sft_max_length: null,
+  sft_dataset: null,
 });
 
 let dotEnvLoaded = false;
@@ -211,6 +213,52 @@ export function resolveConfiguredSftMaxLength(overrides = loadCompilerOverrides(
     );
   }
   return numericValue;
+}
+
+function normalizeHuggingFaceDatasetOverride(value) {
+  const overrideValue = normalizeOptionalString(value);
+  if (overrideValue === null) {
+    return null;
+  }
+
+  if (/^https?:\/\//i.test(overrideValue)) {
+    let parsedUrl = null;
+    try {
+      parsedUrl = new URL(overrideValue);
+    } catch {
+      throw new Error(
+        "compiler override sft_dataset must be null, a dataset id like 'org/name', or a Hugging Face dataset URL.",
+      );
+    }
+
+    const hostname = parsedUrl.hostname.toLowerCase();
+    if (!["huggingface.co", "www.huggingface.co"].includes(hostname)) {
+      throw new Error(
+        "compiler override sft_dataset URL must point at huggingface.co/datasets/<org>/<name>.",
+      );
+    }
+
+    const pathSegments = parsedUrl.pathname.split("/").filter(Boolean);
+    if (pathSegments[0] !== "datasets" || pathSegments.length < 3) {
+      throw new Error(
+        "compiler override sft_dataset URL must point at huggingface.co/datasets/<org>/<name>.",
+      );
+    }
+
+    return `${pathSegments[1]}/${pathSegments[2]}`;
+  }
+
+  if (!/^[^/\s]+\/[^/\s]+$/.test(overrideValue)) {
+    throw new Error(
+      "compiler override sft_dataset must be null, a dataset id like 'org/name', or a Hugging Face dataset URL.",
+    );
+  }
+
+  return overrideValue;
+}
+
+export function resolveConfiguredSftDataset(overrides = loadCompilerOverrides()) {
+  return normalizeHuggingFaceDatasetOverride(overrides.sft_dataset);
 }
 
 function uniqueStrings(values) {
@@ -745,7 +793,7 @@ function normalizeCandidate(candidate) {
   };
 }
 
-function normalizeCompilerInput(rawInput, contextOverride = null) {
+function normalizeCompilerInput(rawInput, contextOverride = null, options = {}) {
   const baseContext =
     rawInput && typeof rawInput === "object" && !Array.isArray(rawInput)
       ? {
@@ -778,14 +826,14 @@ function normalizeCompilerInput(rawInput, contextOverride = null) {
           ? rawInput.datasets
           : [];
 
-  if (!candidates.length) {
+  if (!candidates.length && !options.allowEmptyCandidates) {
     throw new Error(
       "Compiler input must be either an array of ranked dataset objects or an object containing recommended_datasets / ranked_datasets.",
     );
   }
 
   const normalizedCandidates = candidates.map((candidate) => normalizeCandidate(candidate)).filter(Boolean);
-  if (!normalizedCandidates.length) {
+  if (!normalizedCandidates.length && candidates.length > 0) {
     throw new Error("No usable dataset candidates were found in the compiler input.");
   }
 
@@ -1207,6 +1255,9 @@ function validateAndFinalizeSpec(
     artifact_strategy: normalizeOptionalString(rawSpec?.artifact_strategy) ?? "adapter",
     seed_artifact: normalizeOptionalString(rawSpec?.seed_artifact) ?? normalizeOptionalString(seedArtifact),
   };
+  const compilerOverrides = spec.method === "sft" ? loadCompilerOverrides() : DEFAULT_COMPILER_OVERRIDES;
+  const overriddenSftDataset =
+    spec.method === "sft" ? resolveConfiguredSftDataset(compilerOverrides) : null;
 
   if (!normalizedTaskSpec?.supported) {
     errors.push("task_spec must describe a supported backend task.");
@@ -1305,14 +1356,26 @@ function validateAndFinalizeSpec(
     errors.push("training_params.target_modules must be a non-empty array.");
   }
 
-  if (!Array.isArray(spec.selected_datasets) || spec.selected_datasets.length === 0) {
+  const selectedDatasetInputs =
+    overriddenSftDataset === null
+      ? spec.selected_datasets
+      : [
+        {
+          dataset: overriddenSftDataset,
+          weight: 1,
+          warnings: [],
+          include_reason: `Compiler override hardcoded the training dataset to '${overriddenSftDataset}'.`,
+        },
+      ];
+
+  if (!Array.isArray(selectedDatasetInputs) || selectedDatasetInputs.length === 0) {
     errors.push("selected_datasets must be a non-empty array.");
   }
 
   const outputKinds = new Set();
   const selectedDatasets = [];
 
-  for (const selectedDataset of spec.selected_datasets ?? []) {
+  for (const selectedDataset of selectedDatasetInputs ?? []) {
     const datasetId = normalizeOptionalString(selectedDataset?.dataset);
     if (!datasetId) {
       errors.push("Each selected dataset must include a dataset id.");
@@ -1427,7 +1490,6 @@ function validateAndFinalizeSpec(
     return { ok: false, errors };
   }
 
-  const compilerOverrides = spec.method === "sft" ? loadCompilerOverrides() : DEFAULT_COMPILER_OVERRIDES;
   const overriddenSftGpuType =
     spec.method === "sft" ? resolveConfiguredSftGpuType(compilerOverrides) : null;
   const overriddenSftMaxLength =
@@ -1477,6 +1539,10 @@ function validateAndFinalizeSpec(
     notes: Array.isArray(spec.notes) ? spec.notes.map((note) => String(note)) : [],
     evaluation_plan: resolvedEvaluationPlan,
   };
+
+  if (spec.method === "sft" && overriddenSftDataset !== null) {
+    finalized.notes.push(`Compiler override applied: dataset=${overriddenSftDataset}.`);
+  }
 
   if (
     spec.method === "sft" &&
@@ -1891,10 +1957,35 @@ export async function runCompiler(args, options = {}) {
   return withLoggerContext(options.logger, async () => {
     const rawInput = await loadJsonFile(args.inputPath);
     const contextOverride = args.contextPath ? await loadJsonFile(args.contextPath) : null;
-    const normalizedInput = normalizeCompilerInput(rawInput, contextOverride);
+    const compilerOverrides = loadCompilerOverrides();
+    const overriddenSftDataset = resolveConfiguredSftDataset(compilerOverrides);
+    const normalizedInput = normalizeCompilerInput(rawInput, contextOverride, {
+      allowEmptyCandidates: overriddenSftDataset !== null,
+    });
     const normalizedTaskSpec = normalizeTaskSpec(normalizedInput.context.task_spec);
     const sortedCandidates = [...normalizedInput.candidates].sort((left, right) => right.score - left.score);
-    const candidateProfiles = sortedCandidates.slice(0, 8);
+    let candidateProfiles =
+      overriddenSftDataset === null
+        ? sortedCandidates.slice(0, 8)
+        : sortedCandidates.filter((candidate) => candidate.dataset === overriddenSftDataset);
+
+    if (overriddenSftDataset !== null && candidateProfiles.length === 0) {
+      logInfo(
+        `compiler override dataset ${overriddenSftDataset} was not present in the recommendation input; resolving it directly`,
+      );
+      const resolvedOverrideCandidate = await (
+        typeof options.datasetOverrideResolver === "function"
+          ? options.datasetOverrideResolver(overriddenSftDataset, normalizedInput.context)
+          : resolveDatasetOverrideCandidate(overriddenSftDataset, normalizedInput.context)
+      );
+      const normalizedOverrideCandidate = normalizeCandidate(resolvedOverrideCandidate);
+      if (!normalizedOverrideCandidate) {
+        throw new Error(
+          `Compiler override sft_dataset='${overriddenSftDataset}' could not be resolved into a usable dataset candidate.`,
+        );
+      }
+      candidateProfiles = [normalizedOverrideCandidate];
+    }
 
     logUiProgress("I'm loading the training data");
     logInfo(`loaded ${candidateProfiles.length} ranked dataset candidates from recommendation output`);
@@ -1928,6 +2019,10 @@ export async function runCompiler(args, options = {}) {
       throw new Error(
         `None of the recommended dataset candidates exposed a valid normalization proposal for the current backend. ${diagnosticMessage}`,
       );
+    }
+
+    if (overriddenSftDataset !== null) {
+      logInfo(`compiler override locked SFT dataset selection to ${overriddenSftDataset}`);
     }
 
     const objectiveSummary = buildObjectiveSummary(normalizedInput.context, args, usableCandidates);

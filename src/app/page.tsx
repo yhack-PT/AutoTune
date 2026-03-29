@@ -3,7 +3,16 @@
 import { useState, useCallback, useRef, useEffect } from "react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
-import { ArrowUp, Download, Sparkles, Plus, Play, Rewind, ChevronDown } from "lucide-react";
+import {
+  ArrowUp,
+  Check,
+  ChevronDown,
+  Copy,
+  Download,
+  Play,
+  Rewind,
+  Sparkles,
+} from "lucide-react";
 import { cn } from "@/lib/utils";
 import ReactMarkdown from "react-markdown";
 import { getSidebarStageProgress, mergeStageProgressById } from "@/lib/posttraining-progress.mjs";
@@ -186,6 +195,51 @@ function getDeploymentLinkInfo(job: {
   };
 }
 
+function getSelectedDatasetIds(job: {
+  selectedDatasets?: unknown;
+}): string[] {
+  if (!Array.isArray(job.selectedDatasets)) {
+    return [];
+  }
+
+  return job.selectedDatasets
+    .filter((datasetId): datasetId is string => typeof datasetId === "string")
+    .map((datasetId) => datasetId.trim())
+    .filter(Boolean);
+}
+
+function buildDeploymentApiEndpoint(deploymentUrl: string): string {
+  return `${deploymentUrl.replace(/\/+$/, "")}/v1/chat/completions`;
+}
+
+async function copyTextToClipboard(value: string): Promise<void> {
+  if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(value);
+    return;
+  }
+
+  if (typeof document === "undefined") {
+    throw new Error("Clipboard is unavailable.");
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  textarea.style.pointerEvents = "none";
+
+  document.body.appendChild(textarea);
+  textarea.select();
+
+  const didCopy = document.execCommand("copy");
+  document.body.removeChild(textarea);
+
+  if (!didCopy) {
+    throw new Error("Copy failed.");
+  }
+}
+
 // =============================================================================
 // Suggestions (empty state)
 // =============================================================================
@@ -273,11 +327,13 @@ function ProcessingIndicator({
 
 function ProcessingSidebar({
   isOpen,
+  selectedDatasets,
   visibleStageIds,
   stageProgressById,
   onClose,
 }: {
   isOpen: boolean;
+  selectedDatasets: string[];
   visibleStageIds: string[];
   stageProgressById: Record<string, StageProgressItem[]>;
   onClose: () => void;
@@ -311,6 +367,38 @@ function ProcessingSidebar({
 
         <div className="flex-1 overflow-y-auto px-5 py-5">
           <div className="space-y-8">
+            <section className="space-y-3 rounded-2xl border border-border/70 bg-card/60 px-4 py-4">
+              <div className="space-y-1">
+                <h3 className="text-sm font-semibold text-foreground">
+                  Training data
+                </h3>
+                <p className="text-xs leading-relaxed text-foreground/60">
+                  {selectedDatasets.length > 0
+                    ? `Using ${selectedDatasets.length === 1 ? "this dataset" : "these datasets"} to train your model.`
+                    : "We'll show the selected datasets here once the training plan is ready."}
+                </p>
+              </div>
+
+              {selectedDatasets.length > 0 ? (
+                <ul className="space-y-2">
+                  {selectedDatasets.map((datasetId) => (
+                    <li
+                      key={datasetId}
+                      className="rounded-xl border border-border/70 bg-background px-3 py-2"
+                    >
+                      <code className="block break-all font-mono text-xs leading-relaxed text-foreground">
+                        {datasetId}
+                      </code>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="text-sm leading-relaxed text-foreground/65">
+                  Selecting the best public datasets for this run.
+                </p>
+              )}
+            </section>
+
             {isOpen &&
               visibleStages.map((stage) => {
                 const progressItems = stageProgressById[stage.id] ?? [];
@@ -381,6 +469,7 @@ export default function ChatPage() {
   const [visibleStageIds, setVisibleStageIds] = useState<string[]>([]);
   const [, setCompletedStageIds] = useState<string[]>([]);
   const [, setFailedStageId] = useState<string | null>(null);
+  const [selectedDatasets, setSelectedDatasets] = useState<string[]>([]);
   const [stageProgressById, setStageProgressById] = useState<Record<string, StageProgressItem[]>>(
     {},
   );
@@ -389,6 +478,7 @@ export default function ChatPage() {
   const [fineTunedEndpoint, setFineTunedEndpoint] = useState<string | null>(null);
   const [fineTunedModel, setFineTunedModel] = useState<string | null>(null);
   const [fineTunedJobId, setFineTunedJobId] = useState<string | null>(null);
+  const [copiedDeploymentUrl, setCopiedDeploymentUrl] = useState<string | null>(null);
   const [activeModel, setActiveModel] = useState<"openai" | "finetuned">("openai");
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const activeJobIdRef = useRef<string | null>(null);
@@ -396,6 +486,7 @@ export default function ChatPage() {
   const abortRef = useRef<AbortController | null>(null);
   const [showIndicator, setShowIndicator] = useState(false);
   const indicatorTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const copiedIndicatorTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const evalShownRef = useRef(false);
   const terminalStatusByJobRef = useRef<Record<string, "ready" | "failed">>({});
 
@@ -425,6 +516,14 @@ export default function ChatPage() {
       textarea.style.height = `${Math.min(Math.max(scrollH, 52), 200)}px`;
     }
   }, [input]);
+
+  useEffect(() => {
+    return () => {
+      if (copiedIndicatorTimerRef.current) {
+        clearTimeout(copiedIndicatorTimerRef.current);
+      }
+    };
+  }, []);
 
   const stopPolling = useCallback(() => {
     if (pollingRef.current) {
@@ -463,6 +562,7 @@ export default function ChatPage() {
         const nextVisibleStageIds = getVisiblePipelineStageIds(job);
         const nextCompletedStageIds = getCompletedPipelineStageIds(job);
         const nextFailedStageId = getFailedPipelineStageId(job);
+        const nextSelectedDatasets = getSelectedDatasetIds(job);
         const nextStageProgressById = getSidebarStageProgressTyped({
           logs: Array.isArray(job.logs) ? job.logs : [],
           activeStageId: nextActiveStageId,
@@ -480,6 +580,7 @@ export default function ChatPage() {
         setVisibleStageIds(nextVisibleStageIds);
         setCompletedStageIds(nextCompletedStageIds);
         setFailedStageId(nextFailedStageId);
+        setSelectedDatasets(nextSelectedDatasets);
         setStageProgressById((previousStageProgressById) =>
           mergeStageProgressByIdTyped(
             previousStageProgressById,
@@ -692,6 +793,7 @@ export default function ChatPage() {
                 setVisibleStageIds(["recommending"]);
                 setCompletedStageIds([]);
                 setFailedStageId(null);
+                setSelectedDatasets([]);
                 setStageProgressById({});
                 setIsProcessSidebarOpen(true);
                 lastStageRef.current = null;
@@ -774,32 +876,24 @@ export default function ChatPage() {
     [handleSubmit],
   );
 
-  const handleNewChat = useCallback(() => {
-    abortRef.current?.abort();
-    if (pollingRef.current) {
-      clearInterval(pollingRef.current);
-      pollingRef.current = null;
+  const handleCopyDeploymentEndpoint = useCallback(async (deploymentUrl: string) => {
+    try {
+      await copyTextToClipboard(buildDeploymentApiEndpoint(deploymentUrl));
+      setCopiedDeploymentUrl(deploymentUrl);
+
+      if (copiedIndicatorTimerRef.current) {
+        clearTimeout(copiedIndicatorTimerRef.current);
+      }
+
+      copiedIndicatorTimerRef.current = setTimeout(() => {
+        setCopiedDeploymentUrl((currentUrl) =>
+          currentUrl === deploymentUrl ? null : currentUrl,
+        );
+        copiedIndicatorTimerRef.current = null;
+      }, 2000);
+    } catch {
+      setCopiedDeploymentUrl(null);
     }
-    setMessages([]);
-    setInput("");
-    setIsResponding(false);
-    setShowIndicator(false);
-    setActiveStageIndex(null);
-    setVisibleStageIds([]);
-    setCompletedStageIds([]);
-    setFailedStageId(null);
-    setStageProgressById({});
-    setIsProcessSidebarOpen(false);
-    activeJobIdRef.current = null;
-    setActiveJobId(null);
-    setActiveModel("openai");
-    setFineTunedEndpoint(null);
-    setFineTunedModel(null);
-    setFineTunedJobId(null);
-    lastStageRef.current = null;
-    evalShownRef.current = false;
-    terminalStatusByJobRef.current = {};
-    inputRef.current?.focus();
   }, []);
 
   const isEmpty = messages.length === 0;
@@ -812,14 +906,6 @@ export default function ChatPage() {
         {/* Top bar */}
         <header className="shrink-0 flex items-center justify-between px-5 py-3 border-b border-border/50">
           <div className="flex items-center gap-3">
-            {/* <Button
-              variant="ghost"
-              size="icon-sm"
-              onClick={handleNewChat}
-              title="New chat"
-            >
-              <Plus className="h-4 w-4" />
-            </Button> */}
             {fineTunedEndpoint ? (
               <DropdownMenu>
                 <DropdownMenuTrigger className="flex items-center gap-1 text-sm font-medium text-foreground/80 hover:text-foreground outline-hidden">
@@ -905,37 +991,72 @@ export default function ChatPage() {
                   )}
                   {msg.deploymentUrl && (
                     <div className="flex justify-start pl-1 pt-3">
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        className={cn(
-                          "gap-2",
-                          activeModel === "finetuned"
-                            ? "border-transparent bg-white text-black hover:bg-white/80"
-                            : "border-green-300 bg-green-50 text-green-700 hover:bg-green-100 hover:text-green-800",
-                        )}
-                        onClick={() => {
-                          if (activeModel === "finetuned") {
-                            setActiveModel("openai");
-                          } else {
-                            setFineTunedEndpoint(msg.deploymentUrl!);
-                            setFineTunedModel(msg.deploymentModel ?? null);
-                            setActiveModel("finetuned");
-                          }
-                        }}
-                      >
-                        {activeModel === "finetuned" ? (
-                          <>
-                            <Rewind className="h-3 w-3" />
-                            Switch to AutoTune
-                          </>
-                        ) : (
-                          <>
-                            <Play className="h-3 w-3" />
-                            Try this model now
-                          </>
-                        )}
-                      </Button>
+                      <div className="w-full max-w-xl space-y-3">
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className={cn(
+                            "gap-2",
+                            activeModel === "finetuned"
+                              ? "border-transparent bg-white text-black hover:bg-white/80"
+                              : "border-green-300 bg-green-50 text-green-700 hover:bg-green-100 hover:text-green-800",
+                          )}
+                          onClick={() => {
+                            if (activeModel === "finetuned") {
+                              setActiveModel("openai");
+                            } else {
+                              setFineTunedEndpoint(msg.deploymentUrl!);
+                              setFineTunedModel(msg.deploymentModel ?? null);
+                              setActiveModel("finetuned");
+                            }
+                          }}
+                        >
+                          {activeModel === "finetuned" ? (
+                            <>
+                              <Rewind className="h-3 w-3" />
+                              Switch to AutoTune
+                            </>
+                          ) : (
+                            <>
+                              <Play className="h-3 w-3" />
+                              Try this model now
+                            </>
+                          )}
+                        </Button>
+
+                        <div className="rounded-2xl border border-border/70 bg-card/90 px-4 py-3">
+                          <div className="flex items-start justify-between gap-3">
+                            <div className="min-w-0 space-y-1">
+                              <p className="text-[0.65rem] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
+                                API endpoint
+                              </p>
+                              <code className="block break-all font-mono text-xs leading-relaxed text-foreground">
+                                {buildDeploymentApiEndpoint(msg.deploymentUrl)}
+                              </code>
+                            </div>
+
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="xs"
+                              className="shrink-0"
+                              onClick={() => handleCopyDeploymentEndpoint(msg.deploymentUrl!)}
+                            >
+                              {copiedDeploymentUrl === msg.deploymentUrl ? (
+                                <>
+                                  <Check className="h-3 w-3" />
+                                  Copied
+                                </>
+                              ) : (
+                                <>
+                                  <Copy className="h-3 w-3" />
+                                  Copy
+                                </>
+                              )}
+                            </Button>
+                          </div>
+                        </div>
+                      </div>
                     </div>
                   )}
                 </div>
@@ -1006,6 +1127,7 @@ export default function ChatPage() {
 
       <ProcessingSidebar
         isOpen={isProcessSidebarOpen && visibleStageIds.length > 0}
+        selectedDatasets={selectedDatasets}
         visibleStageIds={visibleStageIds}
         stageProgressById={stageProgressById}
         onClose={() => setIsProcessSidebarOpen(false)}
