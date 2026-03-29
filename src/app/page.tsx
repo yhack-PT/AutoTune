@@ -609,7 +609,7 @@ export default function ChatPage() {
               <div className="max-w-2xl w-full space-y-5">
                 <div className="text-center space-y-1">
                   <h2 className="text-2xl font-semibold tracking-tight">
-                    What should your AI do?
+                    What should your AI be an expert at?
                   </h2>
                   <p className="text-sm text-muted-foreground max-w-md mx-auto">
                     Build a specialized AI for any use case.
@@ -703,7 +703,7 @@ export default function ChatPage() {
                 placeholder={
                   isResponding && currentStage
                     ? currentStage.label
-                    : "Describe the AI you want to build..."
+                    : "e.g. Build me an AI expert at drafting clinical notes from visit transcripts..."
                 }
                 rows={1}
                 className={cn(
