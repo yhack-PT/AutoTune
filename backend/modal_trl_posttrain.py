@@ -61,6 +61,11 @@ DEFAULT_TARGET_MODULES = [
     "down_proj",
 ]
 
+NON_TEXT_COLUMN_PATTERNS = (
+    re.compile(r"(^|_)(image|images|img|photo|picture|pixel|pixels|frame|frames)(_|$)", re.IGNORECASE),
+    re.compile(r"(^|_)(scan|dicom|xray|x_ray|mammogram|thumbnail)(_|$)", re.IGNORECASE),
+)
+
 MODEL_CACHE_DIR = Path("/model_cache")
 DATASET_CACHE_DIR = Path("/dataset_cache")
 CHECKPOINTS_DIR = Path("/checkpoints")
@@ -407,13 +412,57 @@ def _extract_template_variables(template: str) -> list[str]:
     return list(dict.fromkeys(match.group(1).strip() for match in re.finditer(r"{([^{}]+)}", template) if match.group(1).strip()))
 
 
+def _looks_like_image_payload_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return True
+    if isinstance(value, dict):
+        normalized_keys = {str(key).strip().lower() for key in value.keys()}
+        if "bytes" in normalized_keys or "blob" in normalized_keys or "pixel_values" in normalized_keys:
+            return True
+        if (
+            ("path" in normalized_keys or "src" in normalized_keys or "url" in normalized_keys)
+            and ("bytes" in normalized_keys or "height" in normalized_keys or "width" in normalized_keys)
+        ):
+            return True
+    if isinstance(value, str):
+        return value.strip().lower().startswith("data:image/")
+    return False
+
+
+def _sample_dataset_column_values(dataset: Any, column_name: str, *, limit: int = 8) -> list[Any]:
+    samples: list[Any] = []
+    for index in range(min(len(dataset), limit)):
+        row = dataset[index]
+        if isinstance(row, dict) and column_name in row:
+            samples.append(row[column_name])
+    return samples
+
+
+def _find_non_text_required_columns(dataset: Any, column_names: list[str]) -> list[str]:
+    unsupported_columns: list[str] = []
+    for column_name in column_names:
+        if any(pattern.search(column_name) for pattern in NON_TEXT_COLUMN_PATTERNS):
+            unsupported_columns.append(column_name)
+            continue
+        sample_values = _sample_dataset_column_values(dataset, column_name)
+        if any(_looks_like_image_payload_value(value) for value in sample_values):
+            unsupported_columns.append(column_name)
+    return unsupported_columns
+
+
 def _stringify_manifest_value(value: Any, field_name: str) -> str:
     if value is None:
-        raise ValueError(f"Expected `{field_name}` to be populated.")
+        return ""
     if isinstance(value, str):
         return value
     if isinstance(value, (int, float, bool)):
         return str(value)
+    if _looks_like_image_payload_value(value):
+        raise ValueError(
+            f"Expected `{field_name}` to resolve to plain text, not an image/blob payload."
+        )
     if isinstance(value, (list, dict)):
         return json.dumps(value, ensure_ascii=True)
     return str(value)
@@ -538,42 +587,48 @@ def _resolve_normalization_raw_value(
     return raw_value
 
 
-def _drop_missing_completion_rows(
+def _drop_invalid_required_sft_rows(
     dataset_id: str,
     dataset: Any,
-    completion_field: dict[str, Any],
+    required_fields: tuple[str, ...],
     *,
     split_name: str,
     selected_target_column: str | None,
 ) -> tuple[Any, dict[str, Any]]:
     total_rows = len(dataset)
     kept_indices: list[int] = []
+    dropped_rows_by_field = {field_name: 0 for field_name in required_fields}
 
-    source_column = completion_field.get("source_column")
-    completion_source_column = source_column.strip() if isinstance(source_column, str) and source_column.strip() else None
+    field_values = {field_name: dataset[field_name] for field_name in required_fields}
 
-    if completion_source_column:
-        raw_values = dataset[completion_source_column]
-        for index, raw_value in enumerate(raw_values):
-            if not _is_missing_manifest_value(raw_value):
-                kept_indices.append(index)
-    else:
-        for index in range(total_rows):
-            raw_value = _resolve_normalization_raw_value(dataset[index], completion_field, "completion")
-            if not _is_missing_manifest_value(raw_value):
-                kept_indices.append(index)
+    for index in range(total_rows):
+        missing_fields = [
+            field_name
+            for field_name in required_fields
+            if _is_missing_manifest_value(field_values[field_name][index])
+        ]
+        if missing_fields:
+            for field_name in missing_fields:
+                dropped_rows_by_field[field_name] += 1
+            continue
+        kept_indices.append(index)
 
     kept_rows = len(kept_indices)
     dropped_rows = total_rows - kept_rows
     diagnostic = {
         "dataset": dataset_id,
         "split": split_name,
-        "selected_target_column": selected_target_column or completion_source_column,
+        "selected_target_column": selected_target_column,
         "total_rows": total_rows,
         "kept_rows": kept_rows,
-        "dropped_rows_missing_target": dropped_rows,
+        "dropped_rows_invalid_examples": dropped_rows,
         "dropped_fraction": (dropped_rows / total_rows) if total_rows else 0.0,
+        "dropped_rows_by_field": dropped_rows_by_field,
     }
+    for field_name, dropped_count in dropped_rows_by_field.items():
+        diagnostic[f"dropped_rows_missing_{field_name}"] = dropped_count
+    if "completion" in dropped_rows_by_field:
+        diagnostic["dropped_rows_missing_target"] = dropped_rows_by_field["completion"]
 
     if dropped_rows <= 0:
         return dataset, diagnostic
@@ -586,18 +641,70 @@ def _summarize_preprocessing_diagnostics(entries: list[dict[str, Any]]) -> dict[
 
     total_rows = sum(int(entry.get("total_rows", 0)) for entry in entries)
     kept_rows = sum(int(entry.get("kept_rows", 0)) for entry in entries)
-    dropped_rows = sum(int(entry.get("dropped_rows_missing_target", 0)) for entry in entries)
+    dropped_invalid_rows = sum(int(entry.get("dropped_rows_invalid_examples", 0)) for entry in entries)
+    dropped_missing_target_rows = sum(int(entry.get("dropped_rows_missing_target", 0)) for entry in entries)
+    dropped_rows_by_field: dict[str, int] = {}
 
-    return {
-        "missing_target_label_filtering": {
-            "policy": "drop_missing_selected_target_labels",
+    for entry in entries:
+        entry_field_counts = entry.get("dropped_rows_by_field")
+        if not isinstance(entry_field_counts, dict):
+            continue
+        for field_name, count in entry_field_counts.items():
+            if not isinstance(field_name, str):
+                continue
+            dropped_rows_by_field[field_name] = dropped_rows_by_field.get(field_name, 0) + int(count)
+
+    summary = {
+        "invalid_sft_example_filtering": {
+            "policy": "drop_rows_with_blank_required_sft_fields",
             "total_rows": total_rows,
             "kept_rows": kept_rows,
-            "dropped_rows_missing_target": dropped_rows,
-            "dropped_fraction": (dropped_rows / total_rows) if total_rows else 0.0,
+            "dropped_rows_invalid_examples": dropped_invalid_rows,
+            "dropped_fraction": (dropped_invalid_rows / total_rows) if total_rows else 0.0,
+            "dropped_rows_by_field": dropped_rows_by_field,
             "datasets": entries,
         }
     }
+
+    if dropped_missing_target_rows > 0:
+        summary["missing_target_label_filtering"] = {
+            "policy": "drop_missing_selected_target_labels",
+            "total_rows": total_rows,
+            "kept_rows": kept_rows,
+            "dropped_rows_missing_target": dropped_missing_target_rows,
+            "dropped_fraction": (dropped_missing_target_rows / total_rows) if total_rows else 0.0,
+            "datasets": entries,
+        }
+
+    return summary
+
+
+def _drop_blank_normalized_sft_rows(
+    dataset: Any,
+    required_fields: tuple[str, ...],
+    *,
+    dataset_label: str,
+) -> Any:
+    total_rows = len(dataset)
+    kept_indices: list[int] = []
+    field_values = {field_name: dataset[field_name] for field_name in required_fields}
+
+    for index in range(total_rows):
+        if all(
+            not _is_missing_manifest_value(field_values[field_name][index])
+            for field_name in required_fields
+        ):
+            kept_indices.append(index)
+
+    if len(kept_indices) == total_rows:
+        return dataset
+    if not kept_indices:
+        required_field_list = ", ".join(required_fields)
+        raise ValueError(
+            f"{dataset_label} has no usable rows after dropping examples with blank required "
+            f"field(s): {required_field_list}."
+        )
+    return dataset.select(kept_indices)
 
 
 def _transform_dataset_with_normalization(dataset_id: str, dataset: Any, entry: dict[str, Any]) -> Any:
@@ -625,6 +732,13 @@ def _transform_dataset_with_normalization(dataset_id: str, dataset: Any, entry: 
         text_field = _require_normalization_field(fields, "text", dataset_id)
         required_columns.update(_normalization_field_columns(text_field))
         _assert_columns_exist(dataset, sorted(required_columns), dataset_id)
+        unsupported_columns = _find_non_text_required_columns(dataset, sorted(required_columns))
+        if unsupported_columns:
+            raise ValueError(
+                f"Prepared dataset `{dataset_id}` normalization references unsupported image/blob columns "
+                f"{unsupported_columns}. This trainer is text-only; remove those columns from "
+                "`normalization.source_columns` and prompt templates."
+            )
         return dataset.map(
             lambda example: {"text": _render_normalization_field(example, text_field, "text", dataset_id)},
             remove_columns=list(dataset.column_names),
@@ -637,6 +751,13 @@ def _transform_dataset_with_normalization(dataset_id: str, dataset: Any, entry: 
         required_columns.update(_normalization_field_columns(prompt_field))
         required_columns.update(_normalization_field_columns(completion_field))
         _assert_columns_exist(dataset, sorted(required_columns), dataset_id)
+        unsupported_columns = _find_non_text_required_columns(dataset, sorted(required_columns))
+        if unsupported_columns:
+            raise ValueError(
+                f"Prepared dataset `{dataset_id}` normalization references unsupported image/blob columns "
+                f"{unsupported_columns}. This trainer is text-only; remove those columns from "
+                "`normalization.source_columns` and prompt templates."
+            )
         return dataset.map(
             lambda example: {
                 "prompt": _render_normalization_field(example, prompt_field, "prompt", dataset_id),
@@ -672,20 +793,26 @@ def _prepare_prepared_dataset_entry(
         raise ValueError(f"Prepared dataset `{dataset_id}` normalization must be an object.")
 
     diagnostics = None
-    filtered_dataset = dataset
+    prepared_dataset = _transform_dataset_with_normalization(dataset_id, dataset, entry)
     shape = _require_manifest_string(normalization, "shape", dataset_id)
-    if shape == "prompt_completion":
-        fields = _require_manifest_mapping(normalization, "fields")
-        completion_field = _require_normalization_field(fields, "completion", dataset_id)
-        filtered_dataset, diagnostics = _drop_missing_completion_rows(
+    if shape == "text":
+        prepared_dataset, diagnostics = _drop_invalid_required_sft_rows(
             dataset_id,
-            dataset,
-            completion_field,
+            prepared_dataset,
+            ("text",),
+            split_name=split_name,
+            selected_target_column=None,
+        )
+    elif shape == "prompt_completion":
+        prepared_dataset, diagnostics = _drop_invalid_required_sft_rows(
+            dataset_id,
+            prepared_dataset,
+            ("prompt", "completion"),
             split_name=split_name,
             selected_target_column=_maybe_none(entry.get("selected_target_column")),
         )
 
-    return _transform_dataset_with_normalization(dataset_id, filtered_dataset, entry), diagnostics
+    return prepared_dataset, diagnostics
 
 
 def _dataset_column_signature(dataset: Any) -> tuple[str, ...]:
@@ -1045,6 +1172,11 @@ def _normalize_sft_dataset(dataset: Any, tokenizer: Any, apply_chat_template: An
             remove_columns=list(dataset.column_names),
             desc="Normalizing SFT text dataset",
         )
+        normalized = _drop_blank_normalized_sft_rows(
+            normalized,
+            ("text",),
+            dataset_label="SFT text dataset",
+        )
         return normalized, "language_modeling"
 
     if "messages" in column_names:
@@ -1059,6 +1191,11 @@ def _normalize_sft_dataset(dataset: Any, tokenizer: Any, apply_chat_template: An
             normalize_messages,
             remove_columns=list(dataset.column_names),
             desc="Applying chat template to SFT messages dataset",
+        )
+        normalized = _drop_blank_normalized_sft_rows(
+            normalized,
+            ("text",),
+            dataset_label="SFT messages dataset",
         )
         return normalized, "language_modeling"
 
@@ -1081,6 +1218,11 @@ def _normalize_sft_dataset(dataset: Any, tokenizer: Any, apply_chat_template: An
             normalize_prompt_completion,
             remove_columns=list(dataset.column_names),
             desc="Normalizing SFT prompt-completion dataset",
+        )
+        normalized = _drop_blank_normalized_sft_rows(
+            normalized,
+            ("prompt", "completion"),
+            dataset_label="SFT prompt-completion dataset",
         )
         return normalized, "prompt_completion"
 

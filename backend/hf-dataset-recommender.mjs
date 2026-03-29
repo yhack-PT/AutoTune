@@ -4,6 +4,7 @@ import { pathToFileURL } from "node:url";
 
 import {
   extractRowsFromPreview,
+  filterSourceSchemaForTextOnlyTraining,
   inferCompatibleMethodsFromNormalization,
   inferClassificationTargetCandidates,
   inferDeterministicNormalization,
@@ -984,14 +985,26 @@ async function enrichCandidates(candidates, context, options = {}) {
       ? schemaPreview.features.map((feature) => String(feature?.name ?? "")).filter(Boolean)
       : [];
     const sampleRows = extractRowsFromPreview(schemaPreview).slice(0, 3);
-    const rowKeys = uniqueStrings(sampleRows.flatMap((row) => Object.keys(row ?? {})));
-    const availableColumns = uniqueStrings([...featureNames, ...rowKeys]);
+    const textOnlySourceSchema = filterSourceSchemaForTextOnlyTraining(featureNames, sampleRows);
+    const availableColumns = textOnlySourceSchema.available_columns;
     const sourceSchema = {
       available_columns: availableColumns,
-      sample_rows: sampleRows.map((row) => summarizeRow(row)),
+      sample_rows: textOnlySourceSchema.sample_rows.map((row) => summarizeRow(row)),
+      excluded_columns: textOnlySourceSchema.excluded_columns,
     };
-    const directCompatibility = inferDeterministicNormalization(availableColumns, sampleRows);
-    const directTargetCandidates = inferClassificationTargetCandidates(availableColumns, sampleRows);
+    if (textOnlySourceSchema.excluded_columns.length > 0) {
+      warnings.push(
+        `Excluded non-text image/blob columns for text-only training: ${textOnlySourceSchema.excluded_columns.join(", ")}.`,
+      );
+    }
+    const directCompatibility = inferDeterministicNormalization(
+      availableColumns,
+      textOnlySourceSchema.sample_rows,
+    );
+    const directTargetCandidates = inferClassificationTargetCandidates(
+      availableColumns,
+      textOnlySourceSchema.sample_rows,
+    );
 
     let compatibilityStatus = directCompatibility.compatibility_status;
     let compatibilityReason = directCompatibility.compatibility_reason;
@@ -1293,6 +1306,7 @@ function buildOpenAINormalizationPrompt(candidate, context, sourceSchema) {
     "Use the native dataset field names exactly as provided.",
     "Return usable=false when the schema cannot support a meaningful deterministic text or prompt/completion normalization.",
     "Use template_synthesis only when direct column mapping is impossible.",
+    "Do not use image, pixel, scan, DICOM, or other binary/media columns in prompt or completion text.",
     "Avoid likely identifier columns such as ticket ids, customer ids, phone numbers, and other obvious PII unless they are essential.",
     "When multiple plausible label columns exist, choose one target column and record ambiguity_warnings instead of failing.",
     `Objective: ${context.analysis?.domain_summary || ""}`,
@@ -1302,6 +1316,7 @@ function buildOpenAINormalizationPrompt(candidate, context, sourceSchema) {
     `Description: ${candidate.description ?? ""}`,
     `Warnings: ${JSON.stringify(candidate.warnings ?? [])}`,
     `Schema signals: ${JSON.stringify(candidate.schema_signals ?? [])}`,
+    `Excluded non-text columns: ${JSON.stringify(sourceSchema?.excluded_columns ?? [])}`,
     `Available columns: ${JSON.stringify(sourceSchema?.available_columns ?? [])}`,
     `Sample rows: ${JSON.stringify(sourceSchema?.sample_rows ?? [])}`,
   ].join("\n");

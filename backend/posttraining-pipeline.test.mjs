@@ -9,10 +9,14 @@ import {
   recommendDatasets,
   RecommendationFailure,
 } from "./hf-dataset-recommender.mjs";
-import { inferDeterministicNormalization } from "./posttraining-normalization.mjs";
+import {
+  filterSourceSchemaForTextOnlyTraining,
+  inferDeterministicNormalization,
+} from "./posttraining-normalization.mjs";
 import {
   buildSpecPrompt,
   getCompilerOverridesConfigPath,
+  resolveConfiguredSftGpuType,
   resolveConfiguredSftNumTrainEpochs,
   runCompiler,
 } from "./posttraining-spec-compiler.mjs";
@@ -529,6 +533,56 @@ test("compiler override can force a different SFT epoch count than the planner p
   }
 });
 
+test("compiler override can force a different SFT GPU type than the planner proposed", async () => {
+  const previousOverridePath = process.env.POSTTRAINING_COMPILER_OVERRIDES_PATH;
+
+  try {
+    await withTempDir(async (tempRoot) => {
+      const overridesPath = path.join(tempRoot, "compiler-overrides.yaml");
+      process.env.POSTTRAINING_COMPILER_OVERRIDES_PATH = overridesPath;
+      await writeFile(overridesPath, "sft_gpu_type: l40s\n", "utf8");
+
+      assert.equal(getCompilerOverridesConfigPath(), overridesPath);
+      assert.equal(resolveConfiguredSftGpuType(), "L40S");
+
+      const enrichedCandidate = buildDirectCompatibleCandidate();
+      const recommendation = await recommendDatasets(buildPlan(), {
+        discoverCandidates: async () => [enrichedCandidate],
+        enrichCandidates: async () => [enrichedCandidate],
+        rankCandidates: async () => [toRecommendedCandidate(enrichedCandidate)],
+        skipDebugWrite: true,
+      });
+
+      const inputPath = path.join(tempRoot, "recommendation.json");
+      await writeFile(inputPath, `${JSON.stringify(recommendation, null, 2)}\n`, "utf8");
+
+      const result = await runCompiler(
+        {
+          inputPath,
+          outputRoot: tempRoot,
+          jobId: "gpu-override-job",
+          objectiveSummary: "Classify support tickets.",
+        },
+        {
+          specPlanner: async () => buildSpec("acme/support-ticket-bodies"),
+        },
+      );
+
+      const compiledConfigRaw = await readFile(result.compiled_config_path, "utf8");
+      assert.match(compiledConfigRaw, /gpu_type:\s*"L40S"/);
+
+      const specRaw = await readFile(result.spec_path, "utf8");
+      assert.match(specRaw, /Compiler override applied: gpu_type=L40S\./);
+    });
+  } finally {
+    if (previousOverridePath === undefined) {
+      delete process.env.POSTTRAINING_COMPILER_OVERRIDES_PATH;
+    } else {
+      process.env.POSTTRAINING_COMPILER_OVERRIDES_PATH = previousOverridePath;
+    }
+  }
+});
+
 test("deterministic classification normalization omits sampled label constraints", () => {
   const normalization = inferDeterministicNormalization(
     ["body", "priority"],
@@ -549,6 +603,29 @@ test("deterministic classification normalization omits sampled label constraints
     normalization.normalization_proposal.fields.prompt.template,
     /Label:\n$/,
   );
+});
+
+test("text-only schema filtering strips image blob columns from sampled source rows", () => {
+  const filtered = filterSourceSchemaForTextOnlyTraining(
+    ["image", "image_id", "caption", "cui"],
+    [
+      {
+        image: { bytes: "iVBORw0KGgoAAAANSUhEUgAA", path: null },
+        image_id: "study-1",
+        caption: "Portable chest radiograph shows bibasilar opacities.",
+        cui: "atelectasis",
+      },
+    ],
+  );
+
+  assert.deepEqual(filtered.excluded_columns, ["image", "image_id"]);
+  assert.deepEqual(filtered.available_columns, ["caption", "cui"]);
+  assert.deepEqual(filtered.sample_rows, [
+    {
+      caption: "Portable chest radiograph shows bibasilar opacities.",
+      cui: "atelectasis",
+    },
+  ]);
 });
 
 test("a direct-compatible dataset survives recommendation and compiles", async () => {

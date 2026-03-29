@@ -17,6 +17,11 @@ const IDENTIFIER_VALUE_PATTERNS = [
   /^[^\s@]+@[^\s@]+\.[^\s@]+$/,
 ];
 
+const NON_TEXT_COLUMN_PATTERNS = [
+  /(^|_)(image|images|img|photo|picture|pixel|pixels|frame|frames)(_|$)/i,
+  /(^|_)(scan|dicom|xray|x_ray|mammogram|thumbnail)(_|$)/i,
+];
+
 const TEXT_COLUMN_CANDIDATES = [
   "text",
   "body",
@@ -80,6 +85,75 @@ const CONTEXT_COLUMN_CANDIDATES = [
 
 export function uniqueStrings(values) {
   return [...new Set((values ?? []).filter(Boolean))];
+}
+
+function isBinaryArrayLike(value) {
+  if (typeof Buffer !== "undefined" && typeof Buffer.isBuffer === "function" && Buffer.isBuffer(value)) {
+    return true;
+  }
+  if (typeof ArrayBuffer !== "undefined") {
+    if (value instanceof ArrayBuffer) {
+      return true;
+    }
+    if (ArrayBuffer.isView(value)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function looksLikeImagePayloadValue(value) {
+  if (value === null || value === undefined) {
+    return false;
+  }
+  if (isBinaryArrayLike(value)) {
+    return true;
+  }
+  if (typeof value === "string") {
+    return /^data:image\//i.test(value.trim());
+  }
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const normalizedKeys = new Set(Object.keys(value).map((key) => normalizeKey(key)));
+    if (normalizedKeys.has("bytes") || normalizedKeys.has("blob") || normalizedKeys.has("pixel_values")) {
+      return true;
+    }
+    if (
+      (normalizedKeys.has("path") || normalizedKeys.has("src") || normalizedKeys.has("url")) &&
+      (normalizedKeys.has("bytes") || normalizedKeys.has("height") || normalizedKeys.has("width"))
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function looksLikeNonTextColumn(columnName, sampleRows) {
+  if (NON_TEXT_COLUMN_PATTERNS.some((pattern) => pattern.test(String(columnName ?? "")))) {
+    return true;
+  }
+  return sampleColumnValues(sampleRows, columnName).some((value) => looksLikeImagePayloadValue(value));
+}
+
+export function filterSourceSchemaForTextOnlyTraining(featureNames, sampleRows) {
+  const normalizedRows = Array.isArray(sampleRows)
+    ? sampleRows.filter((row) => row && typeof row === "object" && !Array.isArray(row))
+    : [];
+  const allColumns = uniqueStrings([
+    ...(Array.isArray(featureNames) ? featureNames.map((value) => String(value).trim()).filter(Boolean) : []),
+    ...normalizedRows.flatMap((row) => Object.keys(row)),
+  ]);
+  const excludedColumns = allColumns.filter((columnName) => looksLikeNonTextColumn(columnName, normalizedRows));
+  const excludedColumnSet = new Set(excludedColumns);
+
+  return {
+    available_columns: allColumns.filter((columnName) => !excludedColumnSet.has(columnName)),
+    sample_rows: normalizedRows.map((row) =>
+      Object.fromEntries(
+        Object.entries(row).filter(([columnName]) => !excludedColumnSet.has(columnName)),
+      )
+    ),
+    excluded_columns: excludedColumns,
+  };
 }
 
 export function normalizeOptionalString(value) {
@@ -430,7 +504,9 @@ export function validateNormalizationProposal(normalizationProposal, availableCo
 }
 
 export function inferDeterministicNormalization(featureNames, sampleRows) {
-  const availableColumns = uniqueStrings(featureNames ?? []);
+  const textOnlySchema = filterSourceSchemaForTextOnlyTraining(featureNames, sampleRows);
+  const availableColumns = textOnlySchema.available_columns;
+  const filteredSampleRows = textOnlySchema.sample_rows;
   const columnMap = new Map(availableColumns.map((name) => [normalizeKey(name), name]));
 
   const promptColumn = firstMatchingColumn(columnMap, PROMPT_COLUMN_CANDIDATES);
@@ -470,7 +546,7 @@ export function inferDeterministicNormalization(featureNames, sampleRows) {
   }
 
   const inputColumn = firstMatchingColumn(columnMap, TEXT_COLUMN_CANDIDATES);
-  const targetCandidates = inferClassificationTargetCandidates(availableColumns, sampleRows);
+  const targetCandidates = inferClassificationTargetCandidates(availableColumns, filteredSampleRows);
   const labelColumn = targetCandidates[0]?.column ?? null;
   if (inputColumn && labelColumn) {
     const ambiguityWarnings =
@@ -531,7 +607,7 @@ export function inferDeterministicNormalization(featureNames, sampleRows) {
     "dialogue",
     "chat",
   ]);
-  if (messagesColumn && looksLikeMessages(getSampleValue(sampleRows ?? [], messagesColumn))) {
+  if (messagesColumn && looksLikeMessages(getSampleValue(filteredSampleRows, messagesColumn))) {
     return {
       compatibility_status: "incompatible",
       compatibility_reason:

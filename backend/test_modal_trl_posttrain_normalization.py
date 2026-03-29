@@ -287,6 +287,44 @@ class ModalTrlNormalizationTests(unittest.TestCase):
             2,
         )
 
+    def test_prepare_prepared_dataset_entry_rejects_image_blob_source_columns(self):
+        dataset = FakeDataset(
+            [
+                {
+                    "image": {"bytes": "iVBORw0KGgoAAAANSUhEUgAA", "path": None},
+                    "caption": "Portable chest radiograph with right basilar opacity.",
+                    "cui": "atelectasis",
+                }
+            ]
+        )
+        entry = {
+            "dataset": "acme/radiology-images",
+            "selected_target_column": "cui",
+            "normalization": {
+                "shape": "prompt_completion",
+                "source_columns": ["image", "caption", "cui"],
+                "fields": {
+                    "text": None,
+                    "prompt": {
+                        "source_column": None,
+                        "template": "Image bytes: {image}\nCaption: {caption}\n\nLabel:",
+                        "value_mapping": None,
+                    },
+                    "completion": {
+                        "source_column": "cui",
+                        "template": None,
+                        "value_mapping": None,
+                    },
+                },
+            },
+        }
+
+        with self.assertRaisesRegex(
+            ValueError,
+            r"acme/radiology-images.*unsupported image/blob columns \['image'\]",
+        ):
+            MODULE._prepare_prepared_dataset_entry(dataset, entry, split_name="train")
+
     def test_load_prepared_manifest_datasets_fails_early_when_all_target_labels_are_missing(self):
         config = MODULE._config_from_mapping(
             {

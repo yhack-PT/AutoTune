@@ -46,6 +46,7 @@ const ALLOWED_GPUS = ["A10", "L40S", "H100"];
 
 export const DEFAULT_COMPILER_OVERRIDES = Object.freeze({
   sft_num_train_epochs: null,
+  sft_gpu_type: null,
 });
 
 let dotEnvLoaded = false;
@@ -142,6 +143,23 @@ export function resolveConfiguredSftNumTrainEpochs(overrides = loadCompilerOverr
     );
   }
   return numericValue;
+}
+
+export function resolveConfiguredSftGpuType(overrides = loadCompilerOverrides()) {
+  const overrideValue = normalizeOptionalString(overrides.sft_gpu_type);
+  if (overrideValue === null) {
+    return null;
+  }
+
+  const matchedGpu = ALLOWED_GPUS.find(
+    (gpuType) => gpuType.toLowerCase() === overrideValue.toLowerCase(),
+  );
+  if (!matchedGpu) {
+    throw new Error(
+      `compiler override sft_gpu_type must be one of ${ALLOWED_GPUS.join(", ")} or null.`,
+    );
+  }
+  return matchedGpu;
 }
 
 function uniqueStrings(values) {
@@ -1178,6 +1196,8 @@ function validateAndFinalizeSpec(
   }
 
   const compilerOverrides = spec.method === "sft" ? loadCompilerOverrides() : DEFAULT_COMPILER_OVERRIDES;
+  const overriddenSftGpuType =
+    spec.method === "sft" ? resolveConfiguredSftGpuType(compilerOverrides) : null;
   const finalized = {
     job_id: jobId,
     objective_summary: normalizeOptionalString(spec.objective_summary) ?? "",
@@ -1191,7 +1211,7 @@ function validateAndFinalizeSpec(
     },
     selected_datasets: normalizeWeights(selectedDatasets),
     compute_preset: {
-      gpu_type: compute.gpu_type,
+      gpu_type: overriddenSftGpuType ?? compute.gpu_type,
       max_length: compute.max_length,
       per_device_train_batch_size: compute.per_device_train_batch_size,
       per_device_eval_batch_size: compute.per_device_eval_batch_size,
@@ -1223,6 +1243,16 @@ function validateAndFinalizeSpec(
   ) {
     finalized.notes.push(
       `Compiler override applied: num_train_epochs=${finalized.training_params.num_train_epochs}.`,
+    );
+  }
+
+  if (
+    spec.method === "sft" &&
+    overriddenSftGpuType !== null &&
+    compute.gpu_type !== finalized.compute_preset.gpu_type
+  ) {
+    finalized.notes.push(
+      `Compiler override applied: gpu_type=${finalized.compute_preset.gpu_type}.`,
     );
   }
 

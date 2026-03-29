@@ -598,6 +598,22 @@ async function runTrainingStage(jobId, compiledConfig) {
           droppedRowsMissingTarget: Number(entry?.dropped_rows_missing_target ?? 0),
         }))
     : [];
+  const invalidSftFiltering =
+    trainingResult?.preprocessing_diagnostics?.invalid_sft_example_filtering ?? null;
+  const droppedInvalidSftRows = Number(invalidSftFiltering?.dropped_rows_invalid_examples ?? 0);
+  const invalidSftDatasets = Array.isArray(invalidSftFiltering?.datasets)
+    ? invalidSftFiltering.datasets
+        .filter((entry) => Number(entry?.dropped_rows_invalid_examples ?? 0) > 0)
+        .map((entry) => ({
+          dataset: entry?.dataset ?? null,
+          split: entry?.split ?? null,
+          droppedRowsInvalidExamples: Number(entry?.dropped_rows_invalid_examples ?? 0),
+          droppedRowsByField:
+            entry && typeof entry === "object" && entry.dropped_rows_by_field
+              ? entry.dropped_rows_by_field
+              : null,
+        }))
+    : [];
 
   await logger.emit({
     source: "orchestrator",
@@ -610,6 +626,7 @@ async function runTrainingStage(jobId, compiledConfig) {
       globalStep: trainingResult.global_step,
       evalExamples: trainingResult.eval_examples,
       droppedRowsMissingTargetLabels: droppedMissingTargetRows,
+      droppedRowsInvalidSftExamples: droppedInvalidSftRows,
     },
   });
 
@@ -621,6 +638,18 @@ async function runTrainingStage(jobId, compiledConfig) {
       data: {
         droppedRowsMissingTargetLabels: droppedMissingTargetRows,
         droppedDatasets,
+      },
+    });
+  }
+
+  if (droppedInvalidSftRows > 0) {
+    await logger.emit({
+      source: "orchestrator",
+      level: "warn",
+      message: "Dropped invalid SFT examples with blank required fields before training.",
+      data: {
+        droppedRowsInvalidSftExamples: droppedInvalidSftRows,
+        invalidSftDatasets,
       },
     });
   }
