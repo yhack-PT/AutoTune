@@ -105,13 +105,6 @@ export function getUiProgressHistoryByStage(logs, options = {}) {
     }
 
     const stageHistory = historyByStage[parsed.stageId] ?? [];
-    const lastItem = stageHistory[stageHistory.length - 1] ?? null;
-
-    if (lastItem && lastItem.text === parsed.text && lastItem.tone === parsed.tone) {
-      historyByStage[parsed.stageId] = stageHistory;
-      continue;
-    }
-
     stageHistory.push({
       id: `${parsed.stageId}:${eventIndex}`,
       text: parsed.text,
@@ -141,6 +134,33 @@ export function getLatestUiProgressByStage(logs, options = {}) {
   }
 
   return latestByStage;
+}
+
+export function mergeStageProgressById(previousProgress = {}, nextProgress = {}) {
+  const mergedProgress = {};
+  const stageIds = new Set([
+    ...Object.keys(previousProgress ?? {}),
+    ...Object.keys(nextProgress ?? {}),
+  ]);
+
+  for (const stageId of stageIds) {
+    const previousItems = Array.isArray(previousProgress?.[stageId])
+      ? previousProgress[stageId]
+      : [];
+    const nextItems = Array.isArray(nextProgress?.[stageId]) ? nextProgress[stageId] : [];
+
+    if (nextItems.length === 0) {
+      if (previousItems.length > 0) {
+        mergedProgress[stageId] = previousItems;
+      }
+      continue;
+    }
+
+    mergedProgress[stageId] =
+      nextItems.length >= previousItems.length ? nextItems : previousItems;
+  }
+
+  return mergedProgress;
 }
 
 export function getSidebarStageProgress({

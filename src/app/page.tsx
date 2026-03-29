@@ -6,7 +6,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { ArrowUp, Sparkles, Plus, Play, Rewind, ChevronDown } from "lucide-react";
 import { cn } from "@/lib/utils";
 import ReactMarkdown from "react-markdown";
-import { getSidebarStageProgress } from "@/lib/posttraining-progress.mjs";
+import { getSidebarStageProgress, mergeStageProgressById } from "@/lib/posttraining-progress.mjs";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -457,7 +457,9 @@ export default function ChatPage() {
         setVisibleStageIds(nextVisibleStageIds);
         setCompletedStageIds(nextCompletedStageIds);
         setFailedStageId(nextFailedStageId);
-        setStageProgressById(nextStageProgressById);
+        setStageProgressById((previousStageProgressById) =>
+          mergeStageProgressById(previousStageProgressById, nextStageProgressById),
+        );
 
         // Track stage changes (no chat bubbles — ProcessingIndicator handles it)
         if (currentStageId !== lastStageRef.current) {
@@ -503,7 +505,9 @@ export default function ChatPage() {
           setCompletedStageIds(nextVisibleStageIds);
           setActiveStageIndex(null);
           setFailedStageId(null);
-          setStageProgressById(nextStageProgressById);
+          setStageProgressById((previousStageProgressById) =>
+            mergeStageProgressById(previousStageProgressById, nextStageProgressById),
+          );
           setMessages((prev) => [
             ...prev,
             {
@@ -521,7 +525,9 @@ export default function ChatPage() {
           stopPolling();
         } else if (job.status === "failed") {
           setActiveStageIndex(null);
-          setStageProgressById(nextStageProgressById);
+          setStageProgressById((previousStageProgressById) =>
+            mergeStageProgressById(previousStageProgressById, nextStageProgressById),
+          );
           setMessages((prev) => [
             ...prev,
             {

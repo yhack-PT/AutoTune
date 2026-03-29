@@ -41,6 +41,7 @@ import random
 import re
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -64,9 +65,10 @@ DEFAULT_TARGET_MODULES = [
     "up_proj",
     "down_proj",
 ]
-DEFAULT_COMPARISON_MAX_EXAMPLES = 30
+DEFAULT_COMPARISON_MAX_EXAMPLES = 15
 DEFAULT_CLASSIFICATION_EVAL_MAX_EXAMPLES = 256
 DEFAULT_GENERATION_EVAL_MAX_NEW_TOKENS = 256
+DEFAULT_GENERATION_EVAL_OPENAI_MAX_WORKERS = 4
 DEFAULT_EVAL_JUDGE_MODEL = "gpt-5.4"
 OPENAI_RESPONSES_API_URL = "https://api.openai.com/v1/responses"
 THINK_TAG_BLOCK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
@@ -305,6 +307,17 @@ def _maybe_none(value: Any) -> str | None:
         raise ValueError(f"Expected a string or null value, got {type(value).__name__}.")
     normalized = value.strip()
     return normalized or None
+
+
+def _read_positive_int_env(name: str, default: int) -> int:
+    raw_value = _maybe_none(os.environ.get(name))
+    if raw_value is None:
+        return default
+    try:
+        parsed = int(raw_value)
+    except ValueError:
+        return default
+    return parsed if parsed > 0 else default
 
 
 def _is_qwen_family_base_model(model_id: Any) -> bool:
@@ -1867,6 +1880,50 @@ def _judge_generation_outputs(
     }
 
 
+def _resolve_generation_eval_openai_max_workers(total_items: int) -> int:
+    if total_items <= 1:
+        return 1
+    configured = _read_positive_int_env(
+        "POSTTRAINING_EVAL_OPENAI_MAX_WORKERS",
+        DEFAULT_GENERATION_EVAL_OPENAI_MAX_WORKERS,
+    )
+    return max(1, min(total_items, configured))
+
+
+def _run_generation_eval_openai_tasks_with_progress(
+    items: list[Any],
+    *,
+    progress_prefix: str,
+    worker: Any,
+) -> list[Any]:
+    total_items = len(items)
+    _emit_progress_update(f"{progress_prefix} 0/{total_items}")
+    if total_items <= 0:
+        return []
+
+    max_workers = _resolve_generation_eval_openai_max_workers(total_items)
+    if max_workers == 1:
+        results = []
+        for index, item in enumerate(items, start=1):
+            results.append(worker(item))
+            _emit_progress_update(f"{progress_prefix} {index}/{total_items}")
+        return results
+
+    results: list[Any] = [None] * total_items
+    completed = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_index = {
+            executor.submit(worker, item): index
+            for index, item in enumerate(items)
+        }
+        for future in as_completed(future_to_index):
+            index = future_to_index[future]
+            results[index] = future.result()
+            completed += 1
+            _emit_progress_update(f"{progress_prefix} {completed}/{total_items}")
+    return results
+
+
 def _evaluate_classification_model_comparison(
     config: TrainConfig,
     tokenizer: Any,
@@ -1998,11 +2055,11 @@ def _evaluate_generation_model_comparison(
     sample = _sample_eval_dataset(eval_dataset, max_examples=comparison_max_examples, seed=seed)
     total_cases = len(sample)
 
-    _emit_progress_update(f"synthesizing_generation_cases 0/{total_cases}")
-    case_specs = []
-    for index, text in enumerate(sample["text"], start=1):
-        case_specs.append(_synthesize_generation_case(str(text), judge_model=judge_model))
-        _emit_progress_update(f"synthesizing_generation_cases {index}/{total_cases}")
+    case_specs = _run_generation_eval_openai_tasks_with_progress(
+        [str(text) for text in sample["text"]],
+        progress_prefix="synthesizing_generation_cases",
+        worker=lambda source_text: _synthesize_generation_case(source_text, judge_model=judge_model),
+    )
     model_inputs = [
         _build_grounded_generation_eval_prompt(case_spec["prompt"], str(source_text))
         for source_text, case_spec in zip(sample["text"], case_specs)
@@ -2053,21 +2110,35 @@ def _evaluate_generation_model_comparison(
     candidate_score_total = 0.0
     cases = []
 
-    _emit_progress_update(f"judging_generation_cases 0/{total_cases}")
-    for index, (source_text, case_spec, model_input, baseline_output, candidate_output) in enumerate(
-        zip(sample["text"], case_specs, model_inputs, baseline_outputs, candidate_outputs)
-    ):
-        judgment = _judge_generation_outputs(
-            prompt=case_spec["prompt"],
-            source_text=str(source_text),
-            reference_answer=case_spec["reference_answer"],
-            rubric=case_spec["rubric"],
-            baseline_output=baseline_output,
-            candidate_output=candidate_output,
-            judge_model=judge_model,
-            flip_order=bool(index % 2),
+    judgment_tasks = [
+        {
+            "index": index,
+            "source_text": str(source_text),
+            "case_spec": case_spec,
+            "baseline_output": baseline_output,
+            "candidate_output": candidate_output,
+        }
+        for index, (source_text, case_spec, baseline_output, candidate_output) in enumerate(
+            zip(sample["text"], case_specs, baseline_outputs, candidate_outputs)
         )
-        _emit_progress_update(f"judging_generation_cases {index + 1}/{total_cases}")
+    ]
+    judgments = _run_generation_eval_openai_tasks_with_progress(
+        judgment_tasks,
+        progress_prefix="judging_generation_cases",
+        worker=lambda task: _judge_generation_outputs(
+            prompt=task["case_spec"]["prompt"],
+            source_text=task["source_text"],
+            reference_answer=task["case_spec"]["reference_answer"],
+            rubric=task["case_spec"]["rubric"],
+            baseline_output=task["baseline_output"],
+            candidate_output=task["candidate_output"],
+            judge_model=judge_model,
+            flip_order=bool(task["index"] % 2),
+        ),
+    )
+    for index, (source_text, case_spec, model_input, baseline_output, candidate_output, judgment) in enumerate(
+        zip(sample["text"], case_specs, model_inputs, baseline_outputs, candidate_outputs, judgments)
+    ):
         winner = judgment["winner"]
         if winner == "baseline":
             baseline_wins += 1
@@ -2199,21 +2270,39 @@ def _evaluate_generation_prompt_completion_model_comparison(
         "Uses clear, coherent wording suitable for the target task style.",
     ]
 
-    _emit_progress_update(f"judging_generation_cases 0/{total_cases}")
-    for index, (prompt, reference_answer, baseline_output, candidate_output) in enumerate(
-        zip(sample["prompt"], sample["completion"], baseline_outputs, candidate_outputs)
-    ):
-        judgment = _judge_generation_outputs(
-            prompt=str(prompt),
-            source_text=str(prompt),
-            reference_answer=str(reference_answer),
-            rubric=rubric,
-            baseline_output=baseline_output,
-            candidate_output=candidate_output,
-            judge_model=judge_model,
-            flip_order=bool(index % 2),
+    judgment_tasks = [
+        {
+            "index": index,
+            "prompt": str(prompt),
+            "reference_answer": str(reference_answer),
+            "baseline_output": baseline_output,
+            "candidate_output": candidate_output,
+        }
+        for index, (prompt, reference_answer, baseline_output, candidate_output) in enumerate(
+            zip(sample["prompt"], sample["completion"], baseline_outputs, candidate_outputs)
         )
-        _emit_progress_update(f"judging_generation_cases {index + 1}/{total_cases}")
+    ]
+    judgments = _run_generation_eval_openai_tasks_with_progress(
+        judgment_tasks,
+        progress_prefix="judging_generation_cases",
+        worker=lambda task: _judge_generation_outputs(
+            prompt=task["prompt"],
+            source_text=task["prompt"],
+            reference_answer=task["reference_answer"],
+            rubric=rubric,
+            baseline_output=task["baseline_output"],
+            candidate_output=task["candidate_output"],
+            judge_model=judge_model,
+            flip_order=bool(task["index"] % 2),
+        ),
+    )
+    for prompt, reference_answer, baseline_output, candidate_output, judgment in zip(
+        sample["prompt"],
+        sample["completion"],
+        baseline_outputs,
+        candidate_outputs,
+        judgments,
+    ):
         winner = judgment["winner"]
         if winner == "baseline":
             baseline_wins += 1

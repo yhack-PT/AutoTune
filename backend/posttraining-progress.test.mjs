@@ -5,6 +5,7 @@ import {
   UI_PROGRESS_SOURCE,
   buildUiProgressEvent,
   getSidebarStageProgress,
+  mergeStageProgressById,
   parseUiProgressEvent,
 } from "../src/lib/posttraining-progress.mjs";
 
@@ -265,4 +266,72 @@ test("getSidebarStageProgress still supports an explicit maxItemsPerStage cap", 
       { id: "training:3", text: "step-4", tone: "normal" },
     ],
   );
+});
+
+test("getSidebarStageProgress keeps consecutive duplicate ui-progress items", () => {
+  const logs = [
+    buildUiProgressEvent({
+      stageId: "recommending",
+      text: "I'm searching through different datasets that could fit this request",
+    }),
+    buildUiProgressEvent({
+      stageId: "recommending",
+      text: "I'm searching through different datasets that could fit this request",
+    }),
+  ];
+
+  assert.deepEqual(
+    getSidebarStageProgress({
+      logs,
+      activeStageId: "recommending",
+      completedStageIds: [],
+      failedStageId: null,
+      jobStatus: "recommending",
+    }).recommending,
+    [
+      {
+        id: "recommending:0",
+        text: "I'm searching through different datasets that could fit this request",
+        tone: "normal",
+      },
+      {
+        id: "recommending:1",
+        text: "I'm searching through different datasets that could fit this request",
+        tone: "normal",
+      },
+    ],
+  );
+});
+
+test("mergeStageProgressById preserves previously seen bullets when a later snapshot is shorter", () => {
+  const previousProgress = {
+    recommending: [
+      { id: "recommending:0", text: "progress-1", tone: "normal" },
+      { id: "recommending:1", text: "progress-2", tone: "normal" },
+    ],
+    compiling: [
+      { id: "compiling:0", text: "compile-1", tone: "normal" },
+    ],
+  };
+  const nextProgress = {
+    recommending: [
+      { id: "recommending:0", text: "progress-1", tone: "normal" },
+    ],
+    training: [
+      { id: "training:0", text: "training-1", tone: "normal" },
+    ],
+  };
+
+  assert.deepEqual(mergeStageProgressById(previousProgress, nextProgress), {
+    recommending: [
+      { id: "recommending:0", text: "progress-1", tone: "normal" },
+      { id: "recommending:1", text: "progress-2", tone: "normal" },
+    ],
+    compiling: [
+      { id: "compiling:0", text: "compile-1", tone: "normal" },
+    ],
+    training: [
+      { id: "training:0", text: "training-1", tone: "normal" },
+    ],
+  });
 });

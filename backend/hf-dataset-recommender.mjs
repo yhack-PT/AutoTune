@@ -990,10 +990,14 @@ function buildContext(plan) {
 
 async function discoverCandidates(context) {
   const candidateMap = new Map();
+  let emittedSearchStepCount = 0;
 
   await Promise.all(
     context.search_queries.map(async (query) => {
-      logUiProgress("I'm searching through different datasets that could fit this request");
+      emittedSearchStepCount += 1;
+      logUiProgress(
+        `I'm searching through different datasets that could fit this request (${emittedSearchStepCount} of ${context.search_queries.length})`,
+      );
       logJson("searching HF datasets for query", query);
       const datasets = await searchHubDatasets(query);
       logInfo(`HF search "${query.search}" returned ${datasets.length} unique candidates`);
@@ -1103,8 +1107,12 @@ function buildSearchVariants(searchText) {
 
 async function enrichCandidates(candidates, context, options = {}) {
   logInfo(`starting enrichment for ${candidates.length} candidates`);
+  let emittedInspectionStepCount = 0;
   return mapWithConcurrency(candidates, ENRICHMENT_CONCURRENCY, async (candidate) => {
-    logUiProgress("I'm checking sample records from a few promising datasets");
+    emittedInspectionStepCount += 1;
+    logUiProgress(
+      `I'm checking sample records from a few promising datasets (${emittedInspectionStepCount} of ${candidates.length})`,
+    );
     logInfo(`enriching dataset ${candidate.id}`);
     const warnings = [];
 

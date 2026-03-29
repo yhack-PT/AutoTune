@@ -530,11 +530,19 @@ class ModalTrlNormalizationTests(unittest.TestCase):
             ]
         )
 
-        sampled_small = MODULE._sample_eval_dataset(small_dataset, max_examples=30, seed=42)
-        sampled_large = MODULE._sample_eval_dataset(large_dataset, max_examples=30, seed=42)
+        sampled_small = MODULE._sample_eval_dataset(
+            small_dataset,
+            max_examples=MODULE.DEFAULT_COMPARISON_MAX_EXAMPLES,
+            seed=42,
+        )
+        sampled_large = MODULE._sample_eval_dataset(
+            large_dataset,
+            max_examples=MODULE.DEFAULT_COMPARISON_MAX_EXAMPLES,
+            seed=42,
+        )
 
         self.assertEqual(len(sampled_small), 3)
-        self.assertEqual(len(sampled_large), 30)
+        self.assertEqual(len(sampled_large), MODULE.DEFAULT_COMPARISON_MAX_EXAMPLES)
 
     def test_reweight_train_dataset_by_provenance_groups_rows_by_dataset(self):
         train_dataset = FakeDataset(
@@ -1003,7 +1011,7 @@ class ModalTrlNormalizationTests(unittest.TestCase):
                 },
                 "evaluation_plan": {
                     "deterministic_seed": 42,
-                    "comparison_max_examples": 30,
+                    "comparison_max_examples": MODULE.DEFAULT_COMPARISON_MAX_EXAMPLES,
                     "max_examples": 64,
                 },
                 "output_name": "comparison-demo",
@@ -1091,7 +1099,7 @@ class ModalTrlNormalizationTests(unittest.TestCase):
                 },
                 "evaluation_plan": {
                     "deterministic_seed": 42,
-                    "comparison_max_examples": 30,
+                    "comparison_max_examples": MODULE.DEFAULT_COMPARISON_MAX_EXAMPLES,
                 },
                 "output_name": "generation-comparison-demo",
             }
@@ -1127,25 +1135,22 @@ class ModalTrlNormalizationTests(unittest.TestCase):
             prefix = "base" if model is base_model else "candidate"
             return f"{prefix} output for {prompt}"
 
-        judgments = iter(
-            [
-                {
-                    "winner": "candidate",
-                    "baseline_score": 6.0,
-                    "candidate_score": 8.5,
-                    "reason": "Candidate is stronger.",
-                },
-                {
-                    "winner": "tie",
-                    "baseline_score": 7.0,
-                    "candidate_score": 7.0,
-                    "reason": "Both are similar.",
-                },
-            ]
-        )
-
         MODULE._predict_generation_response = fake_generate
-        MODULE._judge_generation_outputs = lambda **kwargs: next(judgments)
+        MODULE._judge_generation_outputs = lambda **kwargs: (
+            {
+                "winner": "candidate",
+                "baseline_score": 6.0,
+                "candidate_score": 8.5,
+                "reason": "Candidate is stronger.",
+            }
+            if kwargs["prompt"] == "Prompt for First tutoring example."
+            else {
+                "winner": "tie",
+                "baseline_score": 7.0,
+                "candidate_score": 7.0,
+                "reason": "Both are similar.",
+            }
+        )
 
         try:
             comparison = MODULE._evaluate_generation_model_comparison(
@@ -1191,7 +1196,7 @@ class ModalTrlNormalizationTests(unittest.TestCase):
                 },
                 "evaluation_plan": {
                     "deterministic_seed": 42,
-                    "comparison_max_examples": 30,
+                    "comparison_max_examples": MODULE.DEFAULT_COMPARISON_MAX_EXAMPLES,
                 },
                 "output_name": "grounded-generation-comparison-demo",
             }
@@ -1289,7 +1294,7 @@ class ModalTrlNormalizationTests(unittest.TestCase):
                 },
                 "evaluation_plan": {
                     "deterministic_seed": 42,
-                    "comparison_max_examples": 30,
+                    "comparison_max_examples": MODULE.DEFAULT_COMPARISON_MAX_EXAMPLES,
                 },
                 "output_name": "generation-comparison-strip-think",
             }
@@ -1377,7 +1382,7 @@ class ModalTrlNormalizationTests(unittest.TestCase):
                 },
                 "evaluation_plan": {
                     "deterministic_seed": 42,
-                    "comparison_max_examples": 30,
+                    "comparison_max_examples": MODULE.DEFAULT_COMPARISON_MAX_EXAMPLES,
                 },
                 "output_name": "generation-prompt-completion-demo",
             }
@@ -1407,26 +1412,21 @@ class ModalTrlNormalizationTests(unittest.TestCase):
             captured_prompts.append(prompt)
             return ("base" if model is base_model else "candidate") + f" output for {prompt}"
 
-        judgments = iter(
-            [
-                {
+        def fake_judge(**kwargs):
+            captured_judgments.append(kwargs)
+            if kwargs["prompt"] == "Solve problem 1":
+                return {
                     "winner": "candidate",
                     "baseline_score": 2.0,
                     "candidate_score": 8.0,
                     "reason": "Candidate is better.",
-                },
-                {
-                    "winner": "tie",
-                    "baseline_score": 7.0,
-                    "candidate_score": 7.0,
-                    "reason": "Both are similar.",
-                },
-            ]
-        )
-
-        def fake_judge(**kwargs):
-            captured_judgments.append(kwargs)
-            return next(judgments)
+                }
+            return {
+                "winner": "tie",
+                "baseline_score": 7.0,
+                "candidate_score": 7.0,
+                "reason": "Both are similar.",
+            }
 
         MODULE._predict_generation_response = fake_generate
         MODULE._judge_generation_outputs = fake_judge
@@ -1447,8 +1447,10 @@ class ModalTrlNormalizationTests(unittest.TestCase):
 
         self.assertEqual(len(captured_prompts), 4)
         self.assertEqual(captured_prompts[0], "Solve problem 1")
-        self.assertEqual(captured_judgments[0]["reference_answer"], "Gold answer 1")
-        self.assertEqual(captured_judgments[1]["reference_answer"], "Gold answer 2")
+        self.assertEqual(
+            sorted(judgment["reference_answer"] for judgment in captured_judgments),
+            ["Gold answer 1", "Gold answer 2"],
+        )
         self.assertEqual(comparison["summary"]["candidate_wins"], 1)
         self.assertEqual(comparison["summary"]["ties"], 1)
         self.assertEqual(comparison["cases"][0]["prompt"], "Solve problem 1")

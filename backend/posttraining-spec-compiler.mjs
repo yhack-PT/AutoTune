@@ -48,6 +48,7 @@ const SFT_LEARNING_RATE_MAX = 1e-3;
 
 const ALLOWED_GPUS = ["A10", "L40S", "H100"];
 const DEFAULT_MERGED_SFT_HOLDOUT_FRACTION = 0.1;
+const DEFAULT_COMPARISON_MAX_EXAMPLES = 15;
 const COMPILER_GPU_ALIAS_TO_CANONICAL = Object.freeze({
   a10: "A10",
   a10g: "A10",
@@ -303,7 +304,7 @@ function buildEvaluationPlan(taskRequirements, numTrainEpochs = 1.0) {
     strategy: "merged_sft_holdout",
     holdout_fraction: resolveMergedSftHoldoutFraction(numTrainEpochs),
     deterministic_seed: 42,
-    comparison_max_examples: 30,
+    comparison_max_examples: DEFAULT_COMPARISON_MAX_EXAMPLES,
     include_test_split_in_source_pool: true,
     split_style:
       taskRequirements.task_family === "classification"

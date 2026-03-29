@@ -1188,7 +1188,11 @@ test("recommendDatasets emits ui-progress lines for query search and candidate r
 
     assert.equal(recommendation.recommended_datasets.length, 1);
     assert.equal(recommendation.recommended_datasets[0].dataset, candidate.dataset);
-    assert.ok(progressMessages.includes("I'm searching through different datasets that could fit this request"));
+    assert.ok(
+      progressMessages.some((message) =>
+        message.startsWith("I'm searching through different datasets that could fit this request ("),
+      ),
+    );
     assert.ok(progressMessages.includes("I'm reviewing the most promising dataset options"));
   } finally {
     globalThis.fetch = originalFetch;
@@ -1832,7 +1836,7 @@ test("a direct-compatible dataset survives recommendation and compiles", async (
     assert.equal(result.selected_datasets[0].normalization_shape, "prompt_completion");
     assert.deepEqual(result.selected_datasets[0].source_splits, ["train"]);
     assert.equal(result.spec.evaluation_plan.strategy, "merged_sft_holdout");
-    assert.equal(result.spec.evaluation_plan.comparison_max_examples, 30);
+    assert.equal(result.spec.evaluation_plan.comparison_max_examples, 15);
     assert.equal(result.spec.evaluation_plan.split_style, "stratified_completion_label");
     const manifest = JSON.parse(await readFile(result.manifest_path, "utf8"));
     assert.equal(manifest.selected_datasets[0].normalization.shape, "prompt_completion");
@@ -1881,7 +1885,7 @@ test("a raw-text generation dataset survives recommendation and compiles", async
     assert.deepEqual(result.selected_datasets[0].source_splits, ["train"]);
     assert.equal(result.spec.task_spec.task_family, "generation");
     assert.equal(result.spec.evaluation_plan.strategy, "merged_sft_holdout");
-    assert.equal(result.spec.evaluation_plan.comparison_max_examples, 30);
+    assert.equal(result.spec.evaluation_plan.comparison_max_examples, 15);
     assert.equal(result.spec.evaluation_plan.split_style, "deterministic_random");
     assert.equal(result.compiled_config.evaluation_plan.strategy, "merged_sft_holdout");
 
