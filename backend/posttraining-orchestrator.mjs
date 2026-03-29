@@ -1,6 +1,7 @@
 import process from "node:process";
 import path from "node:path";
 import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -248,7 +249,10 @@ function parseCliArgs(argv) {
 }
 
 function resolveModalBin() {
-  return process.env.MODAL_BIN || "modal";
+  if (process.env.MODAL_BIN) return process.env.MODAL_BIN;
+  const venvModal = path.join(repoRoot, ".venv", "bin", "modal");
+  if (existsSync(venvModal)) return venvModal;
+  return "modal";
 }
 
 function emitProcessOutput(logger, source, chunk) {
