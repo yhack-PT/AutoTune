@@ -539,7 +539,6 @@ function validateUserInputs(input) {
     return {
       description,
       domain: null,
-      qualityTier: null,
       useCase: null,
     };
   }
@@ -556,18 +555,15 @@ function validateUserInputs(input) {
     normalizeOptionalString(input.prompt) ??
     null;
   if (description) {
-    const qualityTier = normalizeQualityTier(input.qualityTier);
     return {
       description,
       domain: normalizeOptionalString(input.domain),
-      qualityTier,
       useCase: normalizeOptionalString(input.useCase),
     };
   }
 
   const domain = normalizeOptionalString(input.domain);
   const useCase = normalizeOptionalString(input.useCase);
-  const qualityTier = normalizeQualityTier(input.qualityTier);
 
   if (!domain) {
     throw new Error("Legacy raw input requires `domain`, or provide a single `description` field.");
@@ -577,31 +573,14 @@ function validateUserInputs(input) {
   }
 
   return {
-    description: buildLegacyDescription({ domain, qualityTier, useCase }),
+    description: buildLegacyDescription({ domain, useCase }),
     domain,
-    qualityTier,
     useCase,
   };
 }
 
 function buildLegacyDescription(input) {
-  const lines = [`Domain: ${input.domain}`, `Use case: ${input.useCase}`];
-  if (input.qualityTier != null) {
-    lines.splice(1, 0, `Quality tier: ${input.qualityTier}`);
-  }
-  return lines.join("\n");
-}
-
-function normalizeQualityTier(value) {
-  if (value == null || value === "") {
-    return null;
-  }
-
-  const qualityTier = Number(value);
-  if (!Number.isInteger(qualityTier) || qualityTier < 1 || qualityTier > 5) {
-    throw new Error("`qualityTier` must be an integer between 1 and 5 when provided.");
-  }
-  return qualityTier;
+  return [`Domain: ${input.domain}`, `Use case: ${input.useCase}`].join("\n");
 }
 
 function buildOpenAIPlanningPrompt(input) {
@@ -609,22 +588,17 @@ function buildOpenAIPlanningPrompt(input) {
     "Create a Hugging Face dataset search plan for post-training a language model.",
     "This backend v1 supports only single-target classification SFT jobs.",
     `User request: ${input.description}`,
-    "Quality tier definitions for the eventual end-to-end post-training run:",
-    "1 = Fastest: target about 30-60 minutes.",
-    "2 = Fast: target about 1-3 hours.",
-    "3 = Balanced: target about 3-8 hours.",
-    "4 = Quality: target about 8-16 hours.",
-    "5 = Maximum Quality: target about 16-24 hours.",
-    input.qualityTier == null
-      ? "If the request does not specify a desired data volume or quality tier, default to a balanced tier-3 time budget."
-      : `The user explicitly requested quality tier ${input.qualityTier}; shape the time budget and guidance accordingly.`,
+    "Infer a reasonable end-to-end run-time budget directly from the user's request.",
+    "If the user states a time preference or deadline, honor it when possible.",
+    "If the user does not specify a time, infer one from task complexity, data needs, and the likely scope of a useful run.",
     "Return task_spec, analysis, search_queries, ranking_criteria, and recommendation_guidance.",
     "search_queries must contain concise Hugging Face search strings, usually 2-6 words, like something typed directly into the Hugging Face search bar.",
     "Use task_filter values only from: text-classification, question-answering, summarization, text-generation, translation, conversational, token-classification, or null.",
     "Use sort values only from: downloads, likes, trending, created.",
-    "Set min_rows based on the explicit or inferred quality tier.",
+    "Set min_rows and recommendation guidance based on the inferred time budget and task complexity.",
     "Set data_format_needed to exactly one of: instruction, completion, preference, raw_text, mixed.",
     "Set analysis.quality_tier_strategy to a concise wall-clock time-budget summary for the recommended run.",
+    "Do not use a numeric 1-5 tier or score.",
     "Do not describe analysis.quality_tier_strategy in terms of row counts, corpus size, or number of datasets.",
     "Keep mapped_task_types narrowly focused on the main fine-tuning objective, usually 1-2 task types.",
     "Keep warnings focused on practical dataset-selection risks.",

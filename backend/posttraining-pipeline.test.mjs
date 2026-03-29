@@ -391,7 +391,6 @@ test("multi-target classification requests are coerced to a single target with w
     },
     {
       domain: "customer support",
-      qualityTier: 3,
       useCase: "Classify support tickets by issue type and urgency.",
     },
   );
@@ -550,7 +549,6 @@ test("recommendDatasets planning prompt asks for time-based quality tier strateg
     await recommendDatasets(
       {
         description: "Classify customer support tickets by priority.",
-        qualityTier: 3,
       },
       {
         discoverCandidates: async () => [candidate],
@@ -560,13 +558,14 @@ test("recommendDatasets planning prompt asks for time-based quality tier strateg
       },
     );
 
-    assert.match(capturedPrompt, /1 = Fastest: target about 30-60 minutes\./);
-    assert.match(capturedPrompt, /3 = Balanced: target about 3-8 hours\./);
-    assert.match(capturedPrompt, /5 = Maximum Quality: target about 16-24 hours\./);
+    assert.match(capturedPrompt, /Infer a reasonable end-to-end run-time budget directly from the user's request\./);
+    assert.match(capturedPrompt, /If the user states a time preference or deadline, honor it when possible\./);
     assert.match(capturedPrompt, /quality_tier_strategy.*wall-clock time-budget summary/i);
+    assert.match(capturedPrompt, /Do not use a numeric 1-5 tier or score\./);
     assert.ok(!capturedPrompt.includes("under 10K rows"));
     assert.ok(!capturedPrompt.includes("4-6+ datasets"));
-    assert.ok(!capturedPrompt.includes("1-3 days"));
+    assert.ok(!capturedPrompt.includes("1 = Fastest"));
+    assert.ok(!capturedPrompt.includes("quality tier 3"));
   } finally {
     globalThis.fetch = originalFetch;
 
