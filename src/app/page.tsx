@@ -250,11 +250,25 @@ export default function ChatPage() {
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const lastStageRef = useRef<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const [showIndicator, setShowIndicator] = useState(false);
+  const indicatorTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Scroll to bottom when new messages appear
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, isResponding, activeStageIndex]);
+
+  // Delay showing the processing indicator by 3 seconds
+  useEffect(() => {
+    if (activeJobId) {
+      indicatorTimerRef.current = setTimeout(() => setShowIndicator(true), 1500);
+    } else {
+      setShowIndicator(false);
+    }
+    return () => {
+      if (indicatorTimerRef.current) clearTimeout(indicatorTimerRef.current);
+    };
+  }, [activeJobId]);
 
   // Auto-resize textarea
   useEffect(() => {
@@ -662,7 +676,7 @@ export default function ChatPage() {
                 </div>
               ))}
 
-              {isResponding && activeStageIndex !== null && (
+              {isResponding && activeStageIndex !== null && showIndicator && (
                 <div className="-mt-6">
                   <ProcessingIndicator
                     activeStageIndex={activeStageIndex}
