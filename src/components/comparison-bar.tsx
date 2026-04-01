@@ -29,15 +29,14 @@ export function ComparisonBar({
   const baselinePercent = Math.round(data.baselineRate * 100);
 
   return (
-    <div className="flex justify-start">
-      <div className="w-full max-w-md rounded-xl border border-border bg-card p-5 space-y-4">
-        <div className="space-y-0.5">
-          <h3 className="text-sm font-semibold text-foreground">
-            Evaluation Results
-          </h3>
-        </div>
+    <div className="flex justify-start my-1">
+      <div className="w-full max-w-md rounded-xl border border-border bg-card px-5 py-5 space-y-2">
+        <h3 className="text-sm font-semibold text-foreground">
+          Evaluation Results
+        </h3>
 
-        <div className="space-y-3">
+        <div className="space-y-1">
+          {/* Post-trained bar */}
           <div className="space-y-1.5">
             <span className="text-xs font-medium text-foreground">
               Post-trained{data.mode === "match_rate" ? " match rate" : ""} — {candidatePercent}%
